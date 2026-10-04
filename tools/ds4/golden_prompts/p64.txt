@@ -1,0 +1,5 @@
+A lock-free ring buffer hands frames to the GPU while the producer fills
+its tail; the consumer copies head, then publishes head+1 with a release
+store. If head overtakes tail, it spins instead of blocking.
+
+inline size_t avail(size_t h, size_t t, size_t cap) { return (t - h + cap) % cap; }

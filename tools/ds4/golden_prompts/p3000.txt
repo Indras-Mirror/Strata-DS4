@@ -1,0 +1,216 @@
+The following note records how a from-scratch inference engine for a
+sparse mixture-of-experts transformer is meant to be verified against a
+reference implementation. It is deliberately long, because the point of a long
+prompt is to exercise the prefill path, the compressed attention caches, and the
+sliding window ring under a context that is no longer trivial.
+
+Every layer of the reference model is built from the same handful of primitives.
+A normalisation scales the hidden state by a learned vector. A low rank
+projection reduces the query to a compact latent and then expands it again. A
+single fused key and value projection produces one head, because the model uses
+multi query attention with a shared latent. Rotary embeddings are applied to a
+suffix of the head dimension, and then removed from the attention output before
+the output projection. Grouped low rank adapters mix the heads back together.
+
+The feed forward block is where the sparsity lives. A router produces a score
+per expert, the score is passed through a softplus and a square root, a learned
+bias is added only for the purpose of selection, and the six highest scoring
+experts are chosen. The chosen experts run a gated linear unit with a clamp on
+the activations, and a shared expert always runs in parallel. The shared expert
+is wider than a routed expert because several copies are stacked along the
+hidden dimension, but it is still a single matrix multiply from the point of
+view of the graph.
+
+A reference implementation written in plain C++ with double accumulation is slow
+but exact. The first milestone is not speed; it is agreement. Agreement is
+measured layer by layer. For each layer the engine writes its normalised
+attention input, its attention output, its normalised feed forward input, its
+mixture output, its hyper connection streams, and finally the logits. Those
+tensors are compared against dumps taken from the reference engine on the same
+prompt with the same tokenisation and the same key value cache format.
+
+The comparison itself has a small vocabulary. The maximum absolute difference
+catches a tensor that is off by a constant. The relative L2 norm catches a
+tensor that is scaled wrong. The cosine similarity catches a tensor whose
+direction has drifted even when its magnitude is fine, which is exactly what a
+missing rotary rotation or a swapped normalisation looks like. For the logits
+the useful statistics are top one agreement, top five agreement, and the
+Kullback Leibler divergence between the two softmax distributions.
+
+A workable threshold for a correct port is a cosine similarity above zero point
+nine nine nine nine on every hidden tensor, a top one agreement above ninety
+nine percent, and a mean KL below zero point zero one. Anything looser hides
+real bugs, and anything tighter is dominated by floating point noise and by the
+order in which the reference sums its reductions.
+
+Three pieces of the model are unusual enough that they deserve their own probe.
+The first is the hyper connection. Instead of a single residual stream the block
+carries four streams of the same width. A pre gate mixes them into one working
+tensor; a post gate mixes the block output back into the streams using a learned
+coupling matrix that has been normalised by a Sinkhorn procedure. If the
+Sinkhorn iteration count is off by one, or the epsilon inside it is missing, the
+streams slowly decorrelate and the error is invisible at the first layer but
+large by the last.
+
+The second unusual piece is the compressed key value cache. At a ratio of four
+the model keeps an overlapping compressed block for every four raw tokens, and
+at a ratio of one hundred twenty-eight it keeps a heavily compressed block for
+every one hundred twenty-eight tokens. Each block is formed by projecting the
+raw tokens through a value projection and a score projection, adding a learned
+absolute positional embedding indexed by the position within the block, taking a
+softmax over the block, and reducing. The reduction is a weighted sum, not a
+mean, so the scores matter.
+
+The third unusual piece is the lightning indexer. It is a tiny attention head
+that scores the compressed blocks and keeps the best five hundred twelve. On
+short contexts the indexer selects everything and can be skipped, which is why
+the first attention milestone only covers prompts up to two thousand tokens.
+Beyond that the indexer and its unconditional Hadamard rotation have to be
+implemented, and the rotation is easy to forget because it does not appear in
+the mathematical description of the model at all; it is a numerical conditioning
+trick applied to quantised keys.
+
+Below is a sketch of the compressed block builder. The overlap variant gathers
+two windows, the current one and the previous one, which is why the coefficient
+for the gather is twice the ratio.
+
+    // state_kv, state_score: [coeff * d_head, n_tokens]
+    kv    = wkv_comp   * x;                       // [coeff * d_head, nt]
+    score = wgate_comp * x;                       // [coeff * d_head, nt]
+    score = score + ape[pos % ratio];             // learned absolute position
+    // gather ratio rows for hca, 2 * ratio rows for the overlap variant
+    values, scores = split_and_permute(kv, score);
+    weights = softmax(scores, axis = block_axis);
+    comp    = sum(values * weights, axis = block_axis);
+    comp    = rms_norm(comp) * comp_norm;
+    comp    = rope(comp, compress_rope_base, attn_factor);
+
+A port that gets the raw attention right but the compressed attention wrong will
+still produce fluent text, because raw attention carries most of the signal on
+short prompts. The divergence only becomes obvious once the context grows past
+the point where the compressed blocks actually contribute, which is another
+reason the golden dumps are taken at three lengths instead of one.
+
+The runtime side of the engine is organised around a small number of long lived
+objects. A geometry struct holds every dimension read from the model metadata. A
+loader maps the quantised tensors into a pinned arena. An expert cache holds a
+bounded number of slots, each the size of one expert, and an eviction policy
+decides what stays. A CPU pool executes the expert matmuls that miss the cache,
+and a doorbell wakes the pool as soon as a layer's routing is known. A device
+plan decides which misses are worth sending over the bus instead of computing on
+the host.
+
+The doorbell is worth describing because it is the difference between a busy
+pipeline and a stalled one. Without it the host waits until the whole layer's
+routing is materialised, then dispatches, then waits again. With it the routing
+of the first expert of a layer is enough to start the first worker, and the
+remaining workers start as their experts are resolved. The GPU keeps working on
+attention for the next layer while the host chews on the current layer's
+experts, and the copy engines stream promotions in the gaps. The measured cost
+of getting this wrong is not a small percentage; it is the difference between a
+token time dominated by the slowest single stage and a token time close to the
+sum divided by the number of overlapped stages.
+
+A simple way to reason about the limit is to write down the bytes and the
+bandwidths. The host can deliver roughly twenty-five to thirty gigabytes per
+second from DRAM into the matrix kernels. The bus can deliver roughly twenty to
+twenty-five gigabytes per second in one direction while the host is busy. If the
+runtime could only use one of them it would be capped near thirty gigabytes per
+second; using both at once raises the ceiling toward fifty. On this machine the
+cache serves about half the expert lookups, so the bytes that must move are
+about zero point eight seven gigabytes per token, not one point seven four. The
+arithmetic is rough but the conclusion is robust: the win comes from parallelism
+between the host, the device, and the bus, not from any single faster kernel.
+
+Correctness has to be established before any of that machinery is switched on.
+The order of work is therefore strict. First the loader, the geometry, and the
+tokenizer, checked by round tripping text through both tokenizers. Second the
+quantised expert kernels, checked one expert at a time against a dequantised
+matrix multiply. Third the reference forward pass, checked layer by layer
+against the golden dumps. Only then the cache, the pool, the doorbell, and the
+device plan, checked against the measured tokens per second of the reference
+engine.
+
+Each of those gates needs a number, and each number needs a recorded baseline.
+A gate that says the port is fast is not a gate. A gate that says the port
+decodes at twenty tokens per second on four fixed prompts with the same context
+and the same key value format as the baseline, and that its top one agreement
+against the dumps is still above ninety nine percent, is a gate. If the number
+is missed the honest response is to stop and reuse the reference engine's own
+expert cache, which already captures most of the available gain, rather than to
+keep rewriting attention.
+
+Finally, a note on prompts. The three dumps should share a distribution but not
+their content. The shortest prompt exercises the raw path with no compressed
+blocks and no indexer. The middle prompt crosses the first compression boundary
+and forces the compressor state to be carried across several blocks. The longest
+prompt crosses the second boundary and forces the lightning indexer and its
+rotation into the picture. Taken together they catch the classes of bug that a
+single length would hide, and they do it without needing a specialised harness.
+
+The quantisation format deserves a paragraph of its own, because the expert
+kernels are where most of the arithmetic and all of the memory traffic live. The
+gate and up projections of each routed expert are stored in a very low bit
+blocked format with a tiny codebook, and the down projection uses a slightly
+larger block format that packs its scales as small integers and its weights as a
+handful of bits. A kernel that reads these formats has to unpack a block at a
+time, multiply by the per block scale, and accumulate into a wide register file
+before it writes the result back. The vector dot products are supplied by the
+CPU backend, so the first version of the port can call them directly and only
+later replace them with hand tuned intrinsics if the profile says the unpacking
+overhead dominates.
+
+The same formats appear on the device. The matrix vector kernels that serve the
+cache slots and the streamed experts accept the same blocked layouts, which is
+why a cache slot can be uploaded as raw bytes without a conversion pass. The
+only subtlety is alignment: a device matrix vector kernel wants the rows padded
+to a boundary, and the packed blobs from the loader are tightly packed, so the
+upload path either pads on the fly or the loader stores the padded form. The
+second option wastes a little space per expert but removes a branch from the hot
+path, and with tens of thousands of experts even a few bytes per row add up, so
+the decision should be made from a measurement rather than from taste.
+
+Error handling in a runtime like this is mostly about keeping a failed
+allocation from becoming a silent zero. If a pinned arena cannot be reserved,
+the loader should fall back to pageable memory and log the fallback, not shrink
+the arena and pretend the model still fits. If a cache slot cannot be allocated,
+the expert cache should degrade to a smaller slot count and report its effective
+hit rate, because the hit rate is the number that explains the resulting token
+time. A watchdog that kills the process when available memory falls below a
+floor is a crude instrument, but on a machine with a known bad memory region it
+is the only instrument that reliably keeps a long run from swapping itself to
+death.
+
+Testing the host side is easier if the pool can be driven without the device.
+A small harness feeds synthetic routing decisions into the pool, checks that the
+results match a single threaded reference, and measures the throughput of the
+pool at one, two, four, and eight workers. The same harness can inject a
+delayed expert to confirm that the doorbell actually overlaps rather than merely
+appearing to. Without that injection the pool looks fast because the test data is
+uniform, and the real workload with a few very hot experts stalls in a way the
+uniform test never reproduces.
+
+The device side needs the mirror image of that harness. A small driver runs one
+attention layer at a time with random but seeded inputs, compares the output
+against a host reference, and reports the maximum absolute and relative errors.
+The compressor and the indexer get their own drivers because their state is
+carried across tokens and a per token test would miss an ordering bug. The
+Hadamard rotation gets a driver too, because a transposed rotation still passes
+a cosine check when the input happens to be symmetric, so the driver uses a
+non symmetric input deliberately.
+
+Once every stage has a driver, the golden dumps tie them together. A dump for a
+prompt of one length is a stack trace through the whole network; a dump for
+three lengths is a stack trace through the whole cache lifecycle. Comparing the
+dumps tensor by tensor localises a failure to a layer, and comparing them across
+lengths localises it to a state transition. That is the entire verification
+strategy, and it is deliberately boring: no learned tolerance, no per tensor
+excuse, just a measured difference and a threshold written down before the run.
+
+A last operational note. The reference engine loads this model with memory
+mapping turned off, because the model lives on a filesystem where mapping stalls
+the load for many minutes while the device sits idle. The port should read the
+expert blobs explicitly into its own arena for the same reason, and should report
+its resident set against the budget as it goes. If the load path is wrong, every
+later measurement is contaminated by page faults, and the profile will blame the
+kernels for a cost that belongs to the loader.

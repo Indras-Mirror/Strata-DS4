@@ -19,6 +19,13 @@ __pycache__/
 # plan v0.3 P1 (repository hygiene, review E1): profiler captures and large diagnostic dumps stay out of git.
 *.nsys-rep
 
+# ds4 phase 0 tooling: compiled probes (build from the headers in tools/ds4/) and
+# golden dumps (large; regenerate with tools/ds4/make_goldens.sh).
+tools/ds4/route_probe
+tools/ds4/golden_dump
+bench/ds4-2026-10-05/goldens/
+bench/ds4-2026-10-05/profile-decode/
+
 # Pi harness metadata (local session state, not project source)
 *.sqlite
 *.npz

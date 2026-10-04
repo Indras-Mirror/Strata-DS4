@@ -1,0 +1,47 @@
+Decode on a single 24 GB card is memory bound long before it is arithmetic
+bound. Every token walks forty-three layers, and at each layer the router picks
+six experts out of two hundred fifty-six. The expert weights dominate the
+footprint, so the useful question is not how fast a matrix multiply runs but
+how many bytes must arrive before the next token can be produced. A cache that
+holds the hottest experts in VRAM converts most of those bytes into a device
+read; the rest cross PCIe or come from system RAM, and the slowest legs set the
+pace.
+
+The scheduler has to overlap three kinds of work. The GPU computes attention
+and the dense projections, which are small and latency sensitive. The CPU pool
+computes the routed experts whose weights are resident in DRAM. A copy engine
+moves the experts that were promoted into the cache this step. If any of the
+three sits idle while another runs, the token time grows by the idle span, so
+the design tries to keep every queue fed from the same dependency graph.
+
+A useful invariant is that the per-token expert demand is roughly constant:
+six experts per layer times forty-three layers times six and three quarter
+mebibytes is about one point seven four gigabytes, independent of context
+length. What changes with context is attention, which grows until the sliding
+window caps it, and the compressed block caches, which grow at one quarter and
+one one hundred twenty-eighth of the raw rate.
+
+Consider a tiny routing table update. The router emits a probability per expert,
+the selection adds a learned bias, and the top six are chosen. The weights are
+renormalised and scaled before the experts run. In code the last few steps look
+like this:
+
+    probs = sqrt(softplus(logits))
+    sel   = top_k(probs + bias, 6)
+    w     = probs[sel]
+    w     = w / max(w.sum(), 1e-6)
+    w     = w * scale
+
+The clamp on the normaliser matters: a batch with a single live expert would
+otherwise divide by zero, and the router does produce near-degenerate rows on
+the hash-routed layers near the embedding. Those first layers ignore the learned
+selection entirely and look the expert ids up in a table indexed by token id,
+but they still use the router probabilities as the mixing weights, so the bias
+is simply absent rather than the whole path being skipped.
+
+Two more details decide correctness. Attention applies rotary embeddings only to
+the positional tail of each query and key, leaving the non positional prefix
+untouched, and then removes the rotation from the output before the grouped
+output projection. Compressed layers use a different rotary base and a YaRN
+attention factor, so a port that shares one rope table between raw and
+compressed layers will drift even when every other tensor matches.
