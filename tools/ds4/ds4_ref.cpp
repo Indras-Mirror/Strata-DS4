@@ -255,6 +255,15 @@ using Bytes = std::shared_ptr<std::vector<uint8_t>>;
 
 struct InputFill { ggml_tensor * t; Bytes data; };
 
+// the per-compression-ratio tensors every layer of that ratio shares
+struct CompInputs {
+    int64_t ratio = 0;
+    int64_t n_blocks = 0;
+    std::shared_ptr<std::vector<uint8_t>> mask_f16;   // [n_blocks, nt] F16, -inf where not visible
+    std::shared_ptr<std::vector<uint8_t>> mask_f32;   // [n_blocks, nt] F32, same
+    std::shared_ptr<std::vector<uint8_t>> idx;        // I32 gather indices (overlap: prev-half ++ cur-half)
+};
+
 struct Graph {
     ggml_context * ctx = nullptr;
     ggml_backend_t cpu = nullptr;
@@ -268,7 +277,7 @@ struct Graph {
         return w->get("blk." + std::to_string(il) + "." + suffix);
     }
 
-    ggml_tensor * input_type(ggml_type ty, std::initializer_list<int64_t> ne, const void * data, size_t bytes) const {
+    ggml_tensor * input_type(ggml_type ty, std::initializer_list<int64_t> ne, const void * data, size_t bytes, const char * nm = "input") const {
         ggml_tensor * t = nullptr;
         switch (ne.size()) {
             case 1: t = ggml_new_tensor_1d(ctx, ty, *ne.begin()); break;
@@ -278,19 +287,20 @@ struct Graph {
             default: std::abort();
         }
         ggml_set_input(t);
+        ggml_set_name(t, nm);
         auto buf = std::make_shared<std::vector<uint8_t>>(bytes);
         std::memcpy(buf->data(), data, bytes);
         fills.push_back({t, buf});
         return t;
     }
-    ggml_tensor * input(std::initializer_list<int64_t> ne, const void * data, size_t bytes) const {
-        return input_type(GGML_TYPE_F32, ne, data, bytes);
+    ggml_tensor * input(std::initializer_list<int64_t> ne, const void * data, size_t bytes, const char * nm = "input") const {
+        return input_type(GGML_TYPE_F32, ne, data, bytes, nm);
     }
-    ggml_tensor * input_i32(std::initializer_list<int64_t> ne, const void * data, size_t bytes) const {
-        return input_type(GGML_TYPE_I32, ne, data, bytes);
+    ggml_tensor * input_i32(std::initializer_list<int64_t> ne, const void * data, size_t bytes, const char * nm = "input") const {
+        return input_type(GGML_TYPE_I32, ne, data, bytes, nm);
     }
-    ggml_tensor * input_f16(std::initializer_list<int64_t> ne, const void * data, size_t bytes) const {
-        return input_type(GGML_TYPE_F16, ne, data, bytes);
+    ggml_tensor * input_f16(std::initializer_list<int64_t> ne, const void * data, size_t bytes, const char * nm = "input") const {
+        return input_type(GGML_TYPE_F16, ne, data, bytes, nm);
     }
 
     ggml_tensor * view1(ggml_tensor * a, int64_t n0, size_t off) const {
@@ -409,31 +419,43 @@ struct Graph {
         return ggml_rope_set_offset(a, (int) (g->d_head - n_dims));
     }
 
-    // one attention block (raw / CSA / HCA) at layer il; returns the pre-output-projection attention output
+    // orthonormal Walsh-Hadamard rotation over contiguous `n`-blocks (llama-impl.h:57-75, llama-kv-cache.cpp:24)
+    ggml_tensor * hadamard(ggml_tensor * cur, ggml_tensor * rot) const {
+        const int64_t n = rot->ne[0];
+        ggml_tensor * res = ggml_is_contiguous(cur)
+            ? ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur) / n)
+            : ggml_cont_2d(ctx, cur, n, ggml_nelements(cur) / n);
+        res = ggml_mul_mat(ctx, rot, res);
+        return ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+    }
+    ggml_tensor * rope_at(ggml_tensor * a, ggml_tensor * pos, int64_t n_dims, int64_t off, int n_ctx,
+                          float base, float fscale, float ext, float attn, float bf, float bs) const {
+        a = ggml_rope_ext(ctx, a, pos, nullptr, (int) n_dims, GGML_ROPE_TYPE_NORMAL, n_ctx, base, fscale, ext, attn, bf, bs);
+        return ggml_rope_set_offset(a, (int) off);
+    }
+
+    // one attention block (raw / CSA + lightning indexer / HCA) at layer il; returns the attention output
+    // before the output projection
     ggml_tensor * attention(int il, ggml_tensor * xn, ggml_tensor * qr, ggml_tensor * inp_pos,
-                            ggml_tensor * tokens_in, const std::vector<int32_t> & tokens,
-                            int64_t ratio, int64_t n_blocks,
+                            const CompInputs & ci, int64_t ratio,
                             const std::shared_ptr<std::vector<uint8_t>> & raw_mask,
-                            const std::shared_ptr<std::vector<uint8_t>> & comp_mask,
-                            const std::shared_ptr<std::vector<uint8_t>> & csa_idx,
-                            ggml_tensor ** attn_out_name) const;
+                            ggml_tensor * rot_idx, int64_t top_k, ggml_tensor ** attn_out_name) const;
 };
 
 // ------------------------------------------------------------------ the attention block
 
 ggml_tensor * Graph::attention(int il, ggml_tensor * xn, ggml_tensor * qr, ggml_tensor * inp_pos,
-                               ggml_tensor * tokens_in, const std::vector<int32_t> & tokens,
-                               int64_t ratio, int64_t n_blocks,
+                               const CompInputs & ci, int64_t ratio,
                                const std::shared_ptr<std::vector<uint8_t>> & raw_mask,
-                               const std::shared_ptr<std::vector<uint8_t>> & comp_mask,
-                               const std::shared_ptr<std::vector<uint8_t>> & csa_idx,
-                               ggml_tensor ** attn_out_name) const {
+                               ggml_tensor * rot_idx, int64_t top_k, ggml_tensor ** attn_out_name) const {
     const int64_t D = g->n_embd, nt = xn->ne[1];
-    const int64_t d_h = g->d_head, dh_rope = g->d_rope, dh_nope = d_h - dh_rope;
+    const int64_t d_h = g->d_head, dh_rope = g->d_rope;
     const int64_t n_head = g->n_head, n_groups = g->o_groups;
     const int64_t n_heads_group = n_head / n_groups;
     const int64_t o_group_dim = n_heads_group * d_h;
     const int64_t o_lora = g->o_lora;
+    const int64_t n_blocks = ci.n_blocks;
+    (void) qr;
 
     const bool comp = ratio != 0;
     const float freq_base  = comp ? (float) g->compress_rope_base : (float) g->rope_freq_base;
@@ -443,95 +465,143 @@ ggml_tensor * Graph::attention(int il, ggml_tensor * xn, ggml_tensor * qr, ggml_
     const float beta_fast  = comp ? (float) g->yarn_beta_fast : 0.0f;
     const float beta_slow  = comp ? (float) g->yarn_beta_slow : 0.0f;
     const int   n_ctx      = comp ? (int) g->rope_orig_ctx : 0;
-    const int   rope_mode  = GGML_ROPE_TYPE_NORMAL;
 
     // q latent
-    ggml_tensor * qr2 = ggml_mul_mat(ctx, L(il, "attn_q_a.weight"), xn);           // [r_q, nt]
+    ggml_tensor * qr2 = ggml_mul_mat(ctx, L(il, "attn_q_a.weight"), xn);
     qr2 = rms_w(qr2, L(il, "attn_q_a_norm.weight"));
-    ggml_tensor * q = ggml_mul_mat(ctx, L(il, "attn_q_b.weight"), qr2);            // [heads*d_h, nt]
+    ggml_tensor * q = ggml_mul_mat(ctx, L(il, "attn_q_b.weight"), qr2);
     q = ggml_reshape_3d(ctx, q, d_h, n_head, nt);
     q = ggml_rms_norm(ctx, q, (float) g->rms_eps);
-    q = rope(q, inp_pos, dh_rope, rope_mode, n_ctx, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    q = rope(q, inp_pos, dh_rope, GGML_ROPE_TYPE_NORMAL, n_ctx, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
 
     // kv latent (K == V)
-    ggml_tensor * kv = ggml_mul_mat(ctx, L(il, "attn_kv.weight"), xn);             // [d_h, nt]
+    ggml_tensor * kv = ggml_mul_mat(ctx, L(il, "attn_kv.weight"), xn);
     kv = rms_w(kv, L(il, "attn_kv_a_norm.weight"));
     kv = ggml_reshape_3d(ctx, kv, d_h, 1, nt);
-    kv = rope(kv, inp_pos, dh_rope, rope_mode, n_ctx, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    kv = rope(kv, inp_pos, dh_rope, GGML_ROPE_TYPE_NORMAL, n_ctx, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
 
     ggml_tensor * k_all = kv;
-    ggml_tensor * mask = input_f16({nt, nt}, raw_mask->data(), raw_mask->size());
+    ggml_tensor * mask = input_f16({nt, nt}, raw_mask->data(), raw_mask->size(), "raw_mask");
 
     if (comp && n_blocks > 0) {
-        const int64_t coff = (ratio == 4) ? 2 : 1;
-        const int64_t state_dim = coff * d_h;
-        // compressor state for every token
-        ggml_tensor * st_kv = ggml_mul_mat(ctx, L(il, "attn_compressor_kv.weight"), xn);     // [state_dim, nt]
-        ggml_tensor * st_sc = ggml_mul_mat(ctx, L(il, "attn_compressor_gate.weight"), xn);   // [state_dim, nt]
-        ggml_tensor * ape = L(il, "attn_compressor_ape.weight");                             // [state_dim, ratio]
-        // state_pos = pos % ratio
         std::vector<int32_t> spos((size_t) nt);
         for (int64_t t = 0; t < nt; ++t) spos[(size_t) t] = (int32_t) (t % ratio);
-        ggml_tensor * state_pos = input_i32({nt}, spos.data(), spos.size() * 4);
-        ggml_tensor * ape_rows = ggml_get_rows(ctx, ape, state_pos);
-        st_sc = ggml_add(ctx, st_sc, ape_rows);
+        ggml_tensor * state_pos = input_i32({nt}, spos.data(), spos.size() * 4, "state_pos");
 
-        // appended row: zeros for kv, -inf for score (first block's missing previous half)
-        ggml_tensor * zrow = ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, state_dim, 1), 0.0f);
-        ggml_tensor * nrow = ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, state_dim, 1), NEG_INF);
-        ggml_tensor * src_kv = ggml_concat(ctx, st_kv, zrow, 1);
-        ggml_tensor * src_sc = ggml_concat(ctx, st_sc, nrow, 1);
+        const int64_t coff = (ratio == 4) ? 2 : 1;
+        const int64_t state_dim = coff * d_h;
 
-        ggml_tensor * comp_k = nullptr;
-        if (ratio == 4) {
-            // overlap: prev half comes from plane 0 of the previous block's tokens, cur half from plane 1
+        // overlap (ratio 4) compressor shared by the CSA value keys and the indexer keys
+        auto overlap_compress = [&](const char * prefix, int64_t head_dim) -> ggml_tensor * {
+            ggml_tensor * st_kv = ggml_mul_mat(ctx, L(il, std::string(prefix) + "_kv.weight"), xn);
+            ggml_tensor * st_sc = ggml_mul_mat(ctx, L(il, std::string(prefix) + "_gate.weight"), xn);
+            ggml_tensor * ape_rows = ggml_get_rows(ctx, L(il, std::string(prefix) + "_ape.weight"), state_pos);
+            st_sc = ggml_add(ctx, st_sc, ape_rows);
+            ggml_tensor * zrow = ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * head_dim, 1), 0.0f);
+            ggml_tensor * nrow = ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * head_dim, 1), NEG_INF);
+            ggml_tensor * src_kv = ggml_concat(ctx, st_kv, zrow, 1);
+            ggml_tensor * src_sc = ggml_concat(ctx, st_sc, nrow, 1);
+
             const int64_t n_read = ratio * n_blocks;
-            ggml_tensor * idx_all = input_i32({2 * ratio * n_blocks}, csa_idx->data(), csa_idx->size());
-            ggml_tensor * kv_rows = ggml_get_rows(ctx, src_kv, idx_all);          // [state_dim, 2*ratio*n_blocks]
+            ggml_tensor * idx_all = input_i32({2 * ratio * n_blocks}, ci.idx->data(), ci.idx->size(), "overlap_idx");
+            ggml_tensor * kv_rows = ggml_get_rows(ctx, src_kv, idx_all);
             ggml_tensor * sc_rows = ggml_get_rows(ctx, src_sc, idx_all);
-            ggml_tensor * kv_prev = ggml_cont(ctx, view2(kv_rows, d_h, n_read, kv_rows->nb[1], 0));
-            kv_prev = ggml_reshape_3d(ctx, kv_prev, d_h, ratio, n_blocks);
-            ggml_tensor * sc_prev = ggml_cont(ctx, view2(sc_rows, d_h, n_read, sc_rows->nb[1], 0));
-            sc_prev = ggml_reshape_3d(ctx, sc_prev, d_h, ratio, n_blocks);
-            size_t off_cur = (size_t) n_read * kv_rows->nb[1] + ggml_row_size(kv_rows->type, d_h);
-            ggml_tensor * kv_cur = ggml_cont(ctx, view2(kv_rows, d_h, n_read, kv_rows->nb[1], off_cur));
-            kv_cur = ggml_reshape_3d(ctx, kv_cur, d_h, ratio, n_blocks);
-            size_t off_curs = (size_t) n_read * sc_rows->nb[1] + ggml_row_size(sc_rows->type, d_h);
-            ggml_tensor * sc_cur = ggml_cont(ctx, view2(sc_rows, d_h, n_read, sc_rows->nb[1], off_curs));
-            sc_cur = ggml_reshape_3d(ctx, sc_cur, d_h, ratio, n_blocks);
+            ggml_tensor * kv_prev = ggml_cont(ctx, view2(kv_rows, head_dim, n_read, kv_rows->nb[1], 0));
+            kv_prev = ggml_reshape_3d(ctx, kv_prev, head_dim, ratio, n_blocks);
+            ggml_tensor * sc_prev = ggml_cont(ctx, view2(sc_rows, head_dim, n_read, sc_rows->nb[1], 0));
+            sc_prev = ggml_reshape_3d(ctx, sc_prev, head_dim, ratio, n_blocks);
+            size_t off_k = (size_t) n_read * kv_rows->nb[1] + ggml_row_size(kv_rows->type, head_dim);
+            ggml_tensor * kv_cur = ggml_cont(ctx, view2(kv_rows, head_dim, n_read, kv_rows->nb[1], off_k));
+            kv_cur = ggml_reshape_3d(ctx, kv_cur, head_dim, ratio, n_blocks);
+            size_t off_s = (size_t) n_read * sc_rows->nb[1] + ggml_row_size(sc_rows->type, head_dim);
+            ggml_tensor * sc_cur = ggml_cont(ctx, view2(sc_rows, head_dim, n_read, sc_rows->nb[1], off_s));
+            sc_cur = ggml_reshape_3d(ctx, sc_cur, head_dim, ratio, n_blocks);
 
-            ggml_tensor * values = ggml_concat(ctx, kv_prev, kv_cur, 1);   // [d_h, 2*ratio, n_blocks]
+            ggml_tensor * values = ggml_concat(ctx, kv_prev, kv_cur, 1);
             ggml_tensor * scores = ggml_concat(ctx, sc_prev, sc_cur, 1);
-            values = ggml_cont(ctx, ggml_permute(ctx, values, 1, 0, 2, 3)); // [2*ratio, d_h, n_blocks]
+            values = ggml_cont(ctx, ggml_permute(ctx, values, 1, 0, 2, 3));
             scores = ggml_cont(ctx, ggml_permute(ctx, scores, 1, 0, 2, 3));
             ggml_tensor * wts = ggml_soft_max(ctx, scores);
-            ggml_tensor * c = ggml_sum_rows(ctx, ggml_mul(ctx, values, wts));   // [1, d_h, n_blocks]
-            comp_k = ggml_cont(ctx, ggml_permute(ctx, c, 1, 0, 2, 3));          // [d_h, 1, n_blocks]
+            ggml_tensor * c = ggml_sum_rows(ctx, ggml_mul(ctx, values, wts));
+            c = ggml_cont(ctx, ggml_permute(ctx, c, 1, 0, 2, 3));           // [head_dim, 1, n_blocks]
+            c = rms_w(c, L(il, std::string(prefix) + "_norm.weight"));
+            std::vector<int32_t> cpos((size_t) n_blocks);
+            for (int64_t b = 0; b < n_blocks; ++b) cpos[(size_t) b] = (int32_t) (ratio * b);
+            ggml_tensor * cpos_t = input_i32({n_blocks}, cpos.data(), cpos.size() * 4, "overlap_pos");
+            return rope_at(c, cpos_t, dh_rope, head_dim - dh_rope, n_ctx, (float) g->compress_rope_base,
+                           freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        };
+
+        ggml_tensor * comp_k = nullptr;
+        ggml_tensor * cmask_f16 = input_f16({n_blocks, nt}, ci.mask_f16->data(), ci.mask_f16->size(), "comp_mask_f16");
+
+        if (ratio == 4) {
+            comp_k = overlap_compress("attn_compressor", d_h);
+
+            // lightning indexer: only needed when there are more visible blocks than top_k
+            if (n_blocks > top_k) {
+                const int64_t idx_k = g->indexer_key_dim, idx_h = g->indexer_n_head;
+                ggml_tensor * lid_k = ggml_cont(ctx, overlap_compress("indexer_compressor", idx_k));
+                if (rot_idx) lid_k = hadamard(lid_k, rot_idx);
+
+                ggml_tensor * iq = ggml_mul_mat(ctx, L(il, "indexer.attn_q_b.weight"), qr2);   // [idx_h*idx_k, nt]
+                iq = ggml_reshape_3d(ctx, iq, idx_k, idx_h, nt);
+                iq = rope_at(iq, inp_pos, dh_rope, idx_k - dh_rope, n_ctx, (float) g->compress_rope_base,
+                             freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+                iq = hadamard(iq, rot_idx);
+                ggml_tensor * iw = ggml_mul_mat(ctx, L(il, "indexer.proj.weight"), xn);       // [idx_h, nt]
+                iw = ggml_scale(ctx, iw, 1.0f / std::sqrt((float) (idx_k * idx_h)));
+
+                ggml_tensor * qp = ggml_permute(ctx, iq, 0, 2, 1, 3);   // [idx_k, nt, idx_h]
+                ggml_tensor * kp = ggml_permute(ctx, lid_k, 0, 2, 1, 3); // [idx_k, n_blocks, 1]
+                ggml_tensor * kq = ggml_mul_mat(ctx, kp, qp);            // [n_blocks, nt, idx_h]
+                kq = ggml_cont(ctx, ggml_permute(ctx, kq, 2, 1, 0, 3));  // [idx_h, nt, n_blocks]
+                ggml_tensor * sc = ggml_relu(ctx, kq);
+                sc = ggml_mul(ctx, sc, ggml_reshape_4d(ctx, iw, idx_h, nt, 1, 1));
+                sc = ggml_sum_rows(ctx, sc);                             // [1, nt, n_blocks]
+                sc = ggml_cont(ctx, ggml_permute(ctx, sc, 2, 1, 0, 3));  // [n_blocks, nt]
+
+                ggml_tensor * vis_f = input({n_blocks, nt}, ci.mask_f32->data(), ci.mask_f32->size(), "comp_mask_f32");
+                sc = ggml_add(ctx, sc, vis_f);
+                const int64_t ntk = std::min(n_blocks, top_k);
+                ggml_tensor * tk = ggml_cont(ctx, ggml_top_k(ctx, sc, (int) ntk));   // [ntk, nt]
+
+                // mask = -inf, zeroed at the top-k rows, then ANDed with visibility (deepseek4.cpp:724-751)
+                ggml_tensor * a = ggml_fill(ctx, vis_f, NEG_INF);
+                a = ggml_view_4d(ctx, a, 1, n_blocks, nt, 1, a->nb[0], a->nb[1], a->nb[2], 0);
+                ggml_tensor * zv = ggml_fill(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, ntk, nt), 0.0f);
+                ggml_tensor * m = ggml_set_rows(ctx, a, zv, tk);
+                m = ggml_view_4d(ctx, m, m->ne[1], m->ne[2], 1, 1, m->nb[2], m->nb[3], m->nb[3], 0);
+                m = ggml_add(ctx, m, vis_f);
+                cmask_f16 = ggml_cast(ctx, m, GGML_TYPE_F16);
+            }
         } else {
             // HCA: one block == `ratio` consecutive tokens, no overlap
-            ggml_tensor * idx_all = input_i32({ratio * n_blocks}, csa_idx->data(), csa_idx->size());
-            ggml_tensor * kv_rows = ggml_get_rows(ctx, src_kv, idx_all);      // [d_h, ratio*n_blocks]
-            ggml_tensor * sc_rows = ggml_get_rows(ctx, src_sc, idx_all);
+            ggml_tensor * st_kv = ggml_mul_mat(ctx, L(il, "attn_compressor_kv.weight"), xn);
+            ggml_tensor * st_sc = ggml_mul_mat(ctx, L(il, "attn_compressor_gate.weight"), xn);
+            ggml_tensor * ape_rows = ggml_get_rows(ctx, L(il, "attn_compressor_ape.weight"), state_pos);
+            st_sc = ggml_add(ctx, st_sc, ape_rows);
+            ggml_tensor * idx_all = input_i32({ratio * n_blocks}, ci.idx->data(), ci.idx->size(), "hca_idx");
+            ggml_tensor * kv_rows = ggml_get_rows(ctx, st_kv, idx_all);
+            ggml_tensor * sc_rows = ggml_get_rows(ctx, st_sc, idx_all);
             ggml_tensor * kv3 = ggml_reshape_3d(ctx, kv_rows, d_h, ratio, n_blocks);
             ggml_tensor * sc3 = ggml_reshape_3d(ctx, sc_rows, d_h, ratio, n_blocks);
             ggml_tensor * values = ggml_cont(ctx, ggml_permute(ctx, kv3, 1, 0, 2, 3));
             ggml_tensor * scores = ggml_cont(ctx, ggml_permute(ctx, sc3, 1, 0, 2, 3));
             ggml_tensor * wts = ggml_soft_max(ctx, scores);
             ggml_tensor * c = ggml_sum_rows(ctx, ggml_mul(ctx, values, wts));
-            comp_k = ggml_cont(ctx, ggml_permute(ctx, c, 1, 0, 2, 3));
+            c = ggml_cont(ctx, ggml_permute(ctx, c, 1, 0, 2, 3));
+            c = rms_w(c, L(il, "attn_compressor_norm.weight"));
+            std::vector<int32_t> cpos((size_t) n_blocks);
+            for (int64_t b = 0; b < n_blocks; ++b) cpos[(size_t) b] = (int32_t) (ratio * b);
+            ggml_tensor * cpos_t = input_i32({n_blocks}, cpos.data(), cpos.size() * 4, "hca_pos");
+            comp_k = rope_at(c, cpos_t, dh_rope, d_h - dh_rope, n_ctx, (float) g->compress_rope_base,
+                             freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
         }
 
-        comp_k = rms_w(comp_k, L(il, "attn_compressor_norm.weight"));
-        // RoPE at the block's write position (ratio*b), compress base
-        std::vector<int32_t> cpos((size_t) n_blocks);
-        for (int64_t b = 0; b < n_blocks; ++b) cpos[(size_t) b] = (int32_t) (ratio * b);
-        ggml_tensor * comp_pos = input_i32({n_blocks}, cpos.data(), cpos.size() * 4);
-        comp_k = rope(comp_k, comp_pos, dh_rope, rope_mode, n_ctx, (float) g->compress_rope_base, freq_scale,
-                      ext_factor, attn_factor, beta_fast, beta_slow);
-
+        (void) state_dim;
         k_all = ggml_concat(ctx, kv, comp_k, 2);
-        ggml_tensor * cm = input_f16({n_blocks, nt}, comp_mask->data(), comp_mask->size());
-        mask = ggml_concat(ctx, mask, cm, 0);
+        mask = ggml_concat(ctx, mask, cmask_f16, 0);
     }
 
     // attention: K == V, per-head sink bias.  flash-attn wants q = [d_h, n_tokens, n_head],
@@ -546,7 +616,8 @@ ggml_tensor * Graph::attention(int il, ggml_tensor * xn, ggml_tensor * qr, ggml_
 
     // de-RoPE then grouped output LoRA
     out = ggml_reshape_3d(ctx, out, d_h, n_head, nt);
-    out = rope_back(out, inp_pos, dh_rope, rope_mode, n_ctx, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    out = rope_back(out, inp_pos, dh_rope, GGML_ROPE_TYPE_NORMAL, n_ctx, freq_base, freq_scale, ext_factor,
+                    attn_factor, beta_fast, beta_slow);
     out = ggml_reshape_3d(ctx, out, o_group_dim, n_groups, nt);
     out = ggml_permute(ctx, out, 0, 2, 1, 3);
     // the GGUF stores Wo_a 2-D [o_group_dim, o_lora*o_groups]; llama.cpp creates it 3-D
@@ -627,6 +698,11 @@ int main(int argc, char ** argv) {
     auto run = [&](ggml_cgraph * gf) -> bool {
         if (!ggml_gallocr_alloc_graph(allo, gf)) { std::fprintf(stderr, "[ds4_ref] gallocr failed\n"); return false; }
         for (auto & f : G.fills) {
+            if (f.t->buffer == nullptr || f.t->data == nullptr) {
+                std::fprintf(stderr, "[ds4_ref] note: input %s was not placed in the graph, skipped\n",
+                             f.t->name[0] ? f.t->name : "(unnamed)");
+                continue;
+            }
             ggml_backend_tensor_set(f.t, f.data->data(), 0, std::min(f.data->size(), ggml_nbytes(f.t)));
         }
         if (ggml_backend_graph_compute(cpu, gf) != GGML_STATUS_SUCCESS) {
@@ -674,48 +750,64 @@ int main(int argc, char ** argv) {
                 m[t * nt + s] = ggml_fp32_to_fp16((s <= t && t - s < n_swa) ? 0.0f : NEG_INF);
     }
 
-    // per-ratio compressor inputs
-    auto make_comp_inputs = [&](int64_t ratio, int64_t & n_blocks,
-                                std::shared_ptr<std::vector<uint8_t>> & comp_mask,
-                                std::shared_ptr<std::vector<uint8_t>> & idx) {
-        n_blocks = nt / ratio;
-        comp_mask.reset(); idx.reset();
-        if (n_blocks <= 0) return;
-        comp_mask = std::make_shared<std::vector<uint8_t>>((size_t) n_blocks * nt * 2);
-        ggml_fp16_t * m = (ggml_fp16_t *) comp_mask->data();
+    // per-ratio compressor inputs (masks + gather indices), shared by every layer of that ratio
+    auto make_comp = [&](int64_t ratio, CompInputs & ci) {
+        ci.ratio = ratio;
+        ci.n_blocks = nt / ratio;
+        if (ci.n_blocks <= 0) return;
+        const int64_t nb = ci.n_blocks;
+        ci.mask_f16 = std::make_shared<std::vector<uint8_t>>((size_t) nb * nt * 2);
+        ci.mask_f32 = std::make_shared<std::vector<uint8_t>>((size_t) nb * nt * 4);
+        ggml_fp16_t * m16 = (ggml_fp16_t *) ci.mask_f16->data();
+        float * m32 = (float *) ci.mask_f32->data();
         for (int64_t t = 0; t < nt; ++t)
-            for (int64_t b = 0; b < n_blocks; ++b)
-                m[b * nt + t] = ggml_fp32_to_fp16((b < (t + 1) / ratio) ? 0.0f : NEG_INF);
+            for (int64_t b = 0; b < nb; ++b) {
+                const float v = (b < (t + 1) / ratio) ? 0.0f : NEG_INF;
+                m16[b * nt + t] = ggml_fp32_to_fp16(v);
+                m32[b * nt + t] = v;
+            }
         const int64_t per = (ratio == 4) ? 2 * ratio : ratio;
-        idx = std::make_shared<std::vector<uint8_t>>((size_t) per * n_blocks * 4);
-        int32_t * p = (int32_t *) idx->data();
+        ci.idx = std::make_shared<std::vector<uint8_t>>((size_t) per * nb * 4);
+        int32_t * p = (int32_t *) ci.idx->data();
         if (ratio == 4) {
-            // [ all prev halves | all cur halves ], prev/cur are 4 tokens each
+            // [ all prev halves | all cur halves ], prev/cur are `ratio` tokens each
             int64_t k = 0;
-            for (int64_t b = 0; b < n_blocks; ++b)
+            for (int64_t b = 0; b < nb; ++b)
                 for (int64_t j = 0; j < ratio; ++j) {
                     const int64_t t = ratio * b - ratio + j;
                     p[k++] = (t < 0) ? (int32_t) nt : (int32_t) t;   // nt == the appended zero row
                 }
-            for (int64_t b = 0; b < n_blocks; ++b)
+            for (int64_t b = 0; b < nb; ++b)
                 for (int64_t j = 0; j < ratio; ++j) p[k++] = (int32_t) (ratio * b + j);
         } else {
             int64_t k = 0;
-            for (int64_t b = 0; b < n_blocks; ++b)
+            for (int64_t b = 0; b < nb; ++b)
                 for (int64_t j = 0; j < ratio; ++j) p[k++] = (int32_t) (ratio * b + j);
         }
     };
 
-    int64_t n_blocks4 = 0, n_blocks128 = 0;
-    std::shared_ptr<std::vector<uint8_t>> mask4, idx4, mask128, idx128;
-    make_comp_inputs(4, n_blocks4, mask4, idx4);
-    make_comp_inputs(128, n_blocks128, mask128, idx128);
-    std::printf("[ds4_ref] blocks: csa(4)=%lld hca(128)=%lld\n", (long long) n_blocks4, (long long) n_blocks128);
-    if (!do_hca) n_blocks128 = 0;
-    if (n_blocks4 > g.indexer_top_k)
-        std::fprintf(stderr, "[ds4_ref] WARNING: %lld CSA blocks > top_k %lld: the lightning indexer is required "
-                             "and is not implemented yet; results will be wrong\n",
-                     (long long) n_blocks4, (long long) g.indexer_top_k);
+    CompInputs ci4, ci128;
+    make_comp(4, ci4);
+    make_comp(128, ci128);
+    if (!do_hca) ci128.n_blocks = 0;
+    std::printf("[ds4_ref] blocks: csa(4)=%lld hca(128)=%lld\n",
+                (long long) ci4.n_blocks, (long long) ci128.n_blocks);
+
+    // orthonormal Walsh-Hadamard matrix for the lightning indexer (llama-kv-cache.cpp:24-60)
+    std::vector<float> rot_data;
+    if (ci4.n_blocks > g.indexer_top_k) {
+        const int n = (int) g.indexer_key_dim;
+        rot_data.assign((size_t) n * n, 0.0f);
+        rot_data[0] = 1.0f / std::sqrt((float) n);
+        for (int s = 1; s < n; s *= 2)
+            for (int i = 0; i < s; ++i)
+                for (int j = 0; j < s; ++j) {
+                    const float v = rot_data[i * n + j];
+                    rot_data[(i + s) * n + j] = v;
+                    rot_data[i * n + (j + s)] = v;
+                    rot_data[(i + s) * n + (j + s)] = -v;
+                }
+    }
 
     // ---------------- layers
     ggml_set_no_alloc(w.ctx, true);
@@ -738,11 +830,14 @@ int main(int argc, char ** argv) {
         ggml_tensor * xn = G.rms_w(attn_pre, G.L(il, "attn_norm.weight"));
         ggml_set_output(xn); ggml_set_name(xn, "attn_norm");
 
-        int64_t nb = (ratio == 4) ? n_blocks4 : (ratio == 128 ? n_blocks128 : 0);
+        const CompInputs & ci = (ratio == 4) ? ci4 : ci128;
+        const bool use_indexer = ratio == 4 && ci.n_blocks > g.indexer_top_k;
+        ggml_tensor * rot_t = use_indexer && !rot_data.empty()
+            ? G.input({(int64_t) g.indexer_key_dim, (int64_t) g.indexer_key_dim}, rot_data.data(), rot_data.size() * 4)
+            : nullptr;
         ggml_tensor * attn_raw = nullptr;
-        ggml_tensor * attn_out = G.attention(il, xn, nullptr, inp_pos, nullptr, tokens, ratio, nb,
-                                             raw_mask, ratio == 4 ? mask4 : mask128,
-                                             ratio == 4 ? idx4 : idx128, &attn_raw);
+        ggml_tensor * attn_out = G.attention(il, xn, nullptr, inp_pos, ci, ratio, raw_mask, rot_t,
+                                             g.indexer_top_k, &attn_raw);
         const char * attn_name = ratio == 4 ? "attn_csa_lid" : (ratio == 128 ? "attn_hca" : "attn_raw");
         ggml_set_output(attn_raw);
         ggml_set_name(attn_raw, attn_name);
