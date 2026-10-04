@@ -231,6 +231,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
   target_link_libraries(gguf_split_test PRIVATE strata_artifact)
   add_test(NAME gguf_split_test COMMAND gguf_split_test)
+  # DSV4 geometry + full tensor map (header mmap only; the real-file part skips without $DS4_GGUF/argv[1])
+  add_executable(ds4_geometry_test tests/core/ds4_geometry_test.cpp)
+  target_link_libraries(ds4_geometry_test PRIVATE strata_artifact)
+  add_test(NAME ds4_geometry_test COMMAND ds4_geometry_test $ENV{DS4_GGUF})
 endif()
 
 # ---- strata_plan ----------------------------------------------------------
