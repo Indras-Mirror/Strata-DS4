@@ -1,0 +1,9 @@
+B-cache40 VRAM 21165 MiB
+B-cache40  15.79 tok/s (320 tok) :: "</think>Here's a complete implementation of an LRU cache with O(1) operations:\n\n"
+B-cache40  16.73 tok/s (320 tok) :: '</think>## CUDA Warp Reduction with Shuffle Instructions\n\nShuffle instructions e'
+B-cache40  16.73 tok/s (320 tok) :: "</think>Here's a comprehensive bash script that watches a directory and rsyncs c"
+B-cache40  15.38 tok/s (320 tok) :: "</think>Here's an idiomatic Rust implementation for parsing CSV lines with quote"
+B-cache40 DECODE MEAN 16.16 tok/s
+B-cache40 PREFILL 7814 tok at 153.2 tok/s
+
+[exited with code 0]
