@@ -63,6 +63,31 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# The `joyai-llm` pre-tokenizer (DeepSeek-V4-Flash and the DeepSeek3/Hunyuan family), transcribed from
+# `.ref/llama.cpp src/llama-vocab.cpp` L320-326 (`case LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM`).  UNLIKE qwen35 this is
+# THREE regexes, and llama.cpp APPLIES THEM SEQUENTIALLY: each one further splits the pieces the previous one
+# left (`unicode_regex_split` at `unicode.cpp:1291-1367` feeds the accumulating `bpe_offsets` into the next).
+# The order is load-bearing.  `\p{N}{1,3}` must cut digit runs first (so `01234` is `012|34`); then
+# `[一-龥぀-ゟ゠-ヿ]+` pulls Han / kana runs out of a larger `\p{L}+` (so `abc漢字def` is `abc|漢字|def`); the
+# last pattern is the ordinary word splitter.  A single alternation of the three looks equivalent on ASCII and
+# is not: it keeps `abc漢字def` whole.
+JOYAI_LLM_PATTERNS = [
+    r"\p{N}{1,3}",
+    r"[一-龥぀-ゟ゠-ヿ]+",
+    (r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+"
+     r"|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+     r"| ?[\p{P}\p{S}]+[\r\n]*"
+     r"|\s*[\r\n]+"
+     r"|\s+(?!\S)"
+     r"|\s+"),
+]
+
+# pre type -> the pattern list llama.cpp applies, in order.  The `pre` string in GGUF metadata selects it.
+PRE_PATTERNS = {
+    "qwen35": [QWEN35_PATTERN],
+    "joyai-llm": JOYAI_LLM_PATTERNS,
+}
+
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
@@ -86,7 +111,10 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        if pre not in PRE_PATTERNS:
+            raise ValueError("unknown pre-tokenizer %r (known: %s)"
+                             % (pre, ", ".join(sorted(PRE_PATTERNS))))
+        self._pre_res = [regex.compile(p) for p in PRE_PATTERNS[pre]]
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -202,9 +230,29 @@ class Tokenizer:
                     heapq.heappush(heap, (r2, p, parts[p], parts[i]))
         return [s for s in parts if s is not None]
 
+    def _pre_split(self, text: str) -> list[str]:
+        """The pre-tokenizer pieces of `text`: each pattern in `_pre_res` splits the pieces the patterns before
+        it left, exactly as llama.cpp's `unicode_regex_split` refines `bpe_offsets` one regex at a time."""
+        spans = [(0, len(text))]
+        for pat in self._pre_res:
+            nxt: list[tuple[int, int]] = []
+            for a, b in spans:
+                sub = text[a:b]
+                last = 0
+                for m in pat.finditer(sub):
+                    if m.start() > last:
+                        nxt.append((a + last, a + m.start()))
+                    if m.end() > m.start():
+                        nxt.append((a + m.start(), a + m.end()))
+                    last = m.end()
+                if last < len(sub):
+                    nxt.append((a + last, b))
+            spans = nxt
+        return [text[a:b] for a, b in spans]
+
     def _encode_plain(self, text: str) -> list[int]:
         out: list[int] = []
-        for piece in self._re.findall(text):
+        for piece in self._pre_split(text):
             mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
             for tok in self._bpe(mapped):
                 i = self.ids.get(tok)
