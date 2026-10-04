@@ -1,0 +1,175 @@
+== metadata (deepseek4.*)
+  general.name = DeepSeek V4 Flash
+  deepseek4.block_count = [43]
+  deepseek4.context_length = [1048576]
+  deepseek4.embedding_length = [4096]
+  deepseek4.attention.head_count = [64]
+  deepseek4.attention.head_count_kv = [1]
+  deepseek4.rope.scaling.type = yarn
+  deepseek4.rope.scaling.factor = [16.0]
+  deepseek4.rope.scaling.original_context_length = [65536]
+  deepseek4.rope.scaling.yarn_beta_fast = [32.0]
+  deepseek4.rope.scaling.yarn_beta_slow = [1.0]
+  deepseek4.rope.freq_base = [10000.0]
+  deepseek4.attention.layer_norm_rms_epsilon = [9.999999974752427e-07]
+  deepseek4.expert_used_count = [6]
+  deepseek4.expert_gating_func = [4]
+  deepseek4.attention.key_length = [512]
+  deepseek4.attention.value_length = [512]
+  deepseek4.vocab_size = [129280]
+  deepseek4.rope.dimension_count = [64]
+  deepseek4.attention.q_lora_rank = [1024]
+  deepseek4.attention.output_lora_rank = [1024]
+  deepseek4.attention.output_group_count = [8]
+  deepseek4.attention.compress_ratios = [0, 0, 4, 128, 4, 128, 4, 128]
+  deepseek4.attention.compress_rope_freq_base = [160000.0]
+  deepseek4.expert_feed_forward_length = [2048]
+  deepseek4.expert_count = [256]
+  deepseek4.expert_shared_count = [1]
+  deepseek4.expert_weights_scale = [1.5]
+  deepseek4.hash_layer_count = [3]
+  deepseek4.expert_weights_norm = [True]
+  deepseek4.swiglu_clamp_exp = [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+  deepseek4.attention.sliding_window = [128]
+  deepseek4.attention.indexer.head_count = [64]
+  deepseek4.attention.indexer.key_length = [128]
+  deepseek4.attention.indexer.top_k = [512]
+  deepseek4.nextn_predict_layers = [1]
+  deepseek4.hyper_connection.count = [4]
+  deepseek4.hyper_connection.sinkhorn_iterations = [20]
+  deepseek4.hyper_connection.epsilon = [9.999999974752427e-07]
+  tokenizer.ggml.model = gpt2
+  tokenizer.ggml.pre = joyai-llm
+
+== total 80.76 GiB, 1328 tensors
+
+== families (count, GiB, types)
+  blk.N.ffn_down_exps.weight                      43    28.22  Q2_Kx43
+  blk.N.ffn_gate_exps.weight                      43    22.17  IQ2_XXSx43
+  blk.N.ffn_up_exps.weight                        43    22.17  IQ2_XXSx43
+  blk.N.attn_output_a.weight                      43     1.43  Q8_0x43
+  blk.N.attn_output_b.weight                      43     1.43  Q8_0x43
+  blk.N.attn_q_b.weight                           43     1.43  Q8_0x43
+  token_embd.weight                                1     0.99  F16x1
+  output.weight                                    1     0.52  Q8_0x1
+  blk.N.ffn_gate_shexp.weight                     43     0.36  Q8_0x43
+  blk.N.ffn_down_shexp.weight                     43     0.36  Q8_0x43
+  blk.N.ffn_up_shexp.weight                       43     0.36  Q8_0x43
+  blk.N.indexer.attn_q_b.weight                   21     0.33  F16x21
+  blk.N.attn_compressor_gate.weight               41     0.24  F16x41
+  blk.N.attn_compressor_kv.weight                 41     0.24  F16x41
+  blk.N.attn_q_a.weight                           43     0.18  Q8_0x43
+  blk.N.attn_kv.weight                            43     0.09  Q8_0x43
+  blk.N.ffn_gate_inp.weight                       43     0.08  F16x43
+  blk.N.indexer_compressor_gate.weight            21     0.04  F16x21
+  blk.N.indexer_compressor_kv.weight              21     0.04  F16x21
+  blk.N.hc_attn_fn.weight                         43     0.03  F16x43
+  blk.N.hc_ffn_fn.weight                          43     0.03  F16x43
+  blk.N.indexer.proj.weight                       21     0.01  F16x21
+  blk.N.ffn_gate_tid2eid.weight                    3     0.01  I32x3
+  blk.N.attn_compressor_ape.weight                41     0.00  F16x41
+  blk.N.attn_norm.weight                          43     0.00  F32x43
+  blk.N.ffn_norm.weight                           43     0.00  F32x43
+  blk.N.attn_q_a_norm.weight                      43     0.00  F32x43
+  output_hc_fn.weight                              1     0.00  F16x1
+  blk.N.attn_kv_a_norm.weight                     43     0.00  F32x43
+  blk.N.attn_compressor_norm.weight               41     0.00  F32x41
+  blk.N.indexer_compressor_ape.weight             21     0.00  F16x21
+  blk.N.exp_probs_b.bias                          40     0.00  F32x40
+  output_norm.weight                               1     0.00  F32x1
+  blk.N.attn_sinks.weight                         43     0.00  F32x43
+  blk.N.indexer_compressor_norm.weight            21     0.00  F32x21
+  blk.N.hc_attn_base.weight                       43     0.00  F32x43
+  blk.N.hc_ffn_base.weight                        43     0.00  F32x43
+  blk.N.hc_attn_scale.weight                      43     0.00  F32x43
+  blk.N.hc_ffn_scale.weight                       43     0.00  F32x43
+  output_hc_base.weight                            1     0.00  F32x1
+  output_hc_scale.weight                           1     0.00  F32x1
+
+== layers 0/3/42 detail
+  blk.0.ffn_gate_tid2eid.weight                 I32      [6, 129280]
+  blk.0.ffn_gate_exps.weight                    IQ2_XXS  [4096, 2048, 256]
+  blk.0.ffn_down_exps.weight                    Q2_K     [2048, 4096, 256]
+  blk.0.ffn_up_exps.weight                      IQ2_XXS  [4096, 2048, 256]
+  blk.3.ffn_gate_exps.weight                    IQ2_XXS  [4096, 2048, 256]
+  blk.3.ffn_down_exps.weight                    Q2_K     [2048, 4096, 256]
+  blk.3.ffn_up_exps.weight                      IQ2_XXS  [4096, 2048, 256]
+  blk.42.ffn_gate_exps.weight                   IQ2_XXS  [4096, 2048, 256]
+  blk.42.ffn_down_exps.weight                   Q2_K     [2048, 4096, 256]
+  blk.42.ffn_up_exps.weight                     IQ2_XXS  [4096, 2048, 256]
+  blk.0.attn_sinks.weight                       F32      [64]
+  blk.0.attn_kv_a_norm.weight                   F32      [512]
+  blk.0.attn_q_a_norm.weight                    F32      [1024]
+  blk.0.attn_kv.weight                          Q8_0     [4096, 512]
+  blk.0.attn_output_a.weight                    Q8_0     [4096, 8192]
+  blk.0.attn_output_b.weight                    Q8_0     [8192, 4096]
+  blk.0.attn_q_a.weight                         Q8_0     [4096, 1024]
+  blk.0.attn_q_b.weight                         Q8_0     [1024, 32768]
+  blk.0.attn_norm.weight                        F32      [4096]
+  blk.0.ffn_gate_inp.weight                     F16      [4096, 256]
+  blk.0.ffn_gate_shexp.weight                   Q8_0     [4096, 2048]
+  blk.0.ffn_down_shexp.weight                   Q8_0     [2048, 4096]
+  blk.0.ffn_up_shexp.weight                     Q8_0     [4096, 2048]
+  blk.0.ffn_norm.weight                         F32      [4096]
+  blk.0.hc_attn_base.weight                     F32      [24]
+  blk.0.hc_attn_fn.weight                       F16      [16384, 24]
+  blk.0.hc_attn_scale.weight                    F32      [3]
+  blk.0.hc_ffn_base.weight                      F32      [24]
+  blk.0.hc_ffn_fn.weight                        F16      [16384, 24]
+  blk.0.hc_ffn_scale.weight                     F32      [3]
+  blk.3.attn_sinks.weight                       F32      [64]
+  blk.3.attn_compressor_ape.weight              F16      [512, 128]
+  blk.3.attn_compressor_norm.weight             F32      [512]
+  blk.3.attn_compressor_gate.weight             F16      [4096, 512]
+  blk.3.attn_compressor_kv.weight               F16      [4096, 512]
+  blk.3.attn_kv_a_norm.weight                   F32      [512]
+  blk.3.attn_q_a_norm.weight                    F32      [1024]
+  blk.3.attn_kv.weight                          Q8_0     [4096, 512]
+  blk.3.attn_output_a.weight                    Q8_0     [4096, 8192]
+  blk.3.attn_output_b.weight                    Q8_0     [8192, 4096]
+  blk.3.attn_q_a.weight                         Q8_0     [4096, 1024]
+  blk.3.attn_q_b.weight                         Q8_0     [1024, 32768]
+  blk.3.attn_norm.weight                        F32      [4096]
+  blk.3.exp_probs_b.bias                        F32      [256]
+  blk.3.ffn_gate_inp.weight                     F16      [4096, 256]
+  blk.3.ffn_gate_shexp.weight                   Q8_0     [4096, 2048]
+  blk.3.ffn_down_shexp.weight                   Q8_0     [2048, 4096]
+  blk.3.ffn_up_shexp.weight                     Q8_0     [4096, 2048]
+  blk.3.ffn_norm.weight                         F32      [4096]
+  blk.3.hc_attn_base.weight                     F32      [24]
+  blk.3.hc_attn_fn.weight                       F16      [16384, 24]
+  blk.3.hc_attn_scale.weight                    F32      [3]
+  blk.3.hc_ffn_base.weight                      F32      [24]
+  blk.3.hc_ffn_fn.weight                        F16      [16384, 24]
+  blk.3.hc_ffn_scale.weight                     F32      [3]
+  blk.42.attn_sinks.weight                      F32      [64]
+  blk.42.attn_compressor_ape.weight             F16      [1024, 4]
+  blk.42.attn_compressor_norm.weight            F32      [512]
+  blk.42.attn_compressor_gate.weight            F16      [4096, 1024]
+  blk.42.attn_compressor_kv.weight              F16      [4096, 1024]
+  blk.42.indexer_compressor_ape.weight          F16      [256, 4]
+  blk.42.indexer_compressor_norm.weight         F32      [128]
+  blk.42.indexer_compressor_gate.weight         F16      [4096, 256]
+  blk.42.indexer_compressor_kv.weight           F16      [4096, 256]
+  blk.42.indexer.proj.weight                    F16      [4096, 64]
+  blk.42.indexer.attn_q_b.weight                F16      [1024, 8192]
+  blk.42.attn_kv_a_norm.weight                  F32      [512]
+  blk.42.attn_q_a_norm.weight                   F32      [1024]
+  blk.42.attn_kv.weight                         Q8_0     [4096, 512]
+  blk.42.attn_output_a.weight                   Q8_0     [4096, 8192]
+  blk.42.attn_output_b.weight                   Q8_0     [8192, 4096]
+  blk.42.attn_q_a.weight                        Q8_0     [4096, 1024]
+  blk.42.attn_q_b.weight                        Q8_0     [1024, 32768]
+  blk.42.attn_norm.weight                       F32      [4096]
+  blk.42.exp_probs_b.bias                       F32      [256]
+  blk.42.ffn_gate_inp.weight                    F16      [4096, 256]
+  blk.42.ffn_gate_shexp.weight                  Q8_0     [4096, 2048]
+  blk.42.ffn_down_shexp.weight                  Q8_0     [2048, 4096]
+  blk.42.ffn_up_shexp.weight                    Q8_0     [4096, 2048]
+  blk.42.ffn_norm.weight                        F32      [4096]
+  blk.42.hc_attn_base.weight                    F32      [24]
+  blk.42.hc_attn_fn.weight                      F16      [16384, 24]
+  blk.42.hc_attn_scale.weight                   F32      [3]
+  blk.42.hc_ffn_base.weight                     F32      [24]
+  blk.42.hc_ffn_fn.weight                       F16      [16384, 24]
+  blk.42.hc_ffn_scale.weight                    F32      [3]

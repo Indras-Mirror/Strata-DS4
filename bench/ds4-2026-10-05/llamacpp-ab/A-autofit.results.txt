@@ -1,0 +1,10 @@
+Mem:              90           6           4           0          80          83
+A-autofit VRAM 22851 MiB
+A-autofit   8.57 tok/s (320 tok) :: "</think>Here's a complete implementation of an LRU cache with O(1) operations, i"
+A-autofit   8.44 tok/s (320 tok) :: '</think>## CUDA Warp Reduction with Shuffle Instructions\n\nShuffle instructions e'
+A-autofit   9.70 tok/s (320 tok) :: "</think>Here's a comprehensive bash script that watches a directory and rsyncs c"
+A-autofit  10.06 tok/s (320 tok) :: "</think>Here's a refactored version that's idiomatic Rust:\n\n```rust\nuse std::err"
+A-autofit DECODE MEAN 9.19 tok/s
+A-autofit PREFILL 7814 tok at 175.5 tok/s
+
+[exited with code 144]

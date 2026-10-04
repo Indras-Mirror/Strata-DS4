@@ -1,0 +1,10 @@
+tokens/layer 12288, lookups train 1585152 test 1585152
+  VRAM for experts  slots % of experts hit (static, held-out)  oracle uniform
+              4 GB    606         5.5%                  26.6%   28.0%    5.5%
+              8 GB   1213        11.0%                  39.9%   42.0%   11.0%
+             12 GB   1820        16.5%                  49.7%   52.1%   16.5%
+             16 GB   2427        22.0%                  57.4%   60.0%   22.0%
+experts needed for 50% held-out hits: 1846 (16.8%, 12.2 GB)
+experts needed for 80% held-out hits: 4941 (44.9%, 32.6 GB)
+experts needed for 90% held-out hits: 6683 (60.7%, 44.1 GB)
+effective experts per layer (perplexity of usage, max 256): 239 239 236 156 137 142 135 119 133 153 156 143 132 129 132 132 149 151 152 166 154 158 168 163 137 154 132 150 133 142 158 174 149 139 139 154 122 149 127 139 126 142 141
