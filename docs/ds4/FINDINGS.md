@@ -38,7 +38,7 @@ held-out blocks (`tools/ds4/route_skew.py`):
 - A profile learned on half the text predicts the other half within ~2.5 points of the oracle, so a learned
   profile (Strata's `--expert-profile-save`) would work.
 
-**Reading:** the measured +76% decode (section 3) matches this prediction of ~2x at a ~50% hit rate. DeepSeek-V4's router is ~3x more concentrated than uniform but far flatter than Qwen3.8-Flash-Next's.
+**Reading:** the measured +51% decode (section 3) matches this prediction of ~2x at a ~50% hit rate. DeepSeek-V4's router is ~3x more concentrated than uniform but far flatter than Qwen3.8-Flash-Next's.
 A 24 GB card serves about half the expert lookups from VRAM, not ~90%.
 
 ## 3. Baseline: llama.cpp on the same machine
@@ -48,12 +48,16 @@ A 24 GB card serves about half the expert lookups from VRAM, not ~90%.
 
 | Configuration | Decode | Prefill (7.8K-token prompt) |
 | --- | ---: | ---: |
-| A: automatic placement (whole layers of experts on the GPU) | **9.2 tok/s** (8.4-10.1) | **175 tok/s** |
-| B: all experts in RAM + `--moe-expert-cache 40` (~11 GB of hot experts) | **16.2 tok/s** (15.4-16.7), **+76%** | 153 tok/s (-13%) |
+Clean runs (2026-10-05 09:38-09:58, quiet machine, NVIDIA 595.91; `clean-ab.results.txt`):
 
-B was measured while an apt upgrade (DKMS builds) competed for the CPU, so its decode gain is if anything understated;
-a clean re-run of both is pending. Its prefill is a little slower: with every expert host-resident, the large prompt
-batches stream experts over PCIe.
+| Configuration | Decode | Prefill (7.8K-token prompt) |
+| --- | ---: | ---: |
+| A: automatic placement (whole layers of experts on the GPU) | **10.85 tok/s** (10.5-11.3) | **175.2 tok/s** |
+| B: all experts in RAM + `--moe-expert-cache 40` (~11 GB of hot experts) | **16.34 tok/s** (15.7-17.1), **+51%** | 153.8 tok/s (-12%) |
+
+Earlier runs the same morning gave A 9.2 and B 16.2 tok/s (A during a stalled-load/download period, B during an apt
+upgrade): B is stable, A was depressed in the first run. B's prefill is a little slower: with every expert
+host-resident, the large prompt batches stream experts over PCIe.
 
 (B is llama.cpp's own hot-expert cache - the Strata idea inside llama.cpp - and answers "how much of the gain is
 available without a new engine".)

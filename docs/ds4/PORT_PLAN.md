@@ -12,14 +12,13 @@ matches llama.cpp.
 
 | Reference (llama.cpp-master-rebase 4cd3d353d, CUDA 13.4) | Decode | Prefill 7.8K |
 | --- | ---: | ---: |
-| A: automatic placement | 9.2 tok/s | 175 tok/s |
-| **B: `-cmoe --moe-expert-cache 40 --load-mode none`** (the bar) | **16.2 tok/s** | 153 tok/s |
+| A: automatic placement | 10.85 tok/s | 175 tok/s |
+| **B: `-cmoe --moe-expert-cache 40 --load-mode none`** (the bar) | **16.34 tok/s** | 154 tok/s |
 
-(B measured during an apt upgrade; the clean re-run is in `bench/ds4-2026-10-05/llamacpp-ab/clean-ab.results.txt`
-- use those numbers if present.)
+(Clean runs, quiet machine: `bench/ds4-2026-10-05/llamacpp-ab/clean-ab.results.txt`.)
 
 **Target: >= 20 tok/s decode (+25% over B), prefill >= 175 tok/s, logits matching llama.cpp.**
-**Kill criterion:** if phase 4 (the MoE engine on real weights) cannot beat B by 20%, stop the native port and put
+**Kill criterion:** if phase 4 (the MoE engine on real weights) cannot beat B by 20% (19.6 tok/s), stop the native port and put
 the same ideas into llama.cpp's expert cache instead (section 7).
 
 ## 2. Where the speed can come from (and where it cannot)

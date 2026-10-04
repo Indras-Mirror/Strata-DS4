@@ -1,0 +1,16 @@
+GPU idle since 09:38:47; load: 5.66 5.33 4.17
+B2-cache40 VRAM 21571 MiB
+B2-cache40  15.72 tok/s (320 tok) :: "</think>Here's a complete implementation of an LRU cache with O(1) operations, i"
+B2-cache40  16.21 tok/s (320 tok) :: '</think>## CUDA Warp Reduction with Shuffle Instructions\n\nShuffle instructions e'
+B2-cache40  17.13 tok/s (320 tok) :: "</think>Here's a comprehensive bash script that watches a directory and rsyncs c"
+B2-cache40  16.29 tok/s (320 tok) :: "</think>Here's an idiomatic Rust refactor of a CSV line parser with quoted field"
+B2-cache40 DECODE MEAN 16.34 tok/s
+B2-cache40 PREFILL 7814 tok at 153.8 tok/s
+A2-autofit VRAM 22829 MiB
+A2-autofit  11.00 tok/s (320 tok) :: "</think>Here's a complete implementation of an LRU cache with O(1) operations, i"
+A2-autofit  11.29 tok/s (320 tok) :: '</think>## CUDA Warp Reduction with Shuffle Instructions\n\nShuffle instructions a'
+A2-autofit  10.46 tok/s (320 tok) :: "</think>Here's a robust bash script that watches a directory and rsyncs changed "
+A2-autofit  10.67 tok/s (320 tok) :: "</think>Here's a refactored version of a CSV line parser with quoted fields into"
+A2-autofit DECODE MEAN 10.85 tok/s
+A2-autofit PREFILL 7814 tok at 175.2 tok/s
+DONE

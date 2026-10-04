@@ -21,8 +21,8 @@ engine code is written yet. Pick up at **Phase 0** of the plan.
   256 experts top-6, experts IQ2_XXS gate/up + Q2_K down; **no MTP layer in the file**).
 - Oracle: `~/AI/llama.cpp-master-rebase/build/bin` (CUDA 13.4, has deepseek4 + `--moe-expert-cache`). Use F16 KV
   for parity runs. `llama.cpp-new` and `-dspark` are CUDA-12 builds and do not run as-is.
-- Bar to beat: llama.cpp `-cmoe --moe-expert-cache 40 --load-mode none` = 16.2 tok/s decode (check
-  `bench/ds4-2026-10-05/llamacpp-ab/clean-ab.results.txt` for the clean re-run). Target >= 20 tok/s.
+- Bar to beat: llama.cpp `-cmoe --moe-expert-cache 40 --load-mode none` = 16.34 tok/s decode, 154 tok/s prefill
+  (clean run; llama.cpp's default placement = 10.85). Target >= 20 tok/s.
 - Kill criterion: if Phase 4 can't beat the bar by 20%, stop and move the ideas into llama.cpp's expert cache.
 - The win must come from splitting cache misses between CPU and a PCIe/GPU share in parallel, overlap and pinned
   memory - NOT from smarter cache allocation (measured: +0.3 points only).
