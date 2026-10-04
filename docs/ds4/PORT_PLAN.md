@@ -131,7 +131,10 @@ Plain CUDA (or even CPU) path, no graphs, F32 accumulation, F16/F32 KV:
 ### Phase 6 - speculation (optional)
 - No MTP in this GGUF. **Best option: huihui's matching abliterated DSpark draft,**
   `huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF/dspark-abliterated/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf`
-  (10.1 GB; DSpark = llama.cpp arch `DFLASH`, `src/models/dflash.cpp`). Other options: a GGUF with the `nextn` block (the converter writes it when
+  (10.1 GB; DSpark = llama.cpp arch `DFLASH`, `src/models/dflash.cpp`). **Downloaded (2026-10-05) to
+  `/media/mal/SSD NVME/Models/huihui-DeepSeek-V4-Flash-0731-dspark-abliterated/`** (`fetch.sh` there resumes +
+  sha256-verifies; `fetch.log` says VERIFIED OK when done). Quick test before any port work: llama.cpp-master-rebase
+  with it as the draft (`-md`) on top of config B - if it beats 16.2 tok/s, that is a free win today. Other options: a GGUF with the `nextn` block (the converter writes it when
   present), or a separate draft (DSpark), or Strata's suffix/prompt-lookup drafter alone (`SuffixDrafter`,
   works without a draft model; helps code edits).
 - **Gate:** decode faster with drafts than without, on the same bench.

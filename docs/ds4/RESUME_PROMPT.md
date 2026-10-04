@@ -29,6 +29,10 @@ engine code is written yet. Pick up at **Phase 0** of the plan.
 - Bench script with a RAM watchdog: `bench/ds4-2026-10-05/llamacpp-ab/bench.sh` (copy to /tmp to run; it needs
   ~75 GB RAM and the GPU to itself). Route probe: `tools/ds4/route_probe.cpp` + `route_skew.py`.
 
+- Draft model for speculation (no MTP in the main GGUF): huihui's abliterated DSpark Q8_0 at
+  `/media/mal/SSD NVME/Models/huihui-DeepSeek-V4-Flash-0731-dspark-abliterated/` (check `fetch.log` for
+  VERIFIED OK; re-run `fetch.sh` to resume). Worth a quick llama.cpp test on top of config B early on.
+
 **Rules**
 - Never develop in `~/AI/Strata` (production Qwen engine serving my wrappers). Work only in `~/AI/Strata-DS4`.
 - Correctness before speed: each phase ends at its gate in PORT_PLAN.md; record the measured numbers in
