@@ -66,6 +66,10 @@ Each phase ends with a measurable gate. Commit after each gate on branch `deepse
 numbers in `FINDINGS.md`.
 
 ### Phase 0 - oracle and profile (no engine code)
+- **First, check the existing `ds4` engine.** huihui's model card runs this exact file with `./ds4 -m
+  DeepSeek-V4-Flash-Q2-0731.gguf --ctx 32768` (a DeepSeek-V4-specific engine; also mentioned by a Mac user on
+  r/Qwen_AI). Find its repo, what it does (expert caching? CPU/GPU split? CUDA?) and its speed here. If it already
+  does what phase 4 plans, build on it or borrow from it instead of starting from Strata alone.
 - `tools/ds4/golden_dump.cpp`: like `route_probe.cpp` (eval callback), but dump per-layer tensors for 3 fixed
   prompts (64, 600, 3000 tokens): `attn_norm`, attention output, `ffn_norm`, MoE output, `l_out` (the hc streams),
   final logits; plus the token ids. Names from `deepseek4.cpp` `cb(...)` calls. Store under
@@ -125,7 +129,9 @@ Plain CUDA (or even CPU) path, no graphs, F32 accumulation, F16/F32 KV:
 - **Gate:** needle test at 64K and 128K; prefill >= 175 tok/s at 7.8K.
 
 ### Phase 6 - speculation (optional)
-- No MTP in this GGUF. Options: find a DeepSeek-V4-Flash GGUF with the `nextn` block (the converter writes it when
+- No MTP in this GGUF. **Best option: huihui's matching abliterated DSpark draft,**
+  `huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF/dspark-abliterated/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf`
+  (10.1 GB; DSpark = llama.cpp arch `DFLASH`, `src/models/dflash.cpp`). Other options: a GGUF with the `nextn` block (the converter writes it when
   present), or a separate draft (DSpark), or Strata's suffix/prompt-lookup drafter alone (`SuffixDrafter`,
   works without a draft model; helps code edits).
 - **Gate:** decode faster with drafts than without, on the same bench.

@@ -38,6 +38,7 @@ engine code is written yet. Pick up at **Phase 0** of the plan.
 - Delegate broad code reading to `deepseek-quetza pro --skip "..."` workers; use the conductor skill for
   multi-slice implementation if it fits.
 
-**Start with Phase 0:** write `tools/ds4/golden_dump.cpp` (per-layer golden tensors from llama.cpp for 64/600/3000
+**Start with Phase 0:** first look up the existing `ds4` engine (huihui's model card runs this exact GGUF with
+`./ds4 -m ... --ctx 32768`) - find its repo and what it does; it may already do the expert caching we plan. Then write `tools/ds4/golden_dump.cpp` (per-layer golden tensors from llama.cpp for 64/600/3000
 token prompts) and profile where the bar's ~62 ms per token goes. Report the time split before writing any engine
 code - if expert CPU time is under half the token, we revisit the plan.
