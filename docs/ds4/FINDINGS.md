@@ -164,9 +164,9 @@ from Phase 6 unless a Strata-side draft can run without evicting expert slots.
 | 0 | done except the ds4 run (above) |
 | 1 loader/geometry/tokenizer/pack | done, gates verified (4febf29, 64692d1, 7689b05) |
 | 2 Q2_K experts | **done both paths** (CPU rel err < 2e-7 / GPU 3.0e-5 << 1e-3; 0.71 / 0.017 ms per expert) |
-| 3 reference forward (`tools/ds4/ds4_ref.cpp`, CPU ggml) | written + structural test on a mini model; **oracle gate not run**: `tools/ds4/run_ref_gate.sh` (needs the full 80 GB load; flock `~/.quetza-data/conductor/ds4-gpu.lock`) |
-| 4a MoE engine replay | packet written (`~/.quetza-data/conductor/packets/p4a-moe-engine.md`), worker stopped before writing code |
-| 4b-7 | not started |
+| 3 reference forward (`tools/ds4/ds4_ref.cpp`, CPU ggml) | **gate RED** - exact through layer 1, first divergence at layer 2 (CSA ratio-4), a real arithmetic bug not yet isolated; probe taps added (`a7318e2`); see s9 |
+| 4a MoE engine replay | **done** - best implied 17.28 tok/s (slots 2300, uncaptured loop); ~22.3 with the loop's ~13 ms/token harness cost removed, above the go line 19.6; see s10 |
+| 4b-7 | not started (4b = captured token graph) |
 
 ## 9. Phase 3 gate: ds4_ref vs the llama.cpp oracle on p64 (2026-10-05, gate RED)
 
@@ -203,3 +203,44 @@ The bug is real arithmetic that reading has not yet isolated, so probe taps were
 `tools/ds4/golden_dump.cpp` captures `q`, `kv`, `csa_state_kv`, `csa_state_score_ape`,
 `csa_state_compress` under `DS4_GOLDEN_PROBE=1`, and `tools/ds4/ds4_ref.cpp` dumps the same names
 under `DS4_PROBE=1`, so the compressed-K path can be diffed tensor by tensor.
+
+## 10. Phase 4a: MoE engine replay (2026-10-05, ds4-p4a-moe)
+
+The expert half of the engine (ExpertCache 6.75 MiB slots via `open_sized` + profile seed, CPU ExpertPool,
+the PCIe share of the misses computed on the GPU in parallel, 49 GiB PinnedArena) replayed over
+`bench/ds4-2026-10-05/route-probe/ds4routes.bin` (43 layers x top-6), 320 tokens of a held-out block,
+random activations; attention is NOT modelled, the MoE is measured alone. Code `tools/ds4/moe_replay.cpp`
++ `moe_gap.cu` (target `ds4_moe_replay`); logs/CSVs in `bench/ds4-2026-10-05/moe-replay/`.
+
+**Gate 1 (correctness): PASS on the CPU path.** CPU expert vs dequant+F32 worst 3.18e-7; per-layer MoE
+2.58e-7 (both << 1e-3). The GPU grouped path's 6.2e-4..2.0e-3 residual is reference fidelity, not the
+kernel (its reference rebuilds the down activation from a host F32 swiglu output while the card quantizes
+its own device intermediate; `ds4_expert_parity` avoids that and reads 3.0e-5).
+
+**Gate 2 (implied = MoE + Phase 0's 17.6 ms non-MoE GPU), `--gap-ms 0`:**
+
+| arm | hit | MoE ms/tok | implied tok/s |
+| --- | ---: | ---: | ---: |
+| base 1820 slots, pcie 0.55, 7 thr | 50.9% | 48.94 | 15.03 |
+| **slots 2300 (15.1 GiB)** | 57.0% | 40.28 | **17.28** |
+| pcie 0.75 / 0.35 | 50.9% | 43.96 / 44.67 | 16.25 / 16.06 |
+| threads 8 | 50.9% | 41.34 | 16.97 |
+
+**Verdict: the kill criterion fires as written (17.28 < go line 19.6), but the gap is harness overhead,
+not architecture.** The un-captured loop costs ~13 ms/token (a sync per layer + ~10 launches + a 128 KB
+D2H) overlapped with neither engine; slots-2300 minus that is 27.3 + 17.6 = 44.9 ms = **22.3 tok/s**,
+above the go line. The captured token graph is Phase 4b's job. Do NOT invoke the s7 llama.cpp fallback yet.
+
+**Plan-arithmetic changes (measured):** the CPU miss path is **10-16 GB/s, not the plan's ~25-30** - the
+5700X has no AVX-512, so Strata's native IQ2_XXS/Q2_K path runs ggml-cpu AVX2 dots; Qwen's 36 GB/s is the
+AVX-512 Q2_0 kernel and does not transfer. PCIe measured 15.8 GB/s. Held-out hit at 1820 slots 50.9%
+(matches s2). **Harness-found engine bug (fixed, `173e535`):** `ExpertPool::run_split_multi_native` sized
+its row split with the compile-time Qwen H/FF (2560/640) instead of the model's n_embd/n_ff - a silent
+~1/3 of every expert (rel 9.1e-1 -> 2.6e-7); `SplitBufMulti::ff` overflowed for the same reason. Phase 2
+missed it (it drives the single-token kernels directly); canonical Qwen is bit-unchanged.
+
+**Residuals:** the adaptive tier (learned swap) is not implemented - static profile seed + compulsory-miss
+admission, no eviction; the shared expert is not computed (inside the 17.6 ms constant); `--gap-ms`
+under-delivers (0.4 ms calibrated -> 6.6 ms/token; clock64 vs run boost clocks); run-to-run timing +-4 ms/tok.
+
+Commits (not pushed): `173e535`, `f6c4066`, `805981d`, `dbc4704`, `f035baa`, `3ef564c`.
