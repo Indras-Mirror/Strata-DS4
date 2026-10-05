@@ -1284,3 +1284,9 @@ if(TARGET ggml-cpu)
   target_include_directories(ds4_ref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(ds4_ref PRIVATE ggml ggml-cpu ggml-base)
 endif()
+
+# ---- ds4 decode engine (Phase 4b proper) ---------------------------------
+# Each engine slice owns exactly one of these files (conductor plan 2026-10-06); OPTIONAL so a missing one is fine.
+include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/ds4_dense.cmake OPTIONAL)
+include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/ds4_moe.cmake OPTIONAL)
+include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/ds4_engine.cmake OPTIONAL)
