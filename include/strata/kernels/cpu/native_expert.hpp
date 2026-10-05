@@ -19,6 +19,11 @@ inline constexpr size_t kNativeActBytes = 4672;
 /// Bytes of the largest quantized down activation.  DeepSeek-V4's n_ff 2048 as Q8_K (Q2_K's vec_dot_type) is
 /// 8 x 292 = 2336, the largest; Qwen's 640 as Q8_0 is 20 x 34 = 680.
 inline constexpr size_t kNativeHBytes = 2336;
+/// The widest native expert intermediate (n_ff) any model has.  DeepSeek-V4's 2048 is twice Qwen's 640, so the
+/// pool's per-expert row buffers (ExpertPool::SplitBufMulti::ff) must be sized by THIS and not by the canonical
+/// `FF` (640) that the Q2_0 pack path uses: `native_gu_rows` writes rows [0, n_ff) of the model's own width, and
+/// a buffer sized for Qwen overflows silently into the neighbouring struct (found by tools/ds4/moe_replay).
+inline constexpr int kNativeFFMax = 2048;
 
 /// One layer's native expert geometry.
 struct NativeFmt {
