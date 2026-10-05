@@ -126,3 +126,46 @@ flock ~/.quetza-data/conductor/ds4-gpu.lock build-ds4-cuda/ds4_expert_parity \
     /media/mal/NVME1TB/Models/DeepSeek-V4-Flash-Q2-0731.gguf --bench 30
 flock ~/.quetza-data/conductor/ds4-gpu.lock build-ds4-cuda/mmvq_multi_parity
 ```
+
+## 7. Phase 0 measurements (2026-10-05) - raw logs in `bench/ds4-2026-10-05/phase0/`
+
+**Goldens:** `bench/ds4-2026-10-05/goldens/{p64,p600,p3000}/` (62 MB, git-ignored; regenerate with
+`tools/ds4/make_goldens.sh`). Two llama.cpp p64 runs are **bit-identical** (cosine 1.0, KL 0), so any Phase 3
+mismatch is a real bug, not noise.
+
+**Decode profile, config B** (`profile-table.txt`; nsys slows it to 79.7 ms/token vs ~61 ms un-profiled):
+
+| phase | ms/token | share |
+|---|---|---|
+| GPU kernels (attention 1.6, dense 13.9, other 2.1) | 17.6 | 22% |
+| PCIe H2D copies (**415 MB/token**) | 22.1 | 28% |
+| CPU experts + host + sync/idle (residual) | 40.0 | 50% |
+
+Verdict: CPU expert time is ~half the token, so the plan stands. New lever: the 415 MB/token of H2D copies
+(28%) - overlap them and cut them with the Phase 4 engine.
+
+**DSpark draft (huihui abliterated Q8_0) in llama.cpp-master-rebase - NOT worth it:**
+
+| run | result |
+|---|---|
+| B (hot-expert cache) + draft | OOM in system RAM (80.8 GiB model + 10.9 GB draft) |
+| A (default placement) + draft | CUDA OOM allocating the draft's 1.2 GB compute buffer |
+| A36 control (`-ncmoe 36`, no draft) | 11.24 tok/s decode, 175 tok/s prefill |
+| A36 + draft, n=5 | **6.3-8.0 tok/s** (2 of 4 prompts; stopped early), acceptance 49% (mean len 3.4) |
+| B CPU control (same session) | 15.50 tok/s decode, 150 tok/s prefill |
+
+Making VRAM room for the draft costs ~4.7 tok/s vs B, and the draft then slows A36 down further. Drop DSpark
+from Phase 6 unless a Strata-side draft can run without evicting expert slots.
+
+**antirez ds4 on the 4090:** CUDA build (sm_89) done in `~/AI/ds4-ref` (`./ds4`), **not yet run** - todo.
+
+## 8. Status at pause (2026-10-05 ~11:50, paused for the day by Mal)
+
+| phase | state |
+|---|---|
+| 0 | done except the ds4 run (above) |
+| 1 loader/geometry/tokenizer/pack | done, gates verified (4febf29, 64692d1, 7689b05) |
+| 2 Q2_K experts | CPU gate verified (rel err < 2e-7; 0.71 ms/expert @8 thr); **GPU parity not run** - command in s6 |
+| 3 reference forward (`tools/ds4/ds4_ref.cpp`, CPU ggml) | written + structural test on a mini model; **oracle gate not run**: `tools/ds4/run_ref_gate.sh` (needs the full 80 GB load; flock `~/.quetza-data/conductor/ds4-gpu.lock`) |
+| 4a MoE engine replay | packet written (`~/.quetza-data/conductor/packets/p4a-moe-engine.md`), worker stopped before writing code |
+| 4b-7 | not started |

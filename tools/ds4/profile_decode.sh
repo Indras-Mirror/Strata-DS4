@@ -30,6 +30,8 @@ mkdir -p "$OUT"
 
 watchdog_start() {
     local pid=$1
+    # NB: the subshell's stdout must be detached, otherwise `wd=$(watchdog_start ...)`
+    # never sees EOF (the background loop holds the command-substitution pipe open).
     ( while kill -0 "$pid" 2>/dev/null; do
           a=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
           if [ "$a" -lt 3 ]; then
@@ -37,7 +39,7 @@ watchdog_start() {
               kill -9 "$pid" 2>/dev/null
           fi
           sleep 2
-      done ) &
+      done ) >/dev/null 2>&1 &
     echo $!
 }
 
@@ -80,7 +82,10 @@ PY
 run_under_nsys() {
     local rep="$OUT/nsys-B"
     echo "[profile] nsys capture -> $rep.nsys-rep"
-    nsys profile --force-overwrite=true -o "$rep" -t cuda,nvtx,osrt \
+    # --cuda-graph-trace=node: llama.cpp replays a per-token CUDA graph; without this
+    # nsys reports the whole graph as one activity and the kernel summary misses every
+    # decode kernel (it only sees the un-graphed warmup/prefill work).
+    nsys profile --force-overwrite=true -o "$rep" -t cuda,nvtx,osrt --cuda-graph-trace=node \
         "$BIN" -m "$MODEL" --port "$PORT" "${B_FLAGS[@]}" >"$OUT/server.log" 2>&1 &
     local prof=$!
     local wd; wd=$(watchdog_start "$prof")
@@ -96,8 +101,15 @@ run_under_nsys() {
     fi
     nsys stats --force-export=true --report cuda_gpu_kern_sum   --format csv "$rep.nsys-rep" >"$OUT/kern_sum.csv" 2>/dev/null || true
     nsys stats --force-export=true --report cuda_gpu_mem_time_sum --format csv "$rep.nsys-rep" >"$OUT/mem_time.csv" 2>/dev/null || true
-    python3 "$PARSER" --kern-csv "$OUT/kern_sum.csv" --mem-csv "$OUT/mem_time.csv" \
-        --timings "$OUT/timings.json" --decode-tokens "$DECODE_TOKENS"
+    # prefer the sqlite: it can cut the exact decode window, the CSV path can only
+    # average the whole process lifetime (model load + warmup included).
+    if [ -f "$rep.sqlite" ]; then
+        python3 "$PARSER" --nsys-sqlite "$rep.sqlite" \
+            --timings "$OUT/timings.json" --decode-tokens "$DECODE_TOKENS"
+    else
+        python3 "$PARSER" --kern-csv "$OUT/kern_sum.csv" --mem-csv "$OUT/mem_time.csv" \
+            --timings "$OUT/timings.json" --decode-tokens "$DECODE_TOKENS"
+    fi
 }
 
 run_under_perf() {

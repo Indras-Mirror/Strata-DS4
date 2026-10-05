@@ -1,0 +1,239 @@
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.
+
+Write a Python class implementing an LRU cache with get/put and O(1) operations, with docstrings and tests.
+
+Explain how a CUDA warp executes a reduction with shuffle instructions, with a code example.
+
+Write a bash script that watches a directory and rsyncs changed files to a remote host, with error handling.
+
+Refactor this into idiomatic Rust: a function that parses a CSV line with quoted fields into a Vec<String>.

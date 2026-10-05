@@ -1,0 +1,22 @@
+(decode window: last 20330.9 ms of GPU activity)
+config B decode profile (256 decode tokens, 79.73 ms/token measured)
+phase                            ms/token  % token
+----------------------------------------------------
+GPU attention                       1.552     1.9%
+GPU dense                          13.870    17.4%
+GPU device MoE                      0.100     0.1%
+GPU other                           2.086     2.6%
+GPU kernels total                  17.608    22.1%
+GPU<->host copies (PCIe)           22.094    27.7%
+CPU experts + host (residual)      40.026    50.2%
+----------------------------------------------------
+total (measured)                   79.729   100.0%
+GPU busy                           17.608    22.1%
+
+note: 'CPU experts + host' = total - GPU - copies; it includes sync/idle and
+      host-side launch overhead. Use the perf fallback for the CPU split.
+
+copies by operation:
+  CUDA_MEMCPY_KIND_HTOD                  21.439 ms/token     414.6 MB/token
+  CUDA_MEMCPY_KIND_DTOH                   0.397 ms/token       1.7 MB/token
+  CUDA_MEMCPY_KIND_DTOD                   0.258 ms/token       2.4 MB/token

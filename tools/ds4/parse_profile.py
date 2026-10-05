@@ -64,8 +64,9 @@ def _read_nsys_csv(path, header_keyword):
 
 def load_kernels(path):
     out = []
-    for row in _read_nsys_csv(path, "Kernel Name"):
-        name = _field(row, "Kernel Name")
+    for row in _read_nsys_csv(path, "Total Time"):
+        # nsys >= 2024 names the kernel column "Name" (older builds: "Kernel Name")
+        name = _field(row, "Kernel Name", "Name")
         total = _field(row, "Total Time")
         if name is None or total is None:
             continue
@@ -79,8 +80,8 @@ def load_kernels(path):
 
 def load_copies(path):
     out = []
-    for row in _read_nsys_csv(path, "Operation"):
-        op = _field(row, "Operation")
+    for row in _read_nsys_csv(path, "Total Time"):
+        op = _field(row, "Operation", "Name")
         total = _field(row, "Total Time")
         if op is None or total is None:
             continue
@@ -90,6 +91,36 @@ def load_copies(path):
             continue
         out.append((op, ns))
     return out
+
+
+def load_sqlite_window(path, decode_ms):
+    """Restrict the trace to the last `decode_ms` of GPU activity.
+
+    The CSV path averages over the whole process lifetime, which includes model
+    load and warmup; with --cuda-graph-trace=node the sqlite has every replayed
+    graph kernel with timestamps, so the decode window can be cut exactly.
+    Returns (kernels, copies) with copies as (op, ns, bytes).
+    """
+    import sqlite3
+    con = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+    sid = {i: v for i, v in con.execute("select id, value from StringIds")}
+    t1 = con.execute("select max(end) from CUPTI_ACTIVITY_KIND_KERNEL").fetchone()[0]
+    if t1 is None:
+        raise SystemExit("parse_profile: no kernels in %s" % path)
+    w0 = t1 - int(decode_ms * 1e6)
+    kagg = {}
+    for n, ns in con.execute(
+            "select shortName, sum(end - start) from CUPTI_ACTIVITY_KIND_KERNEL "
+            "where end > ? and start < ? group by shortName", (w0, t1)):
+        kagg[sid.get(n, str(n))] = kagg.get(sid.get(n, str(n)), 0) + ns
+    oper = {r[0]: r[1] for r in con.execute("select id, name from ENUM_CUDA_MEMCPY_OPER")}
+    cagg = {}
+    for k, ns, nbytes in con.execute(
+            "select copyKind, sum(end - start), sum(bytes) from CUPTI_ACTIVITY_KIND_MEMCPY "
+            "where end > ? and start < ? group by copyKind", (w0, t1)):
+        cagg[oper.get(k, str(k))] = (ns, nbytes)
+    con.close()
+    return list(kagg.items()), [(op, ns, b) for op, (ns, b) in cagg.items()]
 
 
 def classify(name):
@@ -122,7 +153,7 @@ def print_gpu_table(kernels, copies, total_ms, decode_tokens):
         return ns / 1e6 / decode_tokens
 
     gpu_ms = mpt(sum(buckets.values()))
-    copy_ms = mpt(sum(ns for _, ns in copies))
+    copy_ms = mpt(sum(c[1] for c in copies))
     residual_ms = max(0.0, total_ms - gpu_ms - copy_ms)
 
     def pct(ms):
@@ -151,8 +182,11 @@ def print_gpu_table(kernels, copies, total_ms, decode_tokens):
     if copies:
         print("")
         print("copies by operation:")
-        for op, ns in sorted(copies, key=lambda x: -x[1]):
-            print("  %-34s %10.3f ms/token" % (op.strip("[]"), mpt(ns)))
+        for c in sorted(copies, key=lambda x: -x[1]):
+            extra = ""
+            if len(c) > 2 and c[2]:
+                extra = "  %8.1f MB/token" % (c[2] / 1e6 / decode_tokens)
+            print("  %-34s %10.3f ms/token%s" % (c[0].strip("[]"), mpt(c[1]), extra))
 
 
 def print_perf_table(path, total_ms, decode_tokens):
@@ -183,15 +217,28 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="summarise a decode profile")
     p.add_argument("--kern-csv")
     p.add_argument("--mem-csv")
+    p.add_argument("--nsys-sqlite", help="nsys report .sqlite (exact decode window)")
+    p.add_argument("--decode-ms", type=float, default=None,
+                   help="decode duration to cut from the end of the trace (ms)")
     p.add_argument("--timings", required=True)
     p.add_argument("--perf-text")
     p.add_argument("--decode-tokens", type=int, default=None)
     args = p.parse_args(argv)
 
-    pps, n, _ = parse_timings(args.timings)
+    pps, n, t = parse_timings(args.timings)
     total_ms = 1000.0 / pps
     decode_tokens = args.decode_tokens or n or 1
 
+    if args.nsys_sqlite:
+        decode_ms = args.decode_ms or float(t.get("predicted_ms", 0)) or total_ms * decode_tokens
+        kernels, copies = load_sqlite_window(args.nsys_sqlite, decode_ms)
+        if not kernels:
+            print("parse_profile: no kernels in the decode window of %s"
+                  % args.nsys_sqlite, file=sys.stderr)
+            return 2
+        print("(decode window: last %.1f ms of GPU activity)" % decode_ms)
+        print_gpu_table(kernels, copies, total_ms, decode_tokens)
+        return 0
     if args.kern_csv:
         kernels = load_kernels(args.kern_csv)
         copies = load_copies(args.mem_csv) if args.mem_csv else []

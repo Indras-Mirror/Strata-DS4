@@ -1,0 +1,44 @@
+{
+  "label": "B-cpucontrol",
+  "prompts": [
+    {
+      "predicted_n": 320,
+      "predicted_per_second": 14.380476019902579,
+      "prompt_n": 30,
+      "prompt_per_second": 12.991230919129588,
+      "cpu_ms_per_tok": 630.0
+    },
+    {
+      "predicted_n": 320,
+      "predicted_per_second": 16.18950018039366,
+      "prompt_n": 22,
+      "prompt_per_second": 14.053161833656556,
+      "cpu_ms_per_tok": 550.125
+    },
+    {
+      "predicted_n": 320,
+      "predicted_per_second": 16.442042932596593,
+      "prompt_n": 27,
+      "prompt_per_second": 16.18841880518677,
+      "cpu_ms_per_tok": 542.84375
+    },
+    {
+      "predicted_n": 320,
+      "predicted_per_second": 14.976256530222953,
+      "prompt_n": 28,
+      "prompt_per_second": 12.808378875506675,
+      "cpu_ms_per_tok": 605.0
+    }
+  ],
+  "prefill": {
+    "cache_n": 0,
+    "prompt_n": 7814,
+    "prompt_ms": 52073.442,
+    "prompt_per_token_ms": 6.664121064755567,
+    "prompt_per_second": 150.05729792165457,
+    "predicted_n": 8,
+    "predicted_ms": 786.256,
+    "predicted_per_token_ms": 112.32228571428571,
+    "predicted_per_second": 8.902952727864715
+  }
+}

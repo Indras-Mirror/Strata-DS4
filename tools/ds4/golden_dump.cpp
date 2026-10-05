@@ -10,7 +10,8 @@
 // Tensor names are the llama.cpp graph-builder names from src/models/deepseek4.cpp's cb(...) calls,
 // suffixed with "-<layer>" by llama_context::graph_get_cb(). We match by base name:
 //   per layer : attn_norm, attn_out, attn_raw, attn_csa_lid, attn_hca, ffn_norm, ffn_moe_out,
-//               ffn_shexp, ffn_out, l_last, hc_attn_pre, hc_attn_post, hc_ffn_pre, hc_ffn_post
+//               ffn_shexp, ffn_out, l_last, hc_attn_pre, hc_attn_post, hc_ffn_pre
+//               (there is no hc_ffn_post: ffn_out is the post-FFN hc stream)
 //   global    : hc_init, hc_head, result_norm, result_output
 // "attention output" = attn_out (after the grouped output LoRA); the attention-module output before
 // the output projection is attn_raw / attn_csa_lid / attn_hca (one of the three per layer).
@@ -26,8 +27,8 @@
 //       $L/build/ggml/src/libggml.a $L/build/ggml/src/libggml-cpu.a \
 //       $L/build/ggml/src/ggml-cuda/libggml-cuda.a $L/build/ggml/src/libggml-base.a \
 //       $L/build/common/libllama-common-base.a $L/build/vendor/cpp-httplib/libcpp-httplib.a \
-//       -lgomp -pthread -lm -ldl -lrt \
-//       -L/usr/local/cuda-13.4/targets/x86_64-linux/lib -lcudart -lcublas -lcublasLt -lnccl \
+//       -lgomp -pthread -lm -ldl -lrt -lssl -lcrypto \
+//       -L/usr/local/cuda-13.4/targets/x86_64-linux/lib -lcudart -lcublas -lcublasLt -lnccl -lcuda \
 //       -Wl,-rpath,/usr/local/cuda-13.4/targets/x86_64-linux/lib \
 //       -o tools/ds4/golden_dump
 //
@@ -64,7 +65,7 @@ static const std::set<std::string> & layer_bases() {
     static const std::set<std::string> s = {
         "attn_norm", "attn_out", "attn_raw", "attn_csa_lid", "attn_hca",
         "ffn_norm", "ffn_moe_out", "ffn_shexp", "ffn_out",
-        "l_last", "hc_attn_pre", "hc_attn_post", "hc_ffn_pre", "hc_ffn_post",
+        "l_last", "hc_attn_pre", "hc_attn_post", "hc_ffn_pre",
     };
     return s;
 }
@@ -123,28 +124,50 @@ struct DumpState {
     std::set<std::string> warned;
 };
 
+// one file per tensor, written once when the tensor is first seen and appended for
+// every later row: "wb" (not "ab") so re-running into an existing output directory
+// truncates instead of silently doubling the file.
 static FILE * open_append(const std::string & path) {
-    FILE * f = std::fopen(path.c_str(), "ab");
+    FILE * f = std::fopen(path.c_str(), "wb");
     return f;
 }
 
 // the token axis is the last logical axis. ggml_tensor has no n_dims field and ggml_n_dims()
 // trims trailing 1s, so the rank has to come from the name; these are the shapes the
 // deepseek4.cpp graph builder produces (see DSV4_ARCH_SPEC.md):
-//   [d_h, n_heads, nt] : attn_raw, attn_csa_lid, attn_hca   (build_attn_mha output, pre-reshape)
-//   [D, hc, nt]        : hc_init, hc_attn_post, hc_ffn_post, l_last
+//   [d_h, n_heads, nt] : attn_raw, attn_csa_lid, attn_hca   (build_attn_mha, non-flash path)
+//   [d_h*n_heads, nt]  : the same three with -fa on (build_attn_mha reshapes to 2-D)
+//   [D, hc, nt]        : hc_init, hc_attn_post, l_last
 //   [D/..., nt]        : everything else
+// note: there is no per-layer "hc_ffn_post" in the graph (the FFN hc stream is ffn_out).
 static int base_rank(const std::string & base) {
     if (base == "attn_raw" || base == "attn_csa_lid" || base == "attn_hca" ||
-        base == "hc_init" || base == "hc_attn_post" || base == "hc_ffn_post" || base == "l_last") {
+        base == "hc_init" || base == "hc_attn_post" || base == "l_last") {
         return 3;
     }
     return 2;
 }
 
+// ggml trims trailing 1s, so the name-based rank hint can be wrong (it is for the
+// flash-attention 2-D attention outputs). Resolve the real token axis from the buffer
+// layout: the stride times the token count must cover exactly nbytes, and the axis must
+// hold the requested rows. Prefer the hint; otherwise try ranks largest-first so a 3-D
+// tensor is never mistaken for a 2-D one (which would lose features).
+static int resolve_token_axis(const ggml_tensor * t, int64_t rows_needed, int hint) {
+    const size_t nbytes = ggml_nbytes(t);
+    auto ok = [&](int r) -> bool {
+        if (r < 2 || r > 4) return false;
+        const int64_t nl = t->ne[r - 1];
+        return nl > 0 && rows_needed <= nl && (size_t) t->nb[r - 1] * (size_t) nl == nbytes;
+    };
+    if (ok(hint)) return hint;
+    for (int r = 4; r >= 2; --r) if (ok(r)) return r;
+    return hint;
+}
+
 static bool write_f32_rows(DumpState & st, ggml_tensor * t, const std::string & name,
                            const std::string & base, int il, int64_t rb, int64_t re) {
-    const int nd = base_rank(base);
+    const int nd = resolve_token_axis(t, re, base_rank(base));
     if (!ggml_is_contiguous(t)) {
         if (st.warned.insert(name).second) {
             std::fprintf(stderr, "[golden_dump] skip non-contiguous tensor %s\n", name.c_str());
@@ -152,11 +175,22 @@ static bool write_f32_rows(DumpState & st, ggml_tensor * t, const std::string & 
         return false;
     }
     const int64_t ne_last = t->ne[nd - 1];
-    if (ne_last <= 0) return false;
-    if (rb < 0 || re > ne_last || rb >= re) return false;
+    if (rb < 0 || re > ne_last || rb >= re) {
+        if (st.warned.insert(name).second) {
+            std::fprintf(stderr, "[golden_dump] skip tensor %s: rows [%lld,%lld) outside token axis %d (ne=%lld)\n",
+                         name.c_str(), (long long) rb, (long long) re, nd - 1, (long long) ne_last);
+        }
+        return false;
+    }
     const size_t nbytes = ggml_nbytes(t);
     const size_t per_tok = t->nb[nd - 1];
-    if (nbytes == 0 || per_tok == 0 || nbytes != per_tok * (size_t) ne_last) return false;
+    if (nbytes == 0 || per_tok == 0 || nbytes != per_tok * (size_t) ne_last) {
+        if (st.warned.insert(name).second) {
+            std::fprintf(stderr, "[golden_dump] skip tensor %s: layout mismatch (nbytes=%zu per_tok=%zu ne_last=%lld)\n",
+                         name.c_str(), nbytes, per_tok, (long long) ne_last);
+        }
+        return false;
+    }
 
     const size_t ts = ggml_type_size(t->type);
     if (ts == 0 || per_tok % ts != 0) return false;

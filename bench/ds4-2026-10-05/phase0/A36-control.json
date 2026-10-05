@@ -1,0 +1,44 @@
+{
+  "label": "A36-control",
+  "prompts": [
+    {
+      "predicted_n": 320,
+      "predicted_per_second": 11.093051576778175,
+      "prompt_n": 30,
+      "prompt_per_second": 18.018526649100608,
+      "cpu_ms_per_tok": 752.625
+    },
+    {
+      "predicted_n": 320,
+      "predicted_per_second": 11.23981026636518,
+      "prompt_n": 22,
+      "prompt_per_second": 17.68780225037084,
+      "cpu_ms_per_tok": 734.28125
+    },
+    {
+      "predicted_n": 320,
+      "predicted_per_second": 11.01291244996979,
+      "prompt_n": 27,
+      "prompt_per_second": 18.432198182994867,
+      "cpu_ms_per_tok": 756.09375
+    },
+    {
+      "predicted_n": 320,
+      "predicted_per_second": 11.603130735638487,
+      "prompt_n": 28,
+      "prompt_per_second": 17.29119797742387,
+      "cpu_ms_per_tok": 723.375
+    }
+  ],
+  "prefill": {
+    "cache_n": 0,
+    "prompt_n": 7814,
+    "prompt_ms": 44638.13,
+    "prompt_per_token_ms": 5.71258382390581,
+    "prompt_per_second": 175.05213592056836,
+    "predicted_n": 8,
+    "predicted_ms": 705.344,
+    "predicted_per_token_ms": 100.76342857142858,
+    "predicted_per_second": 9.924235550313039
+  }
+}
