@@ -221,6 +221,24 @@ matmuls, while the CUDA oracle does not, and every layer's output LoRA is two Q8
 the confirming test is to re-run the oracle with the Q8_0/Q2_K tensors promoted to F16 (or on the CPU backend) and
 see whether the residual collapses. Do NOT relax the 0.9999 per-tensor gate before that test.
 
+**Confirming test DONE (2026-10-06, `tools/ds4/check_act_quant.py`, numpy, ~100 MB, no model load) - the residual is
+NOT a ds4_ref bug, and the "CUDA does not quantize activations" inference was WRONG.** Rebuilding layer 0's output
+projection (de-RoPE + grouped Wo_a + Wo_b, real Q8_0 weights read via mmap) from each side's own `attn_raw-0`:
+- with Q8_0-quantized activations, numpy from the golden's `attn_raw-0` reproduces the golden `attn_out-0` at cos
+  0.99999885, and from ds4_ref's `attn_raw-0` reproduces ds4_ref's `attn_out-0` at **cos 1.000000000**. F32 or F16
+  activations only reach 0.99995 vs either. So **both** backends quantize activations (CUDA MMQ q8_1 rounds the same
+  as ggml-cpu q8_0) and ds4_ref's output path is exact.
+- The difference is all in the input: `attn_raw-0` ref vs golden is cos 0.9999999062 (rms diff 1.5e-4 on |x| rms 0.34,
+  max_abs 3.4e-3 - the earlier "2.2e-8" was 1-cos-scale, not max_abs), i.e. CPU-vs-CUDA flash-attention accumulation
+  noise. Q8 activation rounding amplifies it ~100x: through the F32 path the same input gap gives 0.99999986, through
+  the Q8 path 0.99998932 - and **random Gaussian noise of the same rms on the golden input gives 0.999988-0.999991**,
+  the observed value. Downstream, more Q8 rounding plus discrete MoE top-6 flips compound it to the l_last-16/17 drop.
+**Verdict:** the per-tensor cos > 0.9999 at every layer of p64 is below the noise floor of *any* CPU-vs-CUDA pair on
+this model (one layer of flash-attn noise already costs 1e-5 after one Q8 matmul). Logit gates (p600/p3000 top1 1.0,
+KL < 0.01) pass. Gate change is Mal's call and is NOT made here: options are (a) gate per-tensor against a measured
+noise floor (oracle vs oracle with an input perturbation of the observed rms), or (b) treat the logit gates as the
+Phase 3 gate and keep the per-tensor table as a diagnostic.
+
 The probe taps that localized this are committed:
 `tools/ds4/golden_dump.cpp` captures `q`, `kv`, `csa_state_kv`, `csa_state_score_ape`,
 `csa_state_compress` under `DS4_GOLDEN_PROBE=1`, and `tools/ds4/ds4_ref.cpp` dumps the same names
