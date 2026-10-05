@@ -1163,6 +1163,14 @@ if(STRATA_NATIVE_EXPERTS)
       if(STRATA_BUILD_TESTS)
         add_test(NAME ds4_expert_parity COMMAND ds4_expert_parity "$ENV{DS4_GGUF}")
       endif()
+      # DS4 phase 4a: the DeepSeek-V4 expert engine replayed on recorded routes (tools/ds4/moe_replay.cpp).
+      # It links the real machinery - strata_engine's ExpertCache, the CPU ExpertPool, the native grouped
+      # kernels, PinnedArena - and drives them from ds4routes.bin.  --correctness --cpu-only needs no GPU.
+      add_executable(ds4_moe_replay tools/ds4/moe_replay.cpp tools/ds4/moe_gap.cu)
+      target_include_directories(ds4_moe_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${_strata_gpu_include_directories})
+      target_link_libraries(ds4_moe_replay PRIVATE strata_engine strata_kernels strata_kernels_cpu strata_artifact
+        ${_strata_gpu_runtime_target})
     endif()
     if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
       # Unsloth UD-Q4_K_XL's three expert pairs (and Q8_0 alone, its embedding) on synthetic ggml-quantized weights
