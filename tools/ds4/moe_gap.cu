@@ -18,3 +18,19 @@ __global__ void gap_kernel(unsigned long long cycles) {
 extern "C" void moe_gap_launch(unsigned long long cycles, void* stream) {
     gap_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(cycles);
 }
+
+namespace {
+
+// wall-clock version for Phase 4b: %globaltimer is nanoseconds, independent of the SM clock, so a target of
+// 0.41 ms is 0.41 ms whatever boost bin the driver picks (the clock64 version under-delivered ~2.6x in 4a).
+__global__ void gap_kernel_ns(unsigned long long ns) {
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); } while (t - t0 < ns);
+}
+
+}  // namespace
+
+extern "C" void moe_gap_launch_ns(unsigned long long ns, void* stream) {
+    gap_kernel_ns<<<1, 32, 0, (cudaStream_t) stream>>>(ns);
+}

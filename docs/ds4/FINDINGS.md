@@ -166,7 +166,8 @@ from Phase 6 unless a Strata-side draft can run without evicting expert slots.
 | 2 Q2_K experts | **done both paths** (CPU rel err < 2e-7 / GPU 3.0e-5 << 1e-3; 0.71 / 0.017 ms per expert) |
 | 3 reference forward (`tools/ds4/ds4_ref.cpp`, CPU ggml) | **DONE 2026-10-06** - gate = p600/p3000 logits (top1 1.0, KL 0.0086/0.0079, last position only) PASS; per-tensor cosine is a diagnostic (residual proven to be CPU-vs-CUDA noise x Q8 rounding, s9) |
 | 4a MoE engine replay | **done** - best implied 17.28 tok/s (slots 2300, uncaptured loop); ~22.3 with the loop's ~13 ms/token harness cost removed, above the go line 19.6; see s10 |
-| 4b-7 | not started (4b = captured token graph) |
+| 4b step 1 (real layer order) | **gate NOT met** - measured 18.70 tok/s best (slots 2300, at the VRAM edge), 16.72 at 1820; zero-overhead ceiling 20.1-21.2; kill criterion fires, decision with Mal; see s11 |
+| 4b graph-5-7 | not started |
 
 ## 9. Phase 3 gate: ds4_ref vs the llama.cpp oracle on p64 (2026-10-05, gate RED)
 
@@ -290,3 +291,52 @@ admission, no eviction; the shared expert is not computed (inside the 17.6 ms co
 under-delivers (0.4 ms calibrated -> 6.6 ms/token; clock64 vs run boost clocks); run-to-run timing +-4 ms/tok.
 
 Commits (not pushed): `173e535`, `f6c4066`, `805981d`, `dbc4704`, `f035baa`, `3ef564c`.
+
+## 11. Phase 4b step 1: the MoE replay in the real layer order (2026-10-06, gate NOT met)
+
+s10's 22.3 tok/s projection was the claim most likely to be wrong, and it was. It subtracted the un-captured
+overhead from the **CPU** side (27.3 ms), but in the same run the **GPU** side was longer (hit 2.3 + PCIe 28.2 =
+30.4 ms), and it assumed the 17.6 ms of non-MoE GPU work overlaps the experts. In a real decode it cannot:
+experts(l) need router(l), which comes after attention(l), and attention(l+1) needs experts(l).
+
+New harness flags (`tools/ds4/moe_replay.cpp`, sweep `tools/ds4/p4b_sweep.sh`, logs/CSVs
+`bench/ds4-2026-10-06/p4b/`): `--serial` (the CPU waits for the layer's dense GPU work before quantizing and starting
+its misses), `--gap-wall` (the dense stand-in spins on `%globaltimer`, so 0.41 ms/layer delivers 17.8 ms/token
+instead of 4a's clock64 under-delivery), `--pinned-meta` (one pinned upload per group instead of 5 pageable
+copies), `--dither` (error-diffused PCIe budget: `lround` on 1-4 misses snapped pcie-frac 0.50 and 0.55 to the
+identical split; the real share was ~0.59). Gap = the whole Phase-0 non-MoE GPU time (17.6/43), so `wall` IS a
+measured token time with harness syncs included. 320 held-out tokens, threads 7, pinned 48 GiB arena; every run under
+`tools/ds4/memguard.sh` (64 GiB cap, swap off, 4 GiB watchdog), ComfyUI idle alongside.
+
+| arm | hit | gpu busy | cpu busy | wall ms | tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4a reference re-run (`--gap-ms 0`, implied +17.6) | 57.0% | 29.8 | 24.4 | 37.7 (+17.6) | 18.08 implied |
+| **serial, slots 2300, pcie 0.55** | 57.0% | 47.2 | 23.2 | **53.5** | **18.70** |
+| serial + pinned-meta | 57.0% | 48.0 | 24.7 | 54.8 | 18.23 |
+| serial + pinned, pcie 0.50 (same split as 0.55, rounding) | 57.0% | 48.6 | 24.7 | 55.5 | 18.02 |
+| serial + pinned, pcie 0.60 | 57.0% | 48.6 | 23.8 | 54.6 | 18.31 |
+| serial + dither 0.53 | 57.0% | 45.6 | 25.6 | 55.3 | 18.09 |
+| serial + dither 0.47 | 57.0% | 43.5 | 28.7 | 56.3 | 17.78 |
+| serial + dither 0.53, **slots 1820 (12 GiB)** | 50.9% | 49.7 | 29.9 | 59.8 | **16.72** |
+
+Readings:
+- **Measured best 18.7 tok/s, under the go line 19.6** (bar 16.34). The kill criterion fires on a measured number now,
+  not an implied one. At 1820 slots it is 16.7, about the bar.
+- **VRAM:** ~7.2 GiB of non-expert weights must sit in VRAM (8.2 minus the 1 GiB F16 token_embd), plus context/KV/
+  scratch, so ~14.8 GiB is left for slots. 2300 slots (15.2 GiB) is at or just over the edge; 1820 is safe.
+- **Pinned copies changed nothing** (54.8 vs 53.5, inside the +-1-2 ms run noise). The per-layer copy cost is not
+  where the time goes.
+- **Balancing the per-token sums does not help:** wall - max(gpu, gap+cpu) grows from 6.3 to 9.7-12.7 ms as the
+  split moves toward the CPU. What remains is per-layer imbalance (which side is long changes layer by layer) plus a
+  sync per layer. A captured graph + doorbell can cut the sync part but not the imbalance.
+- **Zero-overhead bound** (wall = gpu busy): 47.2 ms = 21.2 tok/s at 2300 slots, 49.7 ms = 20.1 at 1820. So even a
+  perfect Phase 4b lands around 19.5-21 depending on the slot count it can afford: at best marginal over the go line,
+  ~+20-30% over llama.cpp, with the full DS4 GPU forward (Phases 4b-5) still to be written.
+- The critical path is the GPU: dense 17.8 + PCIe DMA ~26-28 (0.44 GiB/token at ~17 GB/s). PCIe bandwidth and the
+  per-layer dependency, not the CPU, set the ceiling on this box.
+
+**Verdict for Mal (decision not taken here):** per PORT_PLAN s1 / s4 the kill criterion fires (measured 18.7 < 19.6).
+Options: (a) stop the Strata port and take s7's fallback - put the PCIe-share split and profile-seeded cache into
+llama.cpp's MoE expert cache, where the same mechanism lifts the 16.34 bar without new attention code; (b) continue
+to a real captured token graph to measure how much of the ~6 ms/token overhead it removes, accepting that the
+ceiling is ~20-21 tok/s.

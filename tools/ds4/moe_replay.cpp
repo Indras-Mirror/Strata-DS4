@@ -151,6 +151,13 @@ struct Args {
     int64_t mem_floor_gib = 3;   // abort below this MemAvailable
     int64_t correctness = 0, correctness_experts = 12;
     bool pin = false, cpu_only = false, no_cache = false, no_pcie = false, quiet = false;
+    // Phase 4b: --serial makes the CPU wait for the layer's dense GPU work (the router dependency of a real
+    // decode: experts(l) need router(l), after attention(l)); --pinned-meta moves every small per-layer copy to
+    // pinned buffers so cudaMemcpyAsync is truly async; --gap-wall uses the %globaltimer gap kernel.
+    bool serial = false, pinned_meta = false, gap_wall = false;
+    // --dither: carry the rounding of nc*pcie_frac from layer to layer (error diffusion). Without it, lround on
+    // 1-4 misses snaps 0.50 and 0.55 to the same counts (measured: identical 17.4/25.6 split, real share ~0.59).
+    bool dither = false;
     uint64_t seed = 20261005;
 };
 
@@ -182,6 +189,10 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
         else if (k == "--no-cache") a.no_cache = true;
         else if (k == "--no-pcie") a.no_pcie = true;
         else if (k == "--quiet") a.quiet = true;
+        else if (k == "--serial") a.serial = true;
+        else if (k == "--pinned-meta") a.pinned_meta = true;
+        else if (k == "--gap-wall") a.gap_wall = true;
+        else if (k == "--dither") a.dither = true;
         else { err = "unknown argument " + k; return false; }
     }
     if (a.routes.empty()) { err = "--routes is required"; return false; }
@@ -192,7 +203,8 @@ void usage() {
     std::printf(
         "usage: moe_replay <model.gguf> --routes ds4routes.bin [--tokens N] [--offset O]\n"
         "       [--slots S] [--pcie-frac F] [--threads T] [--gap-ms X] [--arena-gib G] [--pin]\n"
-        "       [--correctness K] [--cpu-only] [--no-cache] [--no-pcie] [--out csv] [--quiet]\n");
+        "       [--correctness K] [--cpu-only] [--no-cache] [--no-pcie] [--out csv] [--quiet]\n"
+        "       [--serial] [--pinned-meta] [--gap-wall]   (Phase 4b: real layer order, async copies, wall gap)\n");
 }
 
 // ================================ route replay ================================
@@ -393,12 +405,14 @@ bool build_arena(Arena& ar, const Args& a, BlobSource& src, const Routes& r, std
 //
 // The dense+attention work the concurrent Phase-3 slice owns, as a spin of the measured length (moe_gap.cu).
 extern "C" void moe_gap_launch(unsigned long long cycles, void* stream);
+extern "C" void moe_gap_launch_ns(unsigned long long ns, void* stream);
 
 struct GpuGap {
-    bool armed = false;
-    unsigned long long cycles = 0;
-    void calibrate(double ms_target, void* s) {
+    bool armed = false, wall = false;
+    unsigned long long cycles = 0, ns = 0;
+    void calibrate(double ms_target, void* s, bool use_wall = false) {
         if (ms_target <= 0) return;
+        if (use_wall) { wall = true; ns = (unsigned long long) (ms_target * 1e6); armed = true; return; }
         cudaEvent_t e0, e1;
         ck(cudaEventCreate(&e0), "gap e0");
         ck(cudaEventCreate(&e1), "gap e1");
@@ -416,7 +430,7 @@ struct GpuGap {
         armed = true;
     }
     void launch(void* s) const {
-        if (armed) moe_gap_launch(cycles, s);
+        if (armed) { if (wall) moe_gap_launch_ns(ns, s); else moe_gap_launch(cycles, s); }
     }
 };
 
@@ -467,11 +481,18 @@ private:
          *d_ngroups_ = nullptr, *d_ent_dst_ = nullptr, *d_ent_tok_ = nullptr, *d_scratch_ = nullptr,
          *d_stage_ = nullptr, *d_corr_ = nullptr;
     cudaEvent_t ev_[4] = {};
+    // --pinned-meta: one pinned block per group (0 = hits, 1 = PCIe) + x + the parts readback
+    struct Meta { unsigned long long ptr[kMaxParts]; int32_t start[kMaxParts + 1], dst[kMaxParts], tok[kMaxParts], n; };
+    Meta* h_meta_ = nullptr;
+    Meta* d_meta_ = nullptr;
+    float* h_x_ = nullptr;
+    float* h_parts_ = nullptr;
     std::vector<uint8_t> nact_, hq_;
     std::vector<float> parts_;
     std::vector<cpu::ExpertJobMulti> jobs_;
     std::vector<uint8_t> ftmp_;
     int64_t admitted_ = 0;
+    double pcie_carry_ = 0.0;
 };
 
 bool Engine::init(const Args& a, Arena& arena, BlobSource& src, const cpu::NativeFmt& f, std::string& err) {
@@ -503,7 +524,13 @@ bool Engine::init(const Args& a, Arena& arena, BlobSource& src, const cpu::Nativ
         ck(cudaMalloc(&d_stage_, (size_t) kMaxParts * blob_), "d_stage");
         ck(cudaMalloc(&d_corr_, (size_t) kTopK * blob_), "d_corr");
         for (int i = 0; i < 4; ++i) ck(cudaEventCreate(&ev_[i]), "event");
-        gap_.calibrate(a.gap_ms, s_);
+        if (a.pinned_meta) {
+            ck(cudaMallocHost((void**) &h_meta_, sizeof(Meta) * 2), "h_meta");
+            ck(cudaMalloc((void**) &d_meta_, sizeof(Meta) * 2), "d_meta");
+            ck(cudaMallocHost((void**) &h_x_, (size_t) H * 4), "h_x");
+            ck(cudaMallocHost((void**) &h_parts_, (size_t) kMaxParts * H * 4), "h_parts");
+        }
+        gap_.calibrate(a.gap_ms, s_, a.gap_wall);
         std::printf("gpu: gap %.3f ms/layer (%llu cycles), PCIe staging %d x %.2f MiB\n", a.gap_ms,
                     (unsigned long long) gap_.cycles, kMaxParts, (double) blob_ / 1048576.0);
     }
@@ -556,7 +583,14 @@ Stats Engine::layer(int l, const uint16_t* ids, const float* x, bool force_cpu) 
         else cpu_i[nc++] = k;
     }
     if (!force_cpu && !a_.no_pcie && cache_.valid()) {
-        const int budget = (int) std::lround((double) nc * a_.pcie_frac);
+        int budget;
+        if (a_.dither) {
+            const double want = (double) nc * a_.pcie_frac + pcie_carry_;
+            budget = (int) std::floor(want);
+            pcie_carry_ = want - budget;
+        } else {
+            budget = (int) std::lround((double) nc * a_.pcie_frac);
+        }
         for (int i = 0; i < nc && np < budget; ++i) {
             const int k = cpu_i[nc - 1 - i];
             if (arena_->ptr(l, ids[2 * k + 1])) pcie_i[np++] = k;   // the last misses in routing order
@@ -569,14 +603,49 @@ Stats Engine::layer(int l, const uint16_t* ids, const float* x, bool force_cpu) 
         if (!in_pcie) cpu_keep[nk++] = cpu_i[i];
     }
 
-    cpu::native_quant_act(f_, x, nact_.data());
+    if (!a_.serial) cpu::native_quant_act(f_, x, nact_.data());
     if (gpu) {
-        ck(cudaMemcpyAsync(d_x_, x, (size_t) H * 4, cudaMemcpyHostToDevice, (cudaStream_t) s_), "h2d x");
+        const float* xs = x;
+        if (h_x_) { std::memcpy(h_x_, x, (size_t) H * 4); xs = h_x_; }
+        ck(cudaMemcpyAsync(d_x_, xs, (size_t) H * 4, cudaMemcpyHostToDevice, (cudaStream_t) s_), "h2d x");
         strata::kernels::native_quantize_q8_1((const float*) d_x_, d_xq_, (int) H, 1, s_);
         ck(cudaEventRecord(ev_[0], (cudaStream_t) s_), "rec gap0");
         gap_.launch(s_);
         ck(cudaEventRecord(ev_[1], (cudaStream_t) s_), "rec gap1");
     }
+
+    // upload one group's metadata and launch the grouped expert kernel (w: 0 = hits, 1 = PCIe share)
+    auto launch_group = [&](int w, int n, const std::vector<unsigned long long>& ptr, const std::vector<int32_t>& start,
+                            const std::vector<int32_t>& dst, const std::vector<int32_t>& tok) {
+        const unsigned long long* gp; const int32_t *gs, *gn, *gd, *gt;
+        if (h_meta_) {
+            Meta& m = h_meta_[w];
+            std::memcpy(m.ptr, ptr.data(), sizeof(unsigned long long) * n);
+            std::memcpy(m.start, start.data(), sizeof(int32_t) * (n + 1));
+            std::memcpy(m.dst, dst.data(), sizeof(int32_t) * n);
+            std::memcpy(m.tok, tok.data(), sizeof(int32_t) * n);
+            m.n = n;
+            ck(cudaMemcpyAsync(d_meta_ + w, &m, sizeof(Meta), cudaMemcpyHostToDevice, (cudaStream_t) s_), "meta");
+            Meta* d = d_meta_ + w;
+            gp = d->ptr; gs = d->start; gn = &d->n; gd = d->dst; gt = d->tok;
+        } else {
+            const int32_t one = n;
+            ck(cudaMemcpyAsync(d_grp_ptr_, ptr.data(), sizeof(unsigned long long) * n, cudaMemcpyHostToDevice,
+                               (cudaStream_t) s_), "grp_ptr");
+            ck(cudaMemcpyAsync(d_grp_start_, start.data(), sizeof(int32_t) * (n + 1), cudaMemcpyHostToDevice,
+                               (cudaStream_t) s_), "grp_start");
+            ck(cudaMemcpyAsync(d_ngroups_, &one, sizeof(int32_t), cudaMemcpyHostToDevice, (cudaStream_t) s_),
+               "ngroups");
+            ck(cudaMemcpyAsync(d_ent_dst_, dst.data(), sizeof(int32_t) * n, cudaMemcpyHostToDevice,
+                               (cudaStream_t) s_), "ent_dst");
+            ck(cudaMemcpyAsync(d_ent_tok_, tok.data(), sizeof(int32_t) * n, cudaMemcpyHostToDevice,
+                               (cudaStream_t) s_), "ent_tok");
+            gp = (const unsigned long long*) d_grp_ptr_; gs = (const int32_t*) d_grp_start_;
+            gn = (const int32_t*) d_ngroups_; gd = (const int32_t*) d_ent_dst_; gt = (const int32_t*) d_ent_tok_;
+        }
+        strata::kernels::native_expert_grouped(gl_, gp, gs, gn, gd, gt, kMaxParts, n, d_xq_, d_scratch_,
+                                               (float*) d_parts_, s_, n);
+    };
 
     int ev_hit = -1, ev_pcie = -1;
     if (nh > 0 && gpu) {
@@ -588,20 +657,7 @@ Stats Engine::layer(int l, const uint16_t* ids, const float* x, bool force_cpu) 
             dst[i] = hit_i[i];
         }
         start[nh] = nh;
-        const int32_t one = nh;
-        ck(cudaMemcpyAsync(d_grp_ptr_, ptr.data(), sizeof(unsigned long long) * nh, cudaMemcpyHostToDevice,
-                           (cudaStream_t) s_), "grp_ptr");
-        ck(cudaMemcpyAsync(d_grp_start_, start.data(), sizeof(int32_t) * (nh + 1), cudaMemcpyHostToDevice,
-                           (cudaStream_t) s_), "grp_start");
-        ck(cudaMemcpyAsync(d_ngroups_, &one, sizeof(int32_t), cudaMemcpyHostToDevice, (cudaStream_t) s_), "ngroups");
-        ck(cudaMemcpyAsync(d_ent_dst_, dst.data(), sizeof(int32_t) * nh, cudaMemcpyHostToDevice,
-                           (cudaStream_t) s_), "ent_dst");
-        ck(cudaMemcpyAsync(d_ent_tok_, tok.data(), sizeof(int32_t) * nh, cudaMemcpyHostToDevice,
-                           (cudaStream_t) s_), "ent_tok");
-        strata::kernels::native_expert_grouped(gl_, (const unsigned long long*) d_grp_ptr_,
-                                               (const int32_t*) d_grp_start_, (const int32_t*) d_ngroups_,
-                                               (const int32_t*) d_ent_dst_, (const int32_t*) d_ent_tok_,
-                                               kMaxParts, nh, d_xq_, d_scratch_, (float*) d_parts_, s_, nh);
+        launch_group(0, nh, ptr, start, dst, tok);
         ck(cudaEventRecord(ev_[2], (cudaStream_t) s_), "rec hit1");
         ev_hit = 2;
     }
@@ -617,23 +673,16 @@ Stats Engine::layer(int l, const uint16_t* ids, const float* x, bool force_cpu) 
             dst[i] = pcie_i[i];
         }
         start[np] = np;
-        const int32_t one = np;
-        ck(cudaMemcpyAsync(d_grp_ptr_, ptr.data(), sizeof(unsigned long long) * np, cudaMemcpyHostToDevice,
-                           (cudaStream_t) s_), "pcie grp_ptr");
-        ck(cudaMemcpyAsync(d_grp_start_, start.data(), sizeof(int32_t) * (np + 1), cudaMemcpyHostToDevice,
-                           (cudaStream_t) s_), "pcie grp_start");
-        ck(cudaMemcpyAsync(d_ngroups_, &one, sizeof(int32_t), cudaMemcpyHostToDevice, (cudaStream_t) s_),
-           "pcie ngroups");
-        ck(cudaMemcpyAsync(d_ent_dst_, dst.data(), sizeof(int32_t) * np, cudaMemcpyHostToDevice,
-                           (cudaStream_t) s_), "pcie ent_dst");
-        ck(cudaMemcpyAsync(d_ent_tok_, tok.data(), sizeof(int32_t) * np, cudaMemcpyHostToDevice,
-                           (cudaStream_t) s_), "pcie ent_tok");
-        strata::kernels::native_expert_grouped(gl_, (const unsigned long long*) d_grp_ptr_,
-                                               (const int32_t*) d_grp_start_, (const int32_t*) d_ngroups_,
-                                               (const int32_t*) d_ent_dst_, (const int32_t*) d_ent_tok_,
-                                               kMaxParts, np, d_xq_, d_scratch_, (float*) d_parts_, s_, np);
+        launch_group(1, np, ptr, start, dst, tok);
         ck(cudaEventRecord(ev_[3], (cudaStream_t) s_), "rec pcie1");
         ev_pcie = 3;
+    }
+
+    // --serial: in a real decode the expert ids exist only after layer l's attention + router, so the CPU waits
+    // for the dense GPU work (ev_[1]) before it can quantize the activation and start its misses
+    if (a_.serial) {
+        if (gpu) ck(cudaEventSynchronize(ev_[1]), "serial gap wait");
+        cpu::native_quant_act(f_, x, nact_.data());
     }
 
     // the CPU pool on what is left, WHILE the GPU works
@@ -673,8 +722,8 @@ Stats Engine::layer(int l, const uint16_t* ids, const float* x, bool force_cpu) 
             ck(cudaEventElapsedTime(&ms, ev_[from], ev_[ev_pcie]), "pcie elapsed");
             st.pcie_ms = ms;
         }
-        ck(cudaMemcpyAsync(parts_.data(), d_parts_, (size_t) kMaxParts * H * 4, cudaMemcpyDeviceToHost,
-                           (cudaStream_t) s_), "d2h parts");
+        ck(cudaMemcpyAsync(h_parts_ ? h_parts_ : parts_.data(), d_parts_, (size_t) kMaxParts * H * 4,
+                           cudaMemcpyDeviceToHost, (cudaStream_t) s_), "d2h parts");
         ck(cudaStreamSynchronize((cudaStream_t) s_), "parts sync");
     }
 
@@ -1009,7 +1058,13 @@ int main(int argc, char** argv) {
     // `wall` IS the MoE engine's own time and adding 17.6 does not double count.  With a gap the injected GPU
     // work is already inside `wall`, so the same sum would count it twice; the with-gap arm is printed as an
     // overlap check instead (its wall against the coarse `max(gpu, cpu)` bound rather than a sum).
-    if (a.gap_ms > 0) {
+    if (a.serial && a.gap_ms > 0) {
+        // --serial with gap = Phase 0's whole non-MoE GPU time per layer (17.6 / 43 = 0.41 ms): the CPU cannot
+        // start before the gap ends, so `wall` is the measured token time of the real layer chain, harness
+        // syncs included; nothing is added on top.
+        std::printf("measured full-token (serial chain, gap %.2f ms/token of non-MoE GPU inside) = %.2f ms -> "
+                    "%.2f tok/s (bar 16.34, go 19.6)\n", total.gap_ms / r.count, tok_ms, 1000.0 / tok_ms);
+    } else if (a.gap_ms > 0) {
         std::printf("implied full-token (overlap): MoE wall %.2f already contains the injected %.2f ms/token of\n"
                     "          dense+attention; the serial rest of Phase 0's 17.6 (attn 1.6 + other 2.1) = 3.7\n",
                     tok_ms, total.gap_ms / r.count);
