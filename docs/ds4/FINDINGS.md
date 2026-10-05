@@ -167,6 +167,7 @@ from Phase 6 unless a Strata-side draft can run without evicting expert slots.
 | 3 reference forward (`tools/ds4/ds4_ref.cpp`, CPU ggml) | **DONE 2026-10-06** - gate = p600/p3000 logits (top1 1.0, KL 0.0086/0.0079, last position only) PASS; per-tensor cosine is a diagnostic (residual proven to be CPU-vs-CUDA noise x Q8 rounding, s9) |
 | 4a MoE engine replay | **done** - best implied 17.28 tok/s (slots 2300, uncaptured loop); ~22.3 with the loop's ~13 ms/token harness cost removed, above the go line 19.6; see s10 |
 | 4b step 1 (real layer order) | **gate NOT met** - measured 18.70 tok/s best (slots 2300, at the VRAM edge), 16.72 at 1820; zero-overhead ceiling 20.1-21.2; kill criterion fires, decision with Mal; see s11 |
+| 4b step 2 (predicted prefetch) | **GO in the replay** - 20.57 tok/s at 2150 slots (speed only, no output check; the real engine is not built yet); see s12 |
 | 4b graph-5-7 | not started |
 
 ## 9. Phase 3 gate: ds4_ref vs the llama.cpp oracle on p64 (2026-10-05, gate RED)
@@ -340,3 +341,46 @@ Options: (a) stop the Strata port and take s7's fallback - put the PCIe-share sp
 llama.cpp's MoE expert cache, where the same mechanism lifts the 16.34 bar without new attention code; (b) continue
 to a real captured token graph to measure how much of the ~6 ms/token overhead it removes, accepting that the
 ceiling is ~20-21 tok/s.
+
+## 12. Phase 4b step 2: predicted expert prefetch (2026-10-06) - 20.57 tok/s measured in the replay
+
+**Why the plan's PCIe split could not reach 20:** `tools/ds4/bw_contend.cu` - CPU alone 23.3 GB/s, PCIe alone 23.7,
+**both at once CPU 12.2 + PCIe 17.7 = 29.9 GB/s**. DMA out of pinned RAM and the CPU's expert reads share the DDR4
+bus, so splitting misses buys ~+28% over the CPU alone, not 2x (4a: pcie-0 48.1 ms vs pcie-0.55 48.9 ms MoE).
+
+**The idle window:** during each layer's dense work (~0.41 ms) the PCIe link and the CPU are idle (the experts are
+not known yet). `tools/ds4/hidden_probe.cpp` dumped 1024 tokens' router inputs (`bench/ds4-2026-10-06/hidden-probe/`,
+run under memguard, mmap); `tools/ds4/predict_experts.py`: layer l's router on an earlier state recalls the true
+top-6 at 62% (layer l-1's ffn_norm) / 63% (layer l's pre-attention stream, re-normed with ffn_norm) @6, 70% @8,
+78% @12; sanity (true input) 1.000 on all 40 layers; hash layers 0-2 are exact (tid2eid). `sim_prefetch.py`:
+1.43 experts/layer (what 0.41 ms x 23.7 GB/s moves) cuts misses 27-28%.
+
+**Measured in the replay** (`--pred --pf-b`, `tools/ds4/p4b_prefetch.sh`, `bench/ds4-2026-10-06/p4b-prefetch/`;
+held-out 512 probe tokens, cache seeded from ds4routes' train half, `--serial --gap-wall`, prefetch DMA on a second
+stream under the gap, a per-layer prediction readback charged, guesses outside the arena still DMA a dummy blob):
+
+| slots | arm | hit (incl. prefetched) | tok/s |
+| ---: | --- | ---: | ---: |
+| 1820 | base | 53.8% | 17.84 |
+| 1820 | prefetch 1.43 | 66.1% | 19.32 |
+| 1820 | prefetch 1.43, pcie 0.35 dithered | | 19.34 |
+| 1820 | prefetch 2.0 / 3.0 | | 19.01 / 15.93 (DMA crowds the link) |
+| **2150 (the real VRAM budget)** | base | | 19.42 |
+| **2150** | **prefetch 1.43, pcie 0.25 dithered** | | **20.57** |
+| 2150 | prefetch 1.43, pcie 0.35 / 0.15 | | 20.37 / 20.27 |
+| 2300 (over budget) | prefetch 1.43, pcie 0.55 | 71.8% | 21.18 |
+
+Useful prefetches 31.9/token at 1820 (sim said 32): the simulation holds. VRAM budget for slots: 24 GiB - ~7.2
+non-expert - ~0.8 scratch - ~1 ctx/KV - ~0.5 other = ~14.5 GiB = ~2150 slots.
+
+**Verdict: GO** - 20.57 tok/s at the realistic slot count vs llama.cpp 16.34 (+26%), over the go line 19.6.
+
+**What this does NOT show (read before quoting the number):** the replay measures SPEED only - random activations,
+a timed stand-in for attention (Phase 0's 17.6 ms of llama.cpp non-MoE GPU time), real routes and real expert
+kernels. It does not generate text and does not check outputs. Coherence rests on Phase 2 (expert kernels exact) and
+Phase 3 (reference forward = llama.cpp logits); prefetch cannot change results by construction (the true router
+still selects; a wrong guess wastes a DMA) but no end-to-end output check has run. The real Strata DS4 decode engine
+(GPU attention + CSA/HCA + indexer + the expert tier + this prefetch) does not exist yet: it must pass the logits gate
+vs llama.cpp and a real generation check before any tok/s counts. Predictions came from llama.cpp's hidden states on
+2 corpus files; recall on other text is untested. Next: build that engine (Phase 4b proper), predictor on the GPU.
+(a) llama.cpp fallback: same prefetch idea, but its cache only updates between graph runs - not started.

@@ -73,6 +73,8 @@ constexpr int kExperts = 256;
 constexpr int kTopK = 6;
 constexpr int64_t kBatch = 512;   // route_probe tokenized in 512-token ubatches; see Routes
 constexpr int kMaxParts = 8;      // the pool's MAXT is 8; K=6 needs no more
+constexpr int kPredW = 16;        // ranked predictions per (token, layer) in --pred
+constexpr int kMaxPf = 6;         // prefetch staging slots
 constexpr const char* kVerifyGguf = "blk.%d.ffn_%s_exps.weight";
 
 int g_fail = 0;
@@ -158,6 +160,13 @@ struct Args {
     // --dither: carry the rounding of nc*pcie_frac from layer to layer (error diffusion). Without it, lround on
     // 1-4 misses snaps 0.50 and 0.55 to the same counts (measured: identical 17.4/25.6 split, real share ~0.59).
     bool dither = false;
+    // --pred FILE --pf-b B: predicted prefetch (FINDINGS s12). FILE = [n_tok][43][16] u16 ranked predictions for the
+    // --routes file's tokens (tools/ds4/sim_prefetch.py --export). At each layer's start, before the dense work, up
+    // to B (error-diffused) predicted experts that are NOT cached are DMA'd into staging on a second stream, under
+    // the dense work; a routed miss that was prefetched is computed on the GPU like a hit. --profile FILE seeds the
+    // cache from another routes file (default: --routes).
+    std::string pred, profile;
+    double pf_b = 0.0;
     uint64_t seed = 20261005;
 };
 
@@ -193,6 +202,9 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
         else if (k == "--pinned-meta") a.pinned_meta = true;
         else if (k == "--gap-wall") a.gap_wall = true;
         else if (k == "--dither") a.dither = true;
+        else if (k == "--pred") a.pred = next_s();
+        else if (k == "--pf-b") a.pf_b = next_d();
+        else if (k == "--profile") a.profile = next_s();
         else { err = "unknown argument " + k; return false; }
     }
     if (a.routes.empty()) { err = "--routes is required"; return false; }
@@ -204,7 +216,7 @@ void usage() {
         "usage: moe_replay <model.gguf> --routes ds4routes.bin [--tokens N] [--offset O]\n"
         "       [--slots S] [--pcie-frac F] [--threads T] [--gap-ms X] [--arena-gib G] [--pin]\n"
         "       [--correctness K] [--cpu-only] [--no-cache] [--no-pcie] [--out csv] [--quiet]\n"
-        "       [--serial] [--pinned-meta] [--gap-wall]   (Phase 4b: real layer order, async copies, wall gap)\n");
+        "       [--serial] [--pinned-meta] [--gap-wall] [--dither] [--pred FILE --pf-b B] [--profile FILE]\n");
 }
 
 // ================================ route replay ================================
@@ -456,6 +468,8 @@ public:
     bool init(const Args& a, Arena& arena, BlobSource& src, const cpu::NativeFmt& f, std::string& err);
     void prepare_buffers();
     Stats run_token(const Routes& r, int64_t t, const std::vector<float>& x_tok, bool force_cpu);
+    std::vector<uint16_t> pred_;                    // [n_tok][kLayers][kPredW] for --pred
+    int64_t pf_issued_ = 0, pf_useful_ = 0, pf_dummy_ = 0;
     bool prefill(const std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t slots, std::string& err,
                  int64_t& resident);
     bool correctness(const Args& a, const Routes& r, BlobSource& src, std::string& err);
@@ -465,7 +479,7 @@ public:
     int64_t admitted() const { return admitted_; }
 
 private:
-    Stats layer(int l, const uint16_t* ids, const float* x, bool force_cpu);
+    Stats layer(int l, const uint16_t* ids, const float* x, bool force_cpu, const uint16_t* pred = nullptr);
 
     Args a_;
     Arena* arena_ = nullptr;
@@ -492,7 +506,12 @@ private:
     std::vector<cpu::ExpertJobMulti> jobs_;
     std::vector<uint8_t> ftmp_;
     int64_t admitted_ = 0;
-    double pcie_carry_ = 0.0;
+    double pcie_carry_ = 0.0, pf_carry_ = 0.0;
+    void* d_pf_ = nullptr;                          // kMaxPf prefetch staging slots
+    void* s_pf_ = nullptr;                          // the prefetch stream
+    cudaEvent_t ev_pf_ = nullptr;
+    uint8_t* h_dummy_ = nullptr;                    // pinned stand-in source for a guess outside the arena
+    uint8_t* h_rb_ = nullptr;                       // pinned readback of the predicted ids (modelled cost)
 };
 
 bool Engine::init(const Args& a, Arena& arena, BlobSource& src, const cpu::NativeFmt& f, std::string& err) {
@@ -524,6 +543,16 @@ bool Engine::init(const Args& a, Arena& arena, BlobSource& src, const cpu::Nativ
         ck(cudaMalloc(&d_stage_, (size_t) kMaxParts * blob_), "d_stage");
         ck(cudaMalloc(&d_corr_, (size_t) kTopK * blob_), "d_corr");
         for (int i = 0; i < 4; ++i) ck(cudaEventCreate(&ev_[i]), "event");
+        if (a.pf_b > 0) {
+            cudaStream_t ps = nullptr;
+            ck(cudaStreamCreateWithFlags(&ps, cudaStreamNonBlocking), "pf stream");
+            s_pf_ = ps;
+            ck(cudaMalloc(&d_pf_, (size_t) kMaxPf * blob_), "d_pf");
+            ck(cudaEventCreateWithFlags(&ev_pf_, cudaEventDisableTiming), "ev_pf");
+            ck(cudaMallocHost((void**) &h_dummy_, (size_t) blob_), "h_dummy");
+            std::memset(h_dummy_, 0, (size_t) blob_);
+            ck(cudaMallocHost((void**) &h_rb_, 64), "h_rb");
+        }
         if (a.pinned_meta) {
             ck(cudaMallocHost((void**) &h_meta_, sizeof(Meta) * 2), "h_meta");
             ck(cudaMalloc((void**) &d_meta_, sizeof(Meta) * 2), "d_meta");
@@ -568,20 +597,54 @@ bool Engine::prefill(const std::vector<std::pair<int32_t, int32_t>>& ranked, int
     return true;
 }
 
-Stats Engine::layer(int l, const uint16_t* ids, const float* x, bool force_cpu) {
+Stats Engine::layer(int l, const uint16_t* ids, const float* x, bool force_cpu, const uint16_t* pred) {
     Stats st;
     const double t0 = now_ms();
     const bool gpu = !a_.cpu_only;
 
     // `ids` points at this layer's six (layer, expert) pairs; the expert of router index k is ids[2k+1].
+    // predicted prefetch: issued at the layer's start, so its DMA runs under the dense work (gap) below
+    int pf_e[kMaxPf], npf = 0;
+    if (pred && gpu && !force_cpu && cache_.valid() && a_.pf_b > 0) {
+        // the real engine reads the predicted ids back from the GPU before it can issue the copies: charge it
+        ck(cudaMemcpyAsync(h_rb_, d_x_, 64, cudaMemcpyDeviceToHost, (cudaStream_t) s_), "pf readback");
+        ck(cudaStreamSynchronize((cudaStream_t) s_), "pf readback sync");
+        const double want = a_.pf_b + pf_carry_;
+        const int nb = std::min(kMaxPf, (int) std::floor(want));
+        pf_carry_ = want - std::floor(want);
+        for (int i = 0; i < kPredW && npf < nb; ++i) {
+            const int e = pred[i];
+            if (cache_.slot_of(l, e) >= 0) continue;
+            bool dup = false;
+            for (int j = 0; j < npf; ++j) dup = dup || pf_e[j] == e;
+            if (dup) continue;
+            const uint8_t* src = arena_->ptr(l, e);
+            if (!src) { src = h_dummy_; ++pf_dummy_; }   // a guess outside the replay's arena still costs its DMA
+            ck(cudaMemcpyAsync((uint8_t*) d_pf_ + (size_t) npf * blob_, src, (size_t) blob_, cudaMemcpyHostToDevice,
+                               (cudaStream_t) s_pf_), "pf dma");
+            pf_e[npf++] = e;
+        }
+        if (npf > 0) ck(cudaEventRecord(ev_pf_, (cudaStream_t) s_pf_), "rec pf");
+        pf_issued_ += npf;
+    }
+
     int32_t hit_i[kMaxParts], cpu_i[kMaxParts], pcie_i[kMaxParts], slot_i[kMaxParts] = {};
-    int nh = 0, nc = 0, np = 0;
+    unsigned long long pf_ptr[kMaxParts] = {};
+    int nh = 0, nc = 0, np = 0, npf_hit = 0;
     for (int k = 0; k < kTopK; ++k) {
         const int32_t s = (!force_cpu && cache_.valid()) ? cache_.slot_of(l, ids[2 * k + 1]) : -1;
         slot_i[k] = s;
+        int pf_at = -1;
+        for (int j = 0; j < npf && s < 0; ++j) if (pf_e[j] == ids[2 * k + 1]) pf_at = j;
         if (s >= 0) hit_i[nh++] = k;
+        else if (pf_at >= 0) {
+            pf_ptr[k] = (unsigned long long) d_pf_ + (size_t) pf_at * blob_;
+            hit_i[nh++] = k;
+            ++npf_hit;
+        }
         else cpu_i[nc++] = k;
     }
+    pf_useful_ += npf_hit;
     if (!force_cpu && !a_.no_pcie && cache_.valid()) {
         int budget;
         if (a_.dither) {
@@ -652,11 +715,13 @@ Stats Engine::layer(int l, const uint16_t* ids, const float* x, bool force_cpu) 
         std::vector<unsigned long long> ptr((size_t) nh);
         std::vector<int32_t> start((size_t) nh + 1), dst((size_t) nh, 0), tok((size_t) nh, 0);
         for (int i = 0; i < nh; ++i) {
-            ptr[i] = (unsigned long long) cache_.device_slot(slot_i[hit_i[i]]);
+            ptr[i] = pf_ptr[hit_i[i]] ? pf_ptr[hit_i[i]]
+                                      : (unsigned long long) cache_.device_slot(slot_i[hit_i[i]]);
             start[i] = i;
             dst[i] = hit_i[i];
         }
         start[nh] = nh;
+        if (npf_hit > 0) ck(cudaStreamWaitEvent((cudaStream_t) s_, ev_pf_, 0), "wait pf");
         launch_group(0, nh, ptr, start, dst, tok);
         ck(cudaEventRecord(ev_[2], (cudaStream_t) s_), "rec hit1");
         ev_hit = 2;
@@ -758,7 +823,8 @@ Stats Engine::run_token(const Routes& r, int64_t t, const std::vector<float>& x_
     const uint16_t* ids = r.tok(t);
     for (int l = 0; l < kLayers; ++l) {
         const uint16_t* dst = ids + (size_t) l * kTopK * 2;
-        sum.add(layer(l, dst, x_tok.data() + (size_t) l * H, force_cpu));
+        const uint16_t* pr = pred_.empty() ? nullptr : pred_.data() + ((size_t) t * kLayers + l) * kPredW;
+        sum.add(layer(l, dst, x_tok.data() + (size_t) l * H, force_cpu, pr));
     }
     return sum;
 }
@@ -999,6 +1065,19 @@ int main(int argc, char** argv) {
     Engine eng;
     if (!eng.init(a, arena, src, f, err)) { std::printf("engine: %s\n", err.c_str()); return 1; }
     eng.prepare_buffers();
+    if (!a.pred.empty()) {
+        std::ifstream pin(a.pred, std::ios::binary | std::ios::ate);
+        if (!pin) { std::printf("pred: cannot open %s\n", a.pred.c_str()); return 1; }
+        const int64_t pb = (int64_t) pin.tellg();
+        pin.seekg(0);
+        eng.pred_.resize((size_t) (pb / 2));
+        pin.read((char*) eng.pred_.data(), pb);
+        if ((int64_t) eng.pred_.size() != r.n_tokens * kLayers * kPredW) {
+            std::printf("pred: %lld entries, routes have %lld tokens\n", (long long) eng.pred_.size(), (long long) r.n_tokens);
+            return 1;
+        }
+        std::printf("pred: %s, prefetch budget %.2f experts/layer\n", a.pred.c_str(), a.pf_b);
+    }
 
     if (a.correctness > 0) {
         if (!eng.correctness(a, r, src, err)) { std::printf("correctness: %s\n", err.c_str()); return 1; }
@@ -1009,7 +1088,7 @@ int main(int argc, char** argv) {
     }
 
     if (!a.no_cache && !a.cpu_only) {
-        const std::vector<std::pair<int32_t, int32_t>> ranked = rank_profile(a.routes, err);
+        const std::vector<std::pair<int32_t, int32_t>> ranked = rank_profile(a.profile.empty() ? a.routes : a.profile, err);
         if (ranked.empty()) { std::printf("profile: %s\n", err.c_str()); return 1; }
         int64_t resident = 0;
         if (!eng.prefill(ranked, a.slots, err, resident)) { std::printf("prefill: %s\n", err.c_str()); return 1; }
@@ -1075,6 +1154,10 @@ int main(int argc, char** argv) {
                     "                    it, add only Phase 0's serial attn+other, ~3.7 ms.)\n");
     }
     std::printf("admissions during the run: %lld\n", (long long) eng.admitted());
+    if (!eng.pred_.empty())
+        std::printf("prefetch: issued %.1f/token, useful %.1f/token (%.1f%%), %lld guesses outside the arena (dummy DMA)\n",
+                    (double) eng.pf_issued_ / r.count, (double) eng.pf_useful_ / r.count,
+                    100.0 * (double) eng.pf_useful_ / std::max<int64_t>(1, eng.pf_issued_), (long long) eng.pf_dummy_);
 
     if (!a.out_csv.empty()) {
         std::FILE* fcsv = std::fopen(a.out_csv.c_str(), "w");
