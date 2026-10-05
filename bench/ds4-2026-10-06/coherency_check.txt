@@ -1,0 +1,12 @@
+=== p64 (75 tokens) ... prompt ends: '(size_t h, size_t t, size_t cap) { return (t - h + cap) % cap; }\n'
+  llama.cpp next token top-5: ['inline', 'void', 'size', '```\n\n', '//']
+  ds4_ref   next token top-5: ['inline', 'void', '```\n\n', 'size', '//']
+  top-1 agree: True   top-5 overlap: 5/5
+=== p600 (601 tokens) ... prompt ends: ', so a port that shares one rope table between raw and\ncompressed layers will drift even when every other tensor matches.\n'
+  llama.cpp next token top-5: ['</', 'The', 'Additionally', 'Comp', '```\n\n']
+  ds4_ref   next token top-5: ['</', 'The', 'Additionally', 'Comp', '```\n\n']
+  top-1 agree: True   top-5 overlap: 5/5
+=== p3000 (2998 tokens) ... prompt ends: ' is contaminated by page faults, and the profile will blame the\nkernels for a cost that belongs to the loader.\n'
+  llama.cpp next token top-5: ['"""\n\n', '"""\n', '""', '</', '```\n\n']
+  ds4_ref   next token top-5: ['"""\n\n', '""', '"""\n', '</', '```\n\n']
+  top-1 agree: True   top-5 overlap: 5/5
