@@ -112,6 +112,9 @@ Plain CUDA (or even CPU) path, no graphs, F32 accumulation, F16/F32 KV:
 - Order of work: <= 128 tokens (raw + CSA compressor, no indexer, no HCA) -> <= 2048 (HCA) -> > 2048 (indexer).
 - **Gate:** against the golden dumps, per layer: cosine > 0.9999 on hc streams at 64 tokens; final logits top-1
   agreement > 99% and mean KL < 0.01 teacher-forced over the 600- and 3000-token prompts.
+  **Amended 2026-10-06 (Mal's call, evidence FINDINGS s9):** the gate is the logits on p600/p3000; the per-layer
+  cosine table is a diagnostic (`compare_golden.py --tensors-diag`), because CPU-vs-CUDA flash-attn noise amplified
+  by Q8 activation rounding already exceeds 1e-4 after a few layers.
 
 ### Phase 4 - Strata's MoE engine on DeepSeek (the go/no-go)
 - Expert cache (`expert_cache.hpp:72`) with 6.75 MiB slots (`open_sized`), profile with n_layers 43 / n_expert

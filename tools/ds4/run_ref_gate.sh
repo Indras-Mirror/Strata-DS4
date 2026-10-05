@@ -31,4 +31,4 @@ flock "$LOCK" "$BIN" -m "$GGUF" --tokens "$GOLD/tokens.i32" --out "$OUT" -t 8
 
 echo "== compare $PROMPT =="
 python3 "$REPO/tools/ds4/compare_golden.py" "$GOLD" "$OUT" \
-    --cosine 0.9999 --top1 0.99 --kl 0.01
+    --cosine 0.9999 --top1 0.99 --kl 0.01 --tensors-diag

@@ -185,6 +185,26 @@ class CompareGoldenTests(unittest.TestCase):
         ok, _ = compare_golden.compare_dirs(self.a, self.b, ignore=["attn_norm-0"])
         self.assertTrue(ok)
 
+    def test_tensors_diag_reports_but_does_not_fail(self):
+        tensors = self._base()
+        write_golden(self.a, tensors)
+        bad = dict(tensors)
+        bad["attn_norm-0"] = (-tensors["attn_norm-0"][0], "f32")
+        write_golden(self.b, bad)
+        ok, report = compare_golden.compare_dirs(self.a, self.b, tensors_diag=True)
+        self.assertTrue(ok, report["breaches"])
+        self.assertTrue(any("cosine" in x for x in report["diagnostics"]), report["diagnostics"])
+        # logits still gate in diag mode
+        bad["result_output"] = (tiny_logits(7), "f32")
+        write_golden(self.b, bad)
+        ok2, report2 = compare_golden.compare_dirs(self.a, self.b, tensors_diag=True)
+        self.assertFalse(ok2)
+        self.assertTrue(any("top1" in x for x in report2["breaches"]), report2["breaches"])
+        # missing tensors still gate in diag mode
+        write_golden(self.b, {k: v for k, v in tensors.items() if k != "l_last-0"})
+        ok3, _ = compare_golden.compare_dirs(self.a, self.b, tensors_diag=True)
+        self.assertFalse(ok3)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

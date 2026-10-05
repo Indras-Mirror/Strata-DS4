@@ -164,7 +164,7 @@ from Phase 6 unless a Strata-side draft can run without evicting expert slots.
 | 0 | done except the ds4 run (above) |
 | 1 loader/geometry/tokenizer/pack | done, gates verified (4febf29, 64692d1, 7689b05) |
 | 2 Q2_K experts | **done both paths** (CPU rel err < 2e-7 / GPU 3.0e-5 << 1e-3; 0.71 / 0.017 ms per expert) |
-| 3 reference forward (`tools/ds4/ds4_ref.cpp`, CPU ggml) | **structural bug FIXED** (`7fab6eb`: the compressed-attention mask was filled transposed) - p600/p3000 logits PASS (top1 1.0, KL 0.0086/0.0079 < 0.01); p64 35/477, the strict per-tensor gate still red on a slow CPU-vs-CUDA numeric drift (activation Q8_0), not a structural bug; see s9 |
+| 3 reference forward (`tools/ds4/ds4_ref.cpp`, CPU ggml) | **DONE 2026-10-06** - gate = p600/p3000 logits (top1 1.0, KL 0.0086/0.0079, last position only) PASS; per-tensor cosine is a diagnostic (residual proven to be CPU-vs-CUDA noise x Q8 rounding, s9) |
 | 4a MoE engine replay | **done** - best implied 17.28 tok/s (slots 2300, uncaptured loop); ~22.3 with the loop's ~13 ms/token harness cost removed, above the go line 19.6; see s10 |
 | 4b-7 | not started (4b = captured token graph) |
 
@@ -238,6 +238,12 @@ this model (one layer of flash-attn noise already costs 1e-5 after one Q8 matmul
 KL < 0.01) pass. Gate change is Mal's call and is NOT made here: options are (a) gate per-tensor against a measured
 noise floor (oracle vs oracle with an input perturbation of the observed rms), or (b) treat the logit gates as the
 Phase 3 gate and keep the per-tensor table as a diagnostic.
+
+**Gate decision (Mal, 2026-10-06): option (b).** `run_ref_gate.sh` now passes `--tensors-diag`: per-tensor metric
+breaches are reported, not failing; logits, token ids, missing tensors and shapes still fail. Results: p600 PASS
+(top1 1, top5 1, KL 0.00858), p3000 PASS (KL 0.00787), p64 top1 1 / top5 1 / KL 0.106 (exit 1 - p64 is not a logits
+prompt in the plan, diagnostic only). Caveat: the goldens were dumped without `--all-pos`, so each "mean KL" is
+over 1 position; an all-positions teacher-forced KL needs regenerated goldens (a full-model GPU run).
 
 The probe taps that localized this are committed:
 `tools/ds4/golden_dump.cpp` captures `q`, `kv`, `csa_state_kv`, `csa_state_score_ape`,

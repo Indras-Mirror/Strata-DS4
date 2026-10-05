@@ -150,7 +150,7 @@ def _breaches(name, metrics, thresholds):
     return out
 
 
-def compare_dirs(dir_a, dir_b, thresholds=None, ignore=()):
+def compare_dirs(dir_a, dir_b, thresholds=None, ignore=(), tensors_diag=False):
     th = dict(DEFAULT_THRESHOLDS)
     if thresholds:
         th.update({k: v for k, v in thresholds.items() if v is not None})
@@ -161,6 +161,7 @@ def compare_dirs(dir_a, dir_b, thresholds=None, ignore=()):
 
     rows = []
     breaches = []
+    diagnostics = []  # per-tensor metric breaches when tensors_diag (reported, not failing)
     names = sorted((set(ta) | set(tb)) - ignore)
     for name in names:
         if name in TOKEN_NAMES:
@@ -181,7 +182,7 @@ def compare_dirs(dir_a, dir_b, thresholds=None, ignore=()):
             continue
         m = tensor_metrics(a, b)
         bad = _breaches(name, m, th)
-        breaches.extend(bad)
+        (diagnostics if tensors_diag else breaches).extend(bad)
         rows.append({
             "name": name,
             "shape": list(a.shape),
@@ -222,6 +223,7 @@ def compare_dirs(dir_a, dir_b, thresholds=None, ignore=()):
     report = {
         "ok": not breaches,
         "breaches": breaches,
+        "diagnostics": diagnostics,
         "tensors": rows,
         "logits": logits,
         "thresholds": th,
@@ -255,7 +257,10 @@ def format_report(report, limit=60):
 
     lines.append("")
     if report["ok"]:
-        lines.append("PASS: all tensors within thresholds")
+        lines.append("PASS: all tensors within thresholds" if not report.get("diagnostics")
+                     else "PASS: logits/tokens/shapes gate (per-tensor metrics are diagnostics)")
+    if report.get("diagnostics"):
+        lines.append("diagnostic (not gating): %d per-tensor breach(es)" % len(report["diagnostics"]))
     else:
         lines.append("FAIL: %d breach(es)" % len(report["breaches"]))
         for b in report["breaches"][:limit]:
@@ -276,6 +281,9 @@ def build_parser():
     p.add_argument("--top5", type=float, default=None, help="min logits top-5 overlap (default: 0.99)")
     p.add_argument("--kl", type=float, default=None, help="max mean KL (default: 0.01)")
     p.add_argument("--ignore", action="append", default=[], help="tensor name to skip (repeatable)")
+    p.add_argument("--tensors-diag", action="store_true",
+                   help="per-tensor max_abs/rel_l2/cosine breaches are reported but do not fail; the gate is the "
+                        "logits (top1/top5/KL), token ids, missing tensors and shapes (FINDINGS s9)")
     p.add_argument("--json", action="store_true", help="print the full report as JSON")
     return p
 
@@ -291,7 +299,7 @@ def main(argv=None):
         "kl": args.kl,
     }
     try:
-        ok, report = compare_dirs(args.reference, args.candidate, thresholds, args.ignore)
+        ok, report = compare_dirs(args.reference, args.candidate, thresholds, args.ignore, args.tensors_diag)
     except GoldenError as exc:
         print("compare_golden: %s" % exc, file=sys.stderr)
         return 2
