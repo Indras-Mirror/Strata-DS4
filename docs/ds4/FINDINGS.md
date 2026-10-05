@@ -108,24 +108,22 @@ rounding (reported alongside).
 | path | gate | up | down | fused |
 | --- | ---: | ---: | ---: | ---: |
 | CPU (ggml-cpu vec_dot) | 8.7e-8 | 9.3e-8 | 1.8e-7 | 1.8e-7 |
-| GPU (native MMVQ) | not run (see below) | not run | not run | not run |
+| GPU (native MMVQ) | 2.9e-5 | 3.0e-5 | 9.5e-8 | 9.6e-8 |
 
-Pure-float reference (including Q8_K activation rounding): gate 7.0e-3, up 7.2e-3, fused 1.9e-2.
+Pure-float reference (including activation rounding): CPU/Q8_K gate 7.0e-3, up 7.2e-3, fused 1.9e-2;
+GPU/q8_1 gate 5.5e-3, up 5.8e-3, fused 1.2e-2. GPU Q2_K dequant vs ggml `to_float`: rel 0.000e+00 (bit-exact).
 
 Micro-benchmark, ms per expert matvec (gate+up+down, one token; RTX 4090 + 5700X):
 
 | CPU 1 thread | CPU 8 threads | GPU |
 | ---: | ---: | ---: |
-| 1.55 | 0.71 | not run (see below) |
+| 1.55 | 0.71 | 0.017 (30 iters) |
 
-The GPU half is a residual: `p0-gpu-runs` still holds the GPU when this slice ends, and the shared protocol
-forbids a GPU run before `.done-p0-gpu-runs`.  Run, once it appears (and under `flock ~/.quetza-data/conductor/ds4-gpu.lock`):
-
-```
-flock ~/.quetza-data/conductor/ds4-gpu.lock build-ds4-cuda/ds4_expert_parity \
-    /media/mal/NVME1TB/Models/DeepSeek-V4-Flash-Q2-0731.gguf --bench 30
-flock ~/.quetza-data/conductor/ds4-gpu.lock build-ds4-cuda/mmvq_multi_parity
-```
+**GPU parity run 2026-10-05 21:38 (ds4-p2-gpu-parity) - PASS.** Both commands above were run under
+`flock ~/.quetza-data/conductor/ds4-gpu.lock`, one GPU process at a time. GPU max rel err 3.0e-5 << 1e-3 gate;
+`mmvq_multi_parity` exit 0 (with `multi_exact` on, every column T=1..8 of every type incl Q2_K is bitwise equal
+to a single-column call, 0 bit diffs; with it off, the control finds diffs at T>4, so the comparison has power).
+No kernel changes were needed. Phase 2 is now fully verified on both paths.
 
 ## 7. Phase 0 measurements (2026-10-05) - raw logs in `bench/ds4-2026-10-05/phase0/`
 
@@ -165,7 +163,7 @@ from Phase 6 unless a Strata-side draft can run without evicting expert slots.
 |---|---|
 | 0 | done except the ds4 run (above) |
 | 1 loader/geometry/tokenizer/pack | done, gates verified (4febf29, 64692d1, 7689b05) |
-| 2 Q2_K experts | CPU gate verified (rel err < 2e-7; 0.71 ms/expert @8 thr); **GPU parity not run** - command in s6 |
+| 2 Q2_K experts | **done both paths** (CPU rel err < 2e-7 / GPU 3.0e-5 << 1e-3; 0.71 / 0.017 ms per expert) |
 | 3 reference forward (`tools/ds4/ds4_ref.cpp`, CPU ggml) | written + structural test on a mini model; **oracle gate not run**: `tools/ds4/run_ref_gate.sh` (needs the full 80 GB load; flock `~/.quetza-data/conductor/ds4-gpu.lock`) |
 | 4a MoE engine replay | packet written (`~/.quetza-data/conductor/packets/p4a-moe-engine.md`), worker stopped before writing code |
 | 4b-7 | not started |
