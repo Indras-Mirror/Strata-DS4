@@ -13,10 +13,12 @@
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
-inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// Bytes of the largest quantized gate/up activation any native layer uses.  DeepSeek-V4's n_embd 4096 as Q8_K
+/// (IQ2_XXS's vec_dot_type) is 16 x 292 = 4672, the largest; Qwen's 2560 as Q8_K is 2920 and 4096 as Q8_0 is 4352.
+inline constexpr size_t kNativeActBytes = 4672;
+/// Bytes of the largest quantized down activation.  DeepSeek-V4's n_ff 2048 as Q8_K (Q2_K's vec_dot_type) is
+/// 8 x 292 = 2336, the largest; Qwen's 640 as Q8_0 is 20 x 34 = 680.
+inline constexpr size_t kNativeHBytes = 2336;
 
 /// One layer's native expert geometry.
 struct NativeFmt {

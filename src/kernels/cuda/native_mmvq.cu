@@ -68,6 +68,11 @@ struct Q3KBlock {
     uint8_t scales[12];
     half d;
 };
+struct Q2KBlock {
+    uint8_t scales[16];
+    uint8_t qs[64];
+    half2 dm;
+};
 struct IQ4XSBlock {
     half d;
     uint16_t scales_h;
@@ -107,6 +112,8 @@ static_assert(sizeof(Q81Block) == 36 && alignof(Q81Block) == 4);
 static_assert(sizeof(Q20Block) == 18 && alignof(Q20Block) == 2 && offsetof(Q20Block, qs) == 2);
 static_assert(sizeof(Q3KBlock) == 110 && alignof(Q3KBlock) == 2 && offsetof(Q3KBlock, qs) == 32 &&
               offsetof(Q3KBlock, scales) == 96 && offsetof(Q3KBlock, d) == 108);
+static_assert(sizeof(Q2KBlock) == 84 && alignof(Q2KBlock) == 4 && offsetof(Q2KBlock, qs) == 16 &&
+              offsetof(Q2KBlock, dm) == 80);
 static_assert(sizeof(IQ4XSBlock) == 136 && alignof(IQ4XSBlock) == 2 &&
               offsetof(IQ4XSBlock, scales_h) == 2 && offsetof(IQ4XSBlock, scales_l) == 4 &&
               offsetof(IQ4XSBlock, qs) == 8);
@@ -370,6 +377,28 @@ __device__ __forceinline__ float q3_q8_dot_impl(int vl, int vh, const int* __res
         sumf += d8[i] * (STRATA_DP4A(vi, u[i], 0) * sc);
     }
     return d3 * sumf;
+}
+
+// Q2_K's 84-byte stride: contiguous v/x values, four 16-value groups per 64-value q4 part (llama.cpp's
+// vec_dot_q2_K_q8_1_impl_mmvq).  Two 4-bit scales per sub-block: the low nibble is the quant scale, the high
+// nibble a per-group min the q8_1 activation multiplies directly.
+__device__ __forceinline__ float q2_k_q8_dot_impl(int v, const int* __restrict__ u,
+                                                  const uint8_t* __restrict__ scales, half2 dm,
+                                                  const float* __restrict__ d8) {
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int sc = scales[i];
+        const int vi = (v >> (2 * i)) & 0x03030303;
+        sumf_d += d8[i] * (STRATA_DP4A(vi, u[i], 0) * (sc & 0xF));
+        int m = sc >> 4;
+        m |= m << 8;
+        m |= m << 16;
+        sumf_m += d8[i] * STRATA_DP4A(m, u[i], 0);
+    }
+    const float2 dm2f = __half22float2(dm);
+    return dm2f.x * sumf_d - dm2f.y * sumf_m;
 }
 
 __device__ __forceinline__ float q3_q8_dot(const Q3KBlock* __restrict__ w,
@@ -928,6 +957,36 @@ struct Q20Traits {
         return r.d2 * d8 * sumi;
     }
 };
+struct Q2KTraits {
+    using Block = Q2KBlock;
+    // QI2_K = 16 quant values, VDR_Q2_K_Q8_1_MMVQ = 1: one vec_dot call per 256-value block, 16 threads' worth.
+    static constexpr int DIV = QK, T = 16, KBY = QK / Q8K, BPI = WARPS * WARP / 16;
+    __device__ static int kqs(int tid) { return tid % 16; }
+    struct W { int v; uint8_t scales[4]; half2 dm; int bq8_offset, u8; };
+    __device__ static W load(const Block* __restrict__ w, int iqs) {
+        W r;
+        r.bq8_offset = 4 * (iqs / 8);
+        const int scale_offset = iqs - iqs % 8 + (iqs % 8) / 4;
+        r.v = reinterpret_cast<const int*>(w->qs)[iqs];
+        r.u8 = iqs % 8;
+        r.dm = w->dm;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) r.scales[i] = w->scales[scale_offset + 2 * i];
+        return r;
+    }
+    __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+        (void) iqs;
+        int u[4];
+        float d8[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const Q81Block* bq8i = x + r.bq8_offset + i;
+            d8[i] = __low2float(bq8i->ds);
+            u[i] = reinterpret_cast<const int*>(bq8i->qs)[r.u8];
+        }
+        return q2_k_q8_dot_impl(r.v, u, r.scales, r.dm, d8);
+    }
+};
 struct Q3KTraits {
     using Block = Q3KBlock;
     static constexpr int DIV = 256, T = 16, KBY = 8, BPI = WARPS * WARP / 16;
@@ -1362,6 +1421,40 @@ void native_q2_0_f32(const void* weights, const float* x, void* scratch_q8_1,
     native_q2_0_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
+void native_q2_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+                      int n_in, int n_out, int ncols, void* stream) {
+    validate_shape(n_in, ncols, QK);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    STRATA_WAVE_MMVQ(Q2KTraits)
+    if (ncols > 1) {
+        launch_multi<Q2KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+        launch_check();
+        return;
+    }
+    // One kernel template for every column count, so a column's sum is bitwise the same with or without the
+    // others riding along (the native MMVQ multi_exact contract, mmvq_multi_parity).
+    const auto s = static_cast<cudaStream_t>(stream);
+    launch_multi_n<Q2KTraits, 1>(weights, x_q8_1, y, n_in, n_out, s);
+    launch_check();
+}
+
+void native_q2_k_f32(const void* weights, const float* x, void* scratch_q8_1,
+                     float* y, int n_in, int n_out, int ncols, void* stream) {
+    validate_shape(n_in, ncols, QK);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(weights);
+    validate_pointer(x);
+    validate_pointer(scratch_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
+    native_q2_k_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
+}
+
 void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream) {
     validate_shape(n_in, ncols, 256);
@@ -1563,8 +1656,8 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
 }
 
 bool native_mmvq_supported(int ggml_type) noexcept {
-    return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
-           ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
+    return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 10 ||
+           ggml_type == 11 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
            ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
 }
@@ -1577,6 +1670,7 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     case 7: block_elems = 32; block_bytes = 24; break;
     case 8: block_elems = 32; block_bytes = 34; break;
     case 20: block_elems = 32; block_bytes = 18; break;
+    case 10: block_elems = 256; block_bytes = 84; break;
     case 11: block_elems = 256; block_bytes = 110; break;
     case 12: block_elems = 256; block_bytes = 144; break;
     case 13: block_elems = 256; block_bytes = 176; break;
@@ -1604,6 +1698,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 7: iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 8: native_q8_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 20: native_iq4_nl_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 10: native_q2_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 11: native_q3_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 12: native_q4_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 13: native_q5_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;

@@ -62,6 +62,7 @@ const Case CASES[] = {
     {"Q5_K", 13, 2048, 512, 256, 176, {0, 2}},        // Q5KBlock: half2 dm
     {"Q6_K", 14, 2048, 512, 256, 210, {208, -1}},     // Q6KBlock: half d after ql, qh, scales
     {"IQ4_XS", 23, 4096, 512, 256, 136, {0, -1}},     // IQ4XSBlock: half d; n_in 4096, see THE NEGATIVE CONTROL
+    {"Q2_K", 10, 2048, 512, 256, 84, {80, 82}},       // Q2KBlock: half2 dm after scales[16], qs[64]
     {"Q5_K wide", 13, 4096, 2048, 256, 176, {0, 2}},
 };
 

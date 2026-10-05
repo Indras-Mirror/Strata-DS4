@@ -85,3 +85,38 @@ g++ -O2 -std=c++17 -I <llama.cpp>/include -I <llama.cpp>/ggml/include tools/ds4/
 ./route_probe DeepSeek-V4-Flash.gguf routes.bin corpus/*.txt        # experts on the CPU, attention on the GPU
 python tools/ds4/route_skew.py routes.bin
 ```
+
+## 6. Phase 2 - Q2_K experts on both paths
+
+The expert arithmetic the port needs: gate/up IQ2_XXS (already served), down Q2_K (new).
+
+- **CPU.** ggml-cpu has `ggml_vec_dot_q2_K_q8_K` (AVX2), so `native_fmt` / the pool's i-quant path already
+  routes Q2_K through ggml's own vec_dot; the one change was the pool's activation buffers, which were sized for
+  Qwen (n_embd 2560) and too small for DSV4's 4096 (Q8_K 4672 B) and n_ff 2048 (Q8_K 2336 B):
+  `kNativeActBytes` 4096 -> 4672, `kNativeHBytes` 1024 -> 2336 (`native_expert.hpp`).
+- **GPU.** `native_mmvq.cu` had no Q2_K; it now has `native_q2_k_mmvq` / `native_q2_k_f32` (port of llama.cpp's
+  `vec_dot_q2_K_q8_1`, q8_1 activation), in `native_mmvq_supported`, `native_mmvq_weight_bytes` (84 B / 256) and
+  the `native_mmvq()` dispatch. `iq_kernels.cu` gets the same dot as `Fmt<10>` with `dq_q2_k`, so the grouped
+  native-expert path (`native_expert_supported`/`native_expert_grouped`, the verify-window VRAM slots and the
+  PCIe share) accepts the DSV4 pair (IQ2_XXS gate/up, Q2_K down) too.
+
+Gate: `build-ds4-cuda/ds4_expert_parity <gguf>` - one real expert, gate/up IQ2_XXS and down Q2_K, random input,
+each role against ggml's dequantizer + an F32 matmul.  The activation (Q8_K on the CPU, q8_1 on the GPU) is
+dequantized in the reference, so the measured error is the kernel's arithmetic, not the 8-bit activation
+rounding (reported alongside).
+
+| path | gate | up | down | fused |
+| --- | ---: | ---: | ---: | ---: |
+| CPU (ggml-cpu vec_dot) | 8.7e-8 | 9.3e-8 | 1.8e-7 | 1.8e-7 |
+| GPU (native MMVQ) | PENDING | PENDING | PENDING | PENDING |
+
+Pure-float reference (including Q8_K activation rounding): gate 7.0e-3, up 7.2e-3, fused 1.9e-2.
+
+Micro-benchmark, ms per expert matvec (gate+up+down, one token; RTX 4090 + 5700X):
+
+| CPU 1 thread | CPU 8 threads | GPU |
+| ---: | ---: | ---: |
+| 1.55 | 0.71 | PENDING |
+
+Full commands: `build-ds4-cuda/ds4_expert_parity <gguf> --cpu-only --bench 30`,
+`build-ds4-cuda/ds4_expert_parity <gguf> --bench 30` (GPU, under the shared `flock ds4-gpu.lock`).
