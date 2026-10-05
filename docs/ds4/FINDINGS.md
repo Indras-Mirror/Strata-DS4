@@ -207,10 +207,19 @@ blocks instead of all visible ones (for query 74 of p64: blocks 14-17 instead of
 the compressed half of every CSA/HCA attention. Proven by reconstructing both variants in numpy from ds4_ref's own
 dumped `q-2` / `k_all-2`: the transposed mask reproduces ds4_ref's output at cos 1.000000, the correct mask
 reproduces the golden at 0.999979. Fix (both the f16 and the f32 mask, same loop): fill `t*nb + b`.
-p64 gate after the fix: **35 / 477 pass** (was 21), `attn_csa_lid-2` 0.9033 -> 0.9999791, and the first divergence
-moves off layer 2. Residual: a ~5e-4..1e-3 relative error per layer that compounds and, by layer ~14, flips MoE
-expert selections (ffn_moe_out-23 cos 0.67), so the 0.9999 per-tensor gate is still red. Step 3 is therefore
-**not** pure accumulation noise for the FFN tensors - the remaining breach is real and needs its own slice.
+Gates after the fix (all three prompts, `run_ref_gate.sh`): p64 **35/477** pass (was 21), p600 **42/477**,
+p3000 **38/477**; `attn_csa_lid-2` 0.999979/0.999992 and `attn_hca-3` 0.999975/0.999982, i.e. the compressed half of
+CSA *and* HCA (p600 has 4 HCA blocks, p3000 has 23) now matches. Final logits: p600 top1=1.0 top5=1.0 KL=0.0086,
+p3000 top1=1.0 top5=1.0 KL=0.0079 (both under the 0.01 KL gate); p64 top1=1.0 top5=0.4 KL=1.39.
+
+The remaining breach is a slow, compounding numeric drift, not another structural bug I could find. It enters at
+layer 0: `attn_raw-0` matches to 2.2e-8 max_abs, but `attn_out-0` (de-rope + grouped output LoRA, Q8_0) is already
+0.9999892 and `ffn_moe_out-0` 0.999657 (rel 2.6%); no scale offset (best-fit scale 0.998-1.001). It grows ~1e-3
+per layer until MoE routing flips discrete top-6 expert selections (l_last-16/17 -> 0.95/0.91 on p64). The likeliest
+source is CPU-vs-CUDA matmul numerics: ggml-cpu quantizes the *activations* to Q8_0 for the Q8_0/Q2_K weight
+matmuls, while the CUDA oracle does not, and every layer's output LoRA is two Q8_0 matmuls. INFERRED, not proven:
+the confirming test is to re-run the oracle with the Q8_0/Q2_K tensors promoted to F16 (or on the CPU backend) and
+see whether the residual collapses. Do NOT relax the 0.9999 per-tensor gate before that test.
 
 The probe taps that localized this are committed:
 `tools/ds4/golden_dump.cpp` captures `q`, `kv`, `csa_state_kv`, `csa_state_score_ape`,
