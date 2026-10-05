@@ -225,9 +225,11 @@ bool load_routes(const std::string& path, int64_t offset, int64_t want, Routes& 
     return true;
 }
 
-// The static profile: every (layer, expert) of the whole bin ranked by routing frequency.  Filling the cache with
-// the top `slots` of this ranking is what "seed the profile from ds4routes.bin" means in the phase-4 plan; the
-// held-out hit rate that ranking gets is the ~49.6% of FINDINGS s2.
+// The static profile: every (layer, expert) ranked by routing frequency over the TRAIN half of the bin
+// (alternating 512-token blocks, exactly the split route_skew.py scores with).  Training on half and replaying a
+// held-out block is the only version of this number that means anything: a profile built from every token scores
+// its own training tokens and reads ~10 points better.  Filling the cache with the top `slots` of this ranking is
+// what "seed the profile from ds4routes.bin" means in the phase-4 plan.
 std::vector<std::pair<int32_t, int32_t>> rank_profile(const std::string& path, std::string& err) {
     std::ifstream in(path, std::ios::binary | std::ios::ate);
     if (!in) { err = "cannot open " + path; return {}; }
@@ -235,8 +237,14 @@ std::vector<std::pair<int32_t, int32_t>> rank_profile(const std::string& path, s
     in.seekg(0);
     std::vector<uint16_t> all((size_t) (bytes / 2));
     in.read((char*) all.data(), bytes);
+    const int64_t per_batch = kBatch * kLayers * kTopK;   // records in one 512-token block
     std::map<std::pair<int, int>, int64_t> cnt;
-    for (size_t i = 0; i + 1 < all.size(); i += 2) cnt[{all[i], all[i + 1]}]++;
+    for (size_t i = 0; i + 1 < all.size(); i += 2) {
+        const int64_t rec = (int64_t) i / 2;
+        const int64_t token = (rec / per_batch) * kBatch + (rec % (kBatch * kTopK)) / kTopK;
+        if ((token / kBatch) % 2 != 0) continue;   // the held-out half
+        cnt[{all[i], all[i + 1]}]++;
+    }
     std::vector<std::pair<int32_t, int32_t>> ranked;
     ranked.reserve(cnt.size());
     for (auto& le : cnt) ranked.push_back({le.first.first, le.first.second});
