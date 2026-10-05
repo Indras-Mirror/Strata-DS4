@@ -43,14 +43,17 @@ run() {   # run <name> <args...>
 # 1. the engine's arithmetic on the GPU grouped path (no big arena, no cache: tensors only)
 run gate-correctness --correctness 1 --correctness-experts 12 --arena-gib 0 --no-cache
 
+# 1b. the same engine with the layer's ~0.4 ms of dense+attention GPU work injected, to show the overlap
+run with-gap --slots 1820 --pcie-frac 0.55 --threads 7 --pin --arena-gib 52 --gap-ms 0.4
+
 # 2. the plan's default: 12 GB of slots, 55% of the misses over PCIe, pinned arena
-run base --slots 1820 --pcie-frac 0.55 --threads 7 --pin --arena-gib 52
+run base --slots 1820 --pcie-frac 0.55 --threads 7 --pin --arena-gib 52 --gap-ms 0
 
 # 3. tuning points
-run slots-2300   --slots 2300 --pcie-frac 0.55 --threads 7 --pin --arena-gib 52
-run pcie-75      --slots 1820 --pcie-frac 0.75 --threads 7 --pin --arena-gib 52
-run pcie-35      --slots 1820 --pcie-frac 0.35 --threads 7 --pin --arena-gib 52
-run pcie-0       --slots 1820 --pcie-frac 0.00 --threads 7 --pin --arena-gib 52
-run threads-8    --slots 1820 --pcie-frac 0.55 --threads 8 --pin --arena-gib 52
+run slots-2300   --slots 2300 --pcie-frac 0.55 --threads 7 --pin --arena-gib 52 --gap-ms 0
+run pcie-75      --slots 1820 --pcie-frac 0.75 --threads 7 --pin --arena-gib 52 --gap-ms 0
+run pcie-35      --slots 1820 --pcie-frac 0.35 --threads 7 --pin --arena-gib 52 --gap-ms 0
+run pcie-0       --slots 1820 --pcie-frac 0.00 --threads 7 --pin --arena-gib 52 --gap-ms 0
+run threads-8    --slots 1820 --pcie-frac 0.55 --threads 8 --pin --arena-gib 52 --gap-ms 0
 
 echo "== moe_sweep done $(date -Is) =="

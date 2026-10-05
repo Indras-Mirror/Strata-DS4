@@ -955,8 +955,20 @@ int main(int argc, char** argv) {
                 total.gap_ms / r.count, total.hit_ms / r.count, total.pcie_ms / r.count, cpu_busy);
     std::printf("          gpu busy %.2f, cpu busy %.2f, overlap idle (wall - max) %.2f\n", gpu_busy, cpu_busy,
                 std::max(0.0, tok_ms - std::max(gpu_busy, cpu_busy)));
-    std::printf("implied full-token = MoE %.2f + non-MoE GPU %.2f = %.2f ms -> %.2f tok/s (bar 16.34, go 19.6)\n",
-                tok_ms, non_moe, tok_ms + non_moe, 1000.0 / (tok_ms + non_moe));
+    // The gate's formula is MoE ms + the non-MoE GPU ms of the Phase-0 profile, so the arms run with --gap-ms 0:
+    // `wall` IS the MoE engine's own time and adding 17.6 does not double count.  With a gap the injected GPU
+    // work is already inside `wall`, so the same sum would count it twice; the with-gap arm is printed as an
+    // overlap check instead (its wall against the coarse `max(gpu, cpu)` bound rather than a sum).
+    if (a.gap_ms > 0) {
+        std::printf("implied full-token (overlap): MoE wall %.2f already contains the injected %.2f ms/token of\n"
+                    "          dense+attention; the serial rest of Phase 0's 17.6 (attn 1.6 + other 2.1) = 3.7\n",
+                    tok_ms, total.gap_ms / r.count);
+    } else {
+        std::printf("implied full-token = MoE %.2f + non-MoE GPU %.2f = %.2f ms -> %.2f tok/s (bar 16.34, go 19.6)\n",
+                    tok_ms, non_moe, tok_ms + non_moe, 1000.0 / (tok_ms + non_moe));
+        std::printf("                    (MoE-only.  With the layer's GPU work overlapped as the doorbell does\n"
+                    "                    it, add only Phase 0's serial attn+other, ~3.7 ms.)\n");
+    }
     std::printf("admissions during the run: %lld\n", (long long) eng.admitted());
 
     if (!a.out_csv.empty()) {
