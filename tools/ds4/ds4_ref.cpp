@@ -277,6 +277,18 @@ struct Graph {
     Weights * w = nullptr;
     mutable std::vector<InputFill> fills;
 
+    // probe taps (DS4_PROBE=1): tensors dumped after the layer's graph runs, for
+    // like-for-like diffs against the oracle's same-named cb() taps.
+    struct ProbeRef { std::string base; std::vector<int64_t> feat; ggml_tensor * t; int64_t rows; bool all_rows; };
+    mutable std::vector<ProbeRef> probes;
+    void probe(ggml_tensor * t, const char * base, std::initializer_list<int64_t> feat, int il, int64_t rows, bool all_rows) const {
+        if (!g_probe || t == nullptr) return;
+        const std::string nm = std::string(base) + "-" + std::to_string(il);
+        ggml_set_output(t);
+        ggml_set_name(t, nm.c_str());
+        probes.push_back({ base, std::vector<int64_t>(feat), t, rows, all_rows });
+    }
+
     ggml_tensor * W(const std::string & name) const { return w->get(name); }
     ggml_tensor * L(int il, const std::string & suffix) const {
         return w->get("blk." + std::to_string(il) + "." + suffix);
@@ -532,6 +544,10 @@ ggml_tensor * Graph::attention(int il, ggml_tensor * xn, ggml_tensor * qr, ggml_
             ggml_tensor * c = ggml_sum_rows(ctx, ggml_mul(ctx, values, wts));
             c = ggml_cont(ctx, ggml_permute(ctx, c, 1, 0, 2, 3));           // [head_dim, 1, n_blocks]
             c = rms_w(c, L(il, std::string(prefix) + "_norm.weight"));
+            if (std::strcmp(prefix, "attn_compressor") == 0) {
+                probe(st_kv, "csa_state_kv", { 2 * head_dim }, il, nt, false);
+                probe(st_sc, "csa_state_score_ape", { 2 * head_dim }, il, nt, false);
+            }
             std::vector<int32_t> cpos((size_t) n_blocks);
             for (int64_t b = 0; b < n_blocks; ++b) cpos[(size_t) b] = (int32_t) (ratio * b);
             ggml_tensor * cpos_t = input_i32({n_blocks}, cpos.data(), cpos.size() * 4, "overlap_pos");
@@ -607,6 +623,11 @@ ggml_tensor * Graph::attention(int il, ggml_tensor * xn, ggml_tensor * qr, ggml_
         }
 
         (void) state_dim;
+        if (g_probe && ratio == 4) {
+            probe(q,  "q",                 { d_h, n_head }, il, nt, false);
+            probe(kv, "kv",                { d_h, 1 },      il, nt, false);
+            probe(comp_k, "csa_state_compress", { d_h },    il, n_blocks, true);
+        }
         k_all = ggml_concat(ctx, kv, comp_k, 2);
         mask = ggml_concat(ctx, mask, cmask_f16, 0);
     }
@@ -821,6 +842,7 @@ int main(int argc, char ** argv) {
     ggml_set_no_alloc(w.ctx, true);
     for (int64_t il = 0; il < n_layer; ++il) {
         G.fills.clear();
+        G.probes.clear();
         const int64_t ratio = (size_t) il < g.compress_ratios.size() ? g.compress_ratios[(size_t) il] : 0;
 
         // inputs
@@ -952,6 +974,12 @@ int main(int argc, char ** argv) {
         if (g_probe) {
             dump_put(ds, "probe_hc_post", il, {hc}, (const float *) post_a->data, nt);
             dump_put(ds, "probe_hc_comb", il, {hc, hc}, (const float *) comb_a->data, nt);
+            for (const auto & pr : G.probes) {
+                const bool saved = ds.all_pos;
+                if (pr.all_rows) ds.all_pos = true;
+                dump_put(ds, pr.base, il, pr.feat, (const float *) pr.t->data, pr.rows);
+                ds.all_pos = saved;
+            }
         }
 
         std::memcpy(hc_state.data(), l_last->data, hc_state.size() * 4);

@@ -167,3 +167,39 @@ from Phase 6 unless a Strata-side draft can run without evicting expert slots.
 | 3 reference forward (`tools/ds4/ds4_ref.cpp`, CPU ggml) | written + structural test on a mini model; **oracle gate not run**: `tools/ds4/run_ref_gate.sh` (needs the full 80 GB load; flock `~/.quetza-data/conductor/ds4-gpu.lock`) |
 | 4a MoE engine replay | packet written (`~/.quetza-data/conductor/packets/p4a-moe-engine.md`), worker stopped before writing code |
 | 4b-7 | not started |
+
+## 9. Phase 3 gate: ds4_ref vs the llama.cpp oracle on p64 (2026-10-05, gate RED)
+
+`bash tools/ds4/run_ref_gate.sh p64` compares 477 tensors (`--cosine 0.9999 --top1 0.99 --kl 0.01`).
+Result: **456 FAIL / 21 pass**. (The gate log's table looks like "57 failed" because
+`compare_golden.py` prints only its first 60 rows; the breach list is truncated after 100 with
+"... 850 more". Count the breaches, not the table.)
+
+The ref is exact through layer 1 and through layer 2's attention *input*: the 21 passes are
+`hc_init`, everything of layers 0-1, plus `attn_norm-2` (0.9999219) and `hc_attn_pre-2`
+(0.9999203). First divergence is layer 2 - the first CSA (ratio-4) layer - inside the attention
+module: `attn_csa_lid-2` cos 0.9033, `attn_out-2` 0.8245, and every later tensor is then poisoned
+downstream (including every `attn_hca-*`: on p64 HCA has `n_blocks = 75/128 = 0`, so the ref
+computes a raw-window-only attention there and the failures are downstream, not HCA-specific).
+
+**Step 1 answer - the goldens' `attn_csa_lid`/`attn_hca` are NOT post-Hadamard with `-ctk f16`.**
+`build_input_k_rot()` returns a rotation only when `attn_rot_k` holds, and for DSV4 `attn_rot_k`
+is forced true only by the lightning-indexer clause `n_embd_head_k_full == indexer_head_size`
+(`llama-kv-cache.cpp:322-335`). The raw/csa/hca caches keep `n_embd_head_k_full = 512`
+(`attention.key_length`) vs `indexer_head_size = 128`, and `type_k = f16` is not quantized, so
+`self_k_rot`/`csa.k_rot`/`hca.k_rot` are all null and no Hadamard touches q, K, the compressed
+cache or the attention output. Only `kv_lid` is forced to `indexer_head_size`
+(`llama-kv-cache-dsv4.cpp:1290`), which is exactly the indexer rotation `ds4_ref` already applies.
+Verified numerically: rotating `ds4_ref`'s dumped attn output by the oracle-shaped Hadamard
+(n=128 blocks) gives cos ~0.0 vs the golden, not ~1.0, for `attn_raw-*`, `attn_csa_lid-*`,
+`attn_hca-*`. So there is no like-for-like rotation to add and no comparison to fix.
+
+Structural re-read of the whole `overlap_compress` path against `build_overlap_compressed_kv_from_state`
++ `dsv4_build_comp_plans` found no arithmetic difference (gather index order = all prev-window reads
+then all cur-window reads; prev = plane 0 / cur = plane 1; `comp_pos = ratio*b = state_write_pos =
+source_start`; softmax over 2*ratio; the compress RoPE params - base 160000, freq_scale 1/16,
+ext_factor 1, attn_factor 1/(1+0.1*ln16), beta 32/1, n_ctx_orig 65536 - and the raw mask all match).
+The bug is real arithmetic that reading has not yet isolated, so probe taps were added:
+`tools/ds4/golden_dump.cpp` captures `q`, `kv`, `csa_state_kv`, `csa_state_score_ape`,
+`csa_state_compress` under `DS4_GOLDEN_PROBE=1`, and `tools/ds4/ds4_ref.cpp` dumps the same names
+under `DS4_PROBE=1`, so the compressed-K path can be diffed tensor by tensor.

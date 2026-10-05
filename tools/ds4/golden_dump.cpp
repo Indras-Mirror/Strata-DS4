@@ -66,8 +66,32 @@ static const std::set<std::string> & layer_bases() {
         "attn_norm", "attn_out", "attn_raw", "attn_csa_lid", "attn_hca",
         "ffn_norm", "ffn_moe_out", "ffn_shexp", "ffn_out",
         "l_last", "hc_attn_pre", "hc_attn_post", "hc_ffn_pre",
+        // probe taps for the compressed-attention (CSA/HCA) path
+        "q", "kv", "csa_state_kv", "csa_state_score_ape", "csa_state_compress",
     };
     return s;
+}
+
+// node whose dump axis is the compressed-block axis (ne[2]) rather than tokens: we want
+// every block, not one token-indexed row.
+static bool block_indexed(const std::string & base) {
+    return base == "csa_state_compress";
+}
+
+// extra intermediate taps used to diff the compressed-attention path. They are only
+// captured when DS4_GOLDEN_PROBE=1 so a normal golden regeneration produces exactly the
+// gate tensor set (compare_golden flags extra golden-only names as breaches).
+static bool probe_enabled() {
+    static const bool on = []() {
+        const char * e = getenv("DS4_GOLDEN_PROBE");
+        return e != nullptr && e[0] != '0';
+    }();
+    return on;
+}
+
+static bool probe_base(const std::string & base) {
+    return base == "q" || base == "kv" || base == "csa_state_kv" ||
+           base == "csa_state_score_ape" || base == "csa_state_compress";
 }
 
 static const std::set<std::string> & global_bases() {
@@ -143,6 +167,9 @@ static FILE * open_append(const std::string & path) {
 static int base_rank(const std::string & base) {
     if (base == "attn_raw" || base == "attn_csa_lid" || base == "attn_hca" ||
         base == "hc_init" || base == "hc_attn_post" || base == "l_last") {
+        return 3;
+    }
+    if (block_indexed(base)) {
         return 3;
     }
     return 2;
@@ -261,6 +288,9 @@ static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     if (!match_name(t->name, base, il)) {
         return ask ? false : true;
     }
+    if (probe_base(base) && !probe_enabled()) {
+        return ask ? false : true;
+    }
     if (ask) {
         return true;
     }
@@ -277,6 +307,10 @@ static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     if (output_indexed(base)) {
         rb = 0;
         re = t->ne[base_rank(base) - 1];
+    }
+    if (block_indexed(base)) {
+        rb = 0;
+        re = t->ne[2];
     }
     write_f32_rows(*st, t, t->name, base, il, rb, re);
     return true;
