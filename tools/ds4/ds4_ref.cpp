@@ -84,6 +84,11 @@ static std::string sha256_file(const std::string & path) {
     return sp == std::string::npos ? std::string("unavailable") : s.substr(0, sp);
 }
 
+// DS4_PROBE=1 additionally dumps selected hyper-connection intermediates (hc_post / hc_comb).
+// Off by default: the gate compares the golden tensor set exactly, and extra tensors would
+// show up as "missing in reference".
+static bool g_probe = false;
+
 static bool read_i32_file(const std::string & path, std::vector<int32_t> & out) {
     std::ifstream in(path, std::ios::binary);
     if (!in) return false;
@@ -359,8 +364,10 @@ struct Graph {
         ggml_tensor * flat_norm = ggml_rms_norm(ctx, flat, (float) g->rms_eps);
         ggml_tensor * mixes = ggml_mul_mat(ctx, hc_fn, flat_norm);   // [mix_dim, nt]
 
+        // view1/view2 take BYTE offsets (ggml_view_1d/2d); deepseek4.cpp indexes hc_scale/hc_base
+        // by element via its dsv4_view_* helpers, so scale element n is at byte n*sizeof(float).
         ggml_tensor * scale_pre  = view1(hc_scale, 1, 0);
-        ggml_tensor * scale_post = view1(hc_scale, 1, 1);
+        ggml_tensor * scale_post = view1(hc_scale, 1, 1 * sizeof(float));
         ggml_tensor * base_pre   = view1(hc_base, hc, 0);
         ggml_tensor * base_post  = view1(hc_base, hc, (size_t) hc * 4);
 
@@ -372,7 +379,7 @@ struct Graph {
         *post = ggml_sigmoid(ctx, hc_affine(*post, scale_post, base_post));
         *post = ggml_scale(ctx, *post, 2.0f);
 
-        ggml_tensor * scale_comb = view1(hc_scale, 1, 2);
+        ggml_tensor * scale_comb = view1(hc_scale, 1, 2 * sizeof(float));
         ggml_tensor * base_comb  = view1(hc_base, hc * hc, (size_t) 2 * hc * 4);
         *comb = view2(mixes, hc * hc, nt, mixes->nb[1], (size_t) 2 * hc * mixes->nb[0]);
         *comb = hc_affine(*comb, scale_comb, base_comb);
@@ -663,6 +670,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const int64_t nt = (int64_t) tokens.size();
+    g_probe = std::getenv("DS4_PROBE") != nullptr;
     std::printf("[ds4_ref] model=%s tokens=%lld threads=%d all_pos=%d max_layer=%d\n",
                 model_path.c_str(), (long long) nt, n_threads, (int) all_pos, max_layer);
 
@@ -826,6 +834,10 @@ int main(int argc, char ** argv) {
         ggml_tensor * attn_pre = G.hc_pre(xin, G.L(il, "hc_attn_fn.weight"),
                                           G.L(il, "hc_attn_scale.weight"), G.L(il, "hc_attn_base.weight"),
                                           &post_a, &comb_a);
+        if (g_probe) {
+            ggml_set_output(post_a); ggml_set_name(post_a, "probe_hc_post");
+            ggml_set_output(comb_a); ggml_set_name(comb_a, "probe_hc_comb");
+        }
         ggml_set_output(attn_pre); ggml_set_name(attn_pre, "hc_attn_pre");
         ggml_tensor * xn = G.rms_w(attn_pre, G.L(il, "attn_norm.weight"));
         ggml_set_output(xn); ggml_set_name(xn, "attn_norm");
@@ -841,6 +853,11 @@ int main(int argc, char ** argv) {
         const char * attn_name = ratio == 4 ? "attn_csa_lid" : (ratio == 128 ? "attn_hca" : "attn_raw");
         ggml_set_output(attn_raw);
         ggml_set_name(attn_raw, attn_name);
+        // the layer's attention output is dumped too: it must be a graph output or the
+        // gallocr is free to recycle its buffer once hc_post has consumed it, and the
+        // dump below would then read another node's data.
+        ggml_set_output(attn_out);
+        ggml_set_name(attn_out, "attn_out");
 
         ggml_tensor * residual = xin;
         ggml_tensor * hap = G.hc_post(attn_out, residual, post_a, comb_a);
@@ -932,6 +949,10 @@ int main(int argc, char ** argv) {
         dump_put(ds, "ffn_shexp", il, {D}, (const float *) shexp->data, nt);
         dump_put(ds, "ffn_out", il, {D}, (const float *) ffn_out->data, nt);
         dump_put(ds, "l_last", il, {D, hc}, (const float *) l_last->data, nt);
+        if (g_probe) {
+            dump_put(ds, "probe_hc_post", il, {hc}, (const float *) post_a->data, nt);
+            dump_put(ds, "probe_hc_comb", il, {hc, hc}, (const float *) comb_a->data, nt);
+        }
 
         std::memcpy(hc_state.data(), l_last->data, hc_state.size() * 4);
         std::printf("[ds4_ref] layer %lld/%lld done (ratio=%lld)\n", (long long) (il + 1), (long long) n_layer, (long long) ratio);
