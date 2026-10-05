@@ -5,8 +5,9 @@ Paste everything below the line into a fresh Claude Code session started in `~/A
 ---
 
 We're porting the Strata inference engine (built for Qwen3.8-Flash-Next) to DeepSeek-V4-Flash, so DeepSeek runs
-faster on my RTX 4090 + Ryzen 7 5700X + 90 GB DDR4 than llama.cpp does. Scoping and feasibility are done; no
-engine code is written yet. Pick up at **Phase 0** of the plan.
+faster on my RTX 4090 + Ryzen 7 5700X + 90 GB DDR4 than llama.cpp does. Phases 0-2 are mostly done and Phase 3
+(reference forward pass) is written but not yet checked against the goldens. **Status table: `docs/ds4/FINDINGS.md`
+section 8.** This is an overnight run: the GPU and RAM are yours until I'm back. Use /conductor.
 
 **Read first, in this order** (all in `~/AI/Strata-DS4`, branch `deepseek4`, fork github.com/Indras-Mirror/Strata):
 1. `docs/ds4/PORT_PLAN.md` - the plan: goal, the number to beat, phases with gates, kill criterion, machine notes.
@@ -37,12 +38,19 @@ engine code is written yet. Pick up at **Phase 0** of the plan.
 - Never develop in `~/AI/Strata` (production Qwen engine serving my wrappers). Work only in `~/AI/Strata-DS4`.
 - Correctness before speed: each phase ends at its gate in PORT_PLAN.md; record the measured numbers in
   FINDINGS.md and commit before moving on. Measure before concluding; reproduce before diagnosing.
-- Check with me before using the GPU (I run other tests on it) and before pushing to GitHub.
+- Overnight: the GPU is approved. One full-model process at a time (80 GB model, 90 GB RAM); wrap every GPU run or
+  full-model load in `flock ~/.quetza-data/conductor/ds4-gpu.lock`. Still ask before pushing to GitHub.
 - Keep tools and results in the repo, not `/tmp` (wiped on reboot).
 - Delegate broad code reading to `deepseek-quetza pro --skip "..."` workers; use the conductor skill for
   multi-slice implementation if it fits.
 
-**Start with Phase 0:** first look up the existing `ds4` engine (huihui's model card runs this exact GGUF with
-`./ds4 -m ... --ctx 32768`) - find its repo and what it does; it may already do the expert caching we plan. Then write `tools/ds4/golden_dump.cpp` (per-layer golden tensors from llama.cpp for 64/600/3000
-token prompts) and profile where the bar's ~62 ms per token goes. Report the time split before writing any engine
-code - if expert CPU time is under half the token, we revisit the plan.
+**Overnight order:**
+1. Phase 3 oracle gate: `tools/ds4/run_ref_gate.sh` (ds4_ref vs goldens; plan gate: hc-stream cosine > 0.9999 at p64,
+   top-1 > 99% and KL < 0.01 on p600/p3000). Fix and re-run until it passes. Goldens are bit-exact run to run.
+2. Phase 2 GPU parity: the `ds4_expert_parity` GPU command in FINDINGS s6.
+3. Phase 4a: dispatch the ready packet `~/.quetza-data/conductor/packets/p4a-moe-engine.md` (MoE engine replayed on real
+   routes; drop its "wait for .done-p0-gpu-runs" lines, the GPU is free). Then 4b: full decode loop, and the gate (>= 19.6
+   tok/s vs 16.34, top-1 > 99%).
+4. Quick: run antirez ds4 (`~/AI/ds4-ref/ds4`, already built for CUDA) on the same prompts with `--ssd-streaming`, for its
+   4090 speed.
+DSpark is dropped: it made decode slower (FINDINGS s7). Record numbers in FINDINGS and commit after every step.
