@@ -199,7 +199,20 @@ Structural re-read of the whole `overlap_compress` path against `build_overlap_c
 then all cur-window reads; prev = plane 0 / cur = plane 1; `comp_pos = ratio*b = state_write_pos =
 source_start`; softmax over 2*ratio; the compress RoPE params - base 160000, freq_scale 1/16,
 ext_factor 1, attn_factor 1/(1+0.1*ln16), beta 32/1, n_ctx_orig 65536 - and the raw mask all match).
-The bug is real arithmetic that reading has not yet isolated, so probe taps were added:
+**RESOLVED (same session): the compressed-attention mask was filled transposed.** `make_comp` wrote the
+per-block visibility mask as `m16[b*nt + t]`, but the mask tensor is `{n_blocks, nt}` and ggml indexes it as
+`mask[key + query*ne0]` (`ggml_flash_attn_ext`: `mp = mask->data + iq1*mask->nb[1]`, then `mp[ic]`), so element
+`(block b, query t)` actually lives at `t*n_blocks + b`. Every query therefore saw only the *last few* compressed
+blocks instead of all visible ones (for query 74 of p64: blocks 14-17 instead of 0-17), which quietly corrupted
+the compressed half of every CSA/HCA attention. Proven by reconstructing both variants in numpy from ds4_ref's own
+dumped `q-2` / `k_all-2`: the transposed mask reproduces ds4_ref's output at cos 1.000000, the correct mask
+reproduces the golden at 0.999979. Fix (both the f16 and the f32 mask, same loop): fill `t*nb + b`.
+p64 gate after the fix: **35 / 477 pass** (was 21), `attn_csa_lid-2` 0.9033 -> 0.9999791, and the first divergence
+moves off layer 2. Residual: a ~5e-4..1e-3 relative error per layer that compounds and, by layer ~14, flips MoE
+expert selections (ffn_moe_out-23 cos 0.67), so the 0.9999 per-tensor gate is still red. Step 3 is therefore
+**not** pure accumulation noise for the FFN tensors - the remaining breach is real and needs its own slice.
+
+The probe taps that localized this are committed:
 `tools/ds4/golden_dump.cpp` captures `q`, `kv`, `csa_state_kv`, `csa_state_score_ape`,
 `csa_state_compress` under `DS4_GOLDEN_PROBE=1`, and `tools/ds4/ds4_ref.cpp` dumps the same names
 under `DS4_PROBE=1`, so the compressed-K path can be diffed tensor by tensor.

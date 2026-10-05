@@ -626,10 +626,13 @@ ggml_tensor * Graph::attention(int il, ggml_tensor * xn, ggml_tensor * qr, ggml_
         if (g_probe && ratio == 4) {
             probe(q,  "q",                 { d_h, n_head }, il, nt, false);
             probe(kv, "kv",                { d_h, 1 },      il, nt, false);
-            probe(comp_k, "csa_state_compress", { d_h },    il, n_blocks, true);
+            probe(comp_k, "csa_comp_k",        { d_h },    il, n_blocks, true);
         }
         k_all = ggml_concat(ctx, kv, comp_k, 2);
         mask = ggml_concat(ctx, mask, cmask_f16, 0);
+        if (g_probe && ratio == 4) {
+            probe(k_all, "k_all", { d_h, 1 }, il, nt + n_blocks, true);
+        }
     }
 
     // attention: K == V, per-head sink bias.  flash-attn wants q = [d_h, n_tokens, n_head],
@@ -789,11 +792,15 @@ int main(int argc, char ** argv) {
         ci.mask_f32 = std::make_shared<std::vector<uint8_t>>((size_t) nb * nt * 4);
         ggml_fp16_t * m16 = (ggml_fp16_t *) ci.mask_f16->data();
         float * m32 = (float *) ci.mask_f32->data();
+        // the mask tensors are {n_blocks, nt}: element (block b, query t) lives at flat
+        // index b + n_blocks*t (ne0 is the key/block axis, ne1 the query axis -- that is
+        // how ggml_flash_attn_ext indexes it: mask[ic + iq1*ne0]).  Filling b*nt + t
+        // transposes the mask and silently hides all but the last few compressed blocks.
         for (int64_t t = 0; t < nt; ++t)
             for (int64_t b = 0; b < nb; ++b) {
                 const float v = (b < (t + 1) / ratio) ? 0.0f : NEG_INF;
-                m16[b * nt + t] = ggml_fp32_to_fp16(v);
-                m32[b * nt + t] = v;
+                m16[t * nb + b] = ggml_fp32_to_fp16(v);
+                m32[t * nb + b] = v;
             }
         const int64_t per = (ratio == 4) ? 2 * ratio : ratio;
         ci.idx = std::make_shared<std::vector<uint8_t>>((size_t) per * nb * 4);

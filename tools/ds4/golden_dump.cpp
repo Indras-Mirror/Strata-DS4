@@ -67,7 +67,7 @@ static const std::set<std::string> & layer_bases() {
         "ffn_norm", "ffn_moe_out", "ffn_shexp", "ffn_out",
         "l_last", "hc_attn_pre", "hc_attn_post", "hc_ffn_pre",
         // probe taps for the compressed-attention (CSA/HCA) path
-        "q", "kv", "csa_state_kv", "csa_state_score_ape", "csa_state_compress",
+        "q", "kv", "csa_state_kv", "csa_state_score_ape", "csa_state_compress", "csa_comp_k",
     };
     return s;
 }
@@ -75,7 +75,7 @@ static const std::set<std::string> & layer_bases() {
 // node whose dump axis is the compressed-block axis (ne[2]) rather than tokens: we want
 // every block, not one token-indexed row.
 static bool block_indexed(const std::string & base) {
-    return base == "csa_state_compress";
+    return base == "csa_state_compress" || base == "csa_comp_k";
 }
 
 // extra intermediate taps used to diff the compressed-attention path. They are only
@@ -91,7 +91,8 @@ static bool probe_enabled() {
 
 static bool probe_base(const std::string & base) {
     return base == "q" || base == "kv" || base == "csa_state_kv" ||
-           base == "csa_state_score_ape" || base == "csa_state_compress";
+           base == "csa_state_score_ape" || base == "csa_state_compress" ||
+           base == "csa_comp_k";
 }
 
 static const std::set<std::string> & global_bases() {
