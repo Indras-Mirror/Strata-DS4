@@ -114,6 +114,19 @@ void deq_q8_k(const uint8_t* q, int64_t n, float* out) {
     }
 }
 
+
+// q8_1 (the CUDA activation): a fp16 scale per 32 values.  The GPU grouped kernel reads these, so the reference
+// for the card's output dequantizes THIS, not the CPU's Q8_K.
+void deq_q8_1(const uint8_t* q, int64_t n, float* out) {
+    struct Block { uint16_t d, s; int8_t qs[32]; };
+    static_assert(sizeof(Block) == 36, "block_q8_1 layout");
+    for (int64_t b = 0; b < n / 32; ++b) {
+        const Block* blk = reinterpret_cast<const Block*>(q + b * sizeof(Block));
+        const float d = ggml_fp16_to_fp32(blk->d);
+        for (int i = 0; i < 32; ++i) out[b * 32 + i] = d * blk->qs[i];
+    }
+}
+
 int64_t mem_available_gib() {
     std::FILE* f = std::fopen("/proc/meminfo", "r");
     if (!f) return -1;
@@ -838,15 +851,52 @@ bool Engine::correctness(const Args& a, const Routes& r, BlobSource& src, std::s
                 ck(cudaStreamSynchronize((cudaStream_t) s_), "corr sync");
                 ck(cudaMemcpyAsync(parts_.data(), d_parts_, (size_t) kMaxParts * H * 4,
                                    cudaMemcpyDeviceToHost, (cudaStream_t) s_), "corr d2h");
-                for (int k = 0; k < kTopK; ++k)
-                    worst_gpu = std::max(worst_gpu, rel(&parts_[(size_t) dst[(size_t) k] * H],
-                                                        &e_ref[(size_t) k * H], H));
+                ck(cudaStreamSynchronize((cudaStream_t) s_), "corr d2h sync");
+                // The GPU path's activation is q8_1, NOT the CPU's Q8_K: comparing it against e_ref (whose
+                // reference dequantizes Q8_K) measures the difference between two 8-bit formats, ~2e-2, and says
+                // nothing about the kernel.  The reference for the card therefore re-dequantizes the card's own
+                // q8_1 buffers, exactly as ds4_expert_parity does (that gate: rel 3.0e-5).
+                std::vector<uint8_t> xq_h((size_t) strata::kernels::native_q8_1_bytes((int) H, 1));
+                ck(cudaMemcpyAsync(xq_h.data(), d_xq_, xq_h.size(), cudaMemcpyDeviceToHost, (cudaStream_t) s_),
+                   "corr xq d2h");
+                ck(cudaStreamSynchronize((cudaStream_t) s_), "corr xq sync");
+                std::vector<float> xd1((size_t) H);
+                deq_q8_1(xq_h.data(), H, xd1.data());
+                std::vector<float> e_ref_gpu((size_t) kTopK * H), h1((size_t) FF);
+                std::vector<uint8_t> hq_h((size_t) strata::kernels::native_q8_1_bytes((int) FF, 1));
+                std::vector<float> hd1((size_t) FF);
+                for (int k = 0; k < kTopK; ++k) {
+                    RefWeights w;
+                    dequant_weights(blobs[(size_t) k].data(), f_, w);
+                    std::vector<float> g((size_t) FF), u((size_t) FF);
+                    matvec(w.G, FF, H, xd1.data(), g.data());
+                    matvec(w.U, FF, H, xd1.data(), u.data());
+                    for (int64_t j = 0; j < FF; ++j) h1[(size_t) j] = silu(g[(size_t) j]) * u[(size_t) j];
+                    ck(cudaMemcpyAsync(d_x_, h1.data(), (size_t) FF * 4, cudaMemcpyHostToDevice, (cudaStream_t) s_),
+                       "corr h1 h2d");
+                    strata::kernels::native_quantize_q8_1((const float*) d_x_, d_xq_, (int) FF, 1, s_);
+                    ck(cudaMemcpyAsync(hq_h.data(), d_xq_, hq_h.size(), cudaMemcpyDeviceToHost, (cudaStream_t) s_),
+                       "corr hq d2h");
+                    ck(cudaStreamSynchronize((cudaStream_t) s_), "corr hq sync");
+                    deq_q8_1(hq_h.data(), FF, hd1.data());
+                    matvec(w.D, H, FF, hd1.data(), &e_ref_gpu[(size_t) k * H]);
+                }
+                double worst_here = 0;
+                for (int k = 0; k < kTopK; ++k) {
+                    const double rq = rel(&parts_[(size_t) dst[(size_t) k] * H], &e_ref_gpu[(size_t) k * H], H);
+                    worst_here = std::max(worst_here, rq);
+                    if (k == 0)
+                        std::printf("    GPU/q8_1 L%-2d: kernel rel %.3e, vs the CPU's Q8_K reference %.3e\n", l, rq,
+                                    rel(&parts_[(size_t) dst[0] * H], &e_ref[0], H));
+                }
+                worst_gpu = std::max(worst_gpu, worst_here);
             }
         }
     }
     check(worst_expert < 1e-3, "CPU expert output vs dequant+F32 (worst)", worst_expert, 1e-3);
     check(worst_moe < 1e-3, "per-layer MoE output vs dequant+F32 (worst)", worst_moe, 1e-3);
-    if (!a.cpu_only) check(worst_gpu < 1e-3, "GPU grouped expert output vs dequant+F32", worst_gpu, 1e-3);
+    if (!a.cpu_only)
+        check(worst_gpu < 1e-3, "GPU grouped expert vs q8_1 dequant+F32 (worst)", worst_gpu, 1e-3);
     std::printf("  pure-float (8-bit activation rounding, not kernel error): expert %.3e, MoE %.3e\n",
                 worst_flo_expert, worst_flo_moe);
     return true;
