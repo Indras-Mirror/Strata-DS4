@@ -108,7 +108,7 @@ rounding (reported alongside).
 | path | gate | up | down | fused |
 | --- | ---: | ---: | ---: | ---: |
 | CPU (ggml-cpu vec_dot) | 8.7e-8 | 9.3e-8 | 1.8e-7 | 1.8e-7 |
-| GPU (native MMVQ) | PENDING | PENDING | PENDING | PENDING |
+| GPU (native MMVQ) | not run (see below) | not run | not run | not run |
 
 Pure-float reference (including Q8_K activation rounding): gate 7.0e-3, up 7.2e-3, fused 1.9e-2.
 
@@ -116,7 +116,13 @@ Micro-benchmark, ms per expert matvec (gate+up+down, one token; RTX 4090 + 5700X
 
 | CPU 1 thread | CPU 8 threads | GPU |
 | ---: | ---: | ---: |
-| 1.55 | 0.71 | PENDING |
+| 1.55 | 0.71 | not run (see below) |
 
-Full commands: `build-ds4-cuda/ds4_expert_parity <gguf> --cpu-only --bench 30`,
-`build-ds4-cuda/ds4_expert_parity <gguf> --bench 30` (GPU, under the shared `flock ds4-gpu.lock`).
+The GPU half is a residual: `p0-gpu-runs` still holds the GPU when this slice ends, and the shared protocol
+forbids a GPU run before `.done-p0-gpu-runs`.  Run, once it appears (and under `flock ~/.quetza-data/conductor/ds4-gpu.lock`):
+
+```
+flock ~/.quetza-data/conductor/ds4-gpu.lock build-ds4-cuda/ds4_expert_parity \
+    /media/mal/NVME1TB/Models/DeepSeek-V4-Flash-Q2-0731.gguf --bench 30
+flock ~/.quetza-data/conductor/ds4-gpu.lock build-ds4-cuda/mmvq_multi_parity
+```
