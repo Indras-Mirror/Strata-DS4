@@ -164,7 +164,7 @@ from Phase 6 unless a Strata-side draft can run without evicting expert slots.
 | 0 | done except the ds4 run (above) |
 | 1 loader/geometry/tokenizer/pack | done, gates verified (4febf29, 64692d1, 7689b05) |
 | 2 Q2_K experts | **done both paths** (CPU rel err < 2e-7 / GPU 3.0e-5 << 1e-3; 0.71 / 0.017 ms per expert) |
-| 3 reference forward (`tools/ds4/ds4_ref.cpp`, CPU ggml) | **gate RED** - exact through layer 1, first divergence at layer 2 (CSA ratio-4), a real arithmetic bug not yet isolated; probe taps added (`a7318e2`); see s9 |
+| 3 reference forward (`tools/ds4/ds4_ref.cpp`, CPU ggml) | **structural bug FIXED** (`7fab6eb`: the compressed-attention mask was filled transposed) - p600/p3000 logits PASS (top1 1.0, KL 0.0086/0.0079 < 0.01); p64 35/477, the strict per-tensor gate still red on a slow CPU-vs-CUDA numeric drift (activation Q8_0), not a structural bug; see s9 |
 | 4a MoE engine replay | **done** - best implied 17.28 tok/s (slots 2300, uncaptured loop); ~22.3 with the loop's ~13 ms/token harness cost removed, above the go line 19.6; see s10 |
 | 4b-7 | not started (4b = captured token graph) |
 

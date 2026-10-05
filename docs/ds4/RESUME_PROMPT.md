@@ -6,7 +6,8 @@ Paste everything below the line into a fresh Claude Code session started in `~/A
 
 We're porting the Strata inference engine (built for Qwen3.8-Flash-Next) to DeepSeek-V4-Flash, so DeepSeek runs
 faster on my RTX 4090 + Ryzen 7 5700X + 90 GB DDR4 than llama.cpp does. **Phases 0, 1, 2 and 4a are done;
-Phase 3 (the oracle gate) is RED at layer 2.** Use /conductor. **Status table: `docs/ds4/FINDINGS.md` s8.**
+Phase 3's structural bug is fixed (p600/p3000 logits PASS) but its strict per-tensor gate is still red on a
+numeric drift.** Use /conductor. **Status table: `docs/ds4/FINDINGS.md` s8.**
 (Last session ended at a scheduled poweroff, 2026-10-05 23:07 - work was committed, nothing is in flight.)
 
 **Read first, in this order** (all in `~/AI/Strata-DS4`, branch `deepseek4`, fork github.com/Indras-Mirror/Strata):
@@ -22,16 +23,22 @@ Phase 3 (the oracle gate) is RED at layer 2.** Use /conductor. **Status table: `
 - **Phase 0** done except the antirez `ds4` engine run (still todo).
 - **Phase 1** done, gates verified. **Phase 2** done on BOTH paths (CPU 1.8e-7 / GPU 3.0e-5 << 1e-3; 0.71 / 0.017 ms
   per expert) - FINDINGS s6, commit `4d3463d`.
-- **Phase 3** (reference forward, `tools/ds4/ds4_ref.cpp`): **gate RED.** `bash tools/ds4/run_ref_gate.sh p64` =
-  456 FAIL / 21 pass. Exact through layer 1; **first divergence is layer 2 - the first CSA (ratio-4) layer**,
-  inside the attention module (`attn_csa_lid-2` cos 0.9033, `attn_out-2` 0.8245), poisoning everything downstream.
-  Two earlier real bugs were fixed on the way (`dcecd11`: `hc_scale` byte offsets, `attn_out` dump aliasing).
-  **Step 1 is already answered**: the goldens' `attn_csa_lid`/`attn_hca` are **NOT** post-Hadamard with `-ctk f16`
-  (no `k_rot` touch the raw/csa/hca caches; only `kv_lid` is rotated, which the ref already does) - so this is a
-  real arithmetic bug, not a comparison artifact. A structural re-read of `overlap_compress` found no difference,
-  so **probe taps were added** (`a7318e2`): `tools/ds4/golden_dump.cpp` captures `q`, `kv`, `csa_state_kv`,
-  `csa_state_score_ape`, `csa_state_compress` under `DS4_GOLDEN_PROBE=1`, and `tools/ds4/ds4_ref.cpp` dumps the
-  same names under `DS4_PROBE=1` - diff them tensor by tensor to isolate the layer-2 CSA bug.
+- **Phase 3** (reference forward, `tools/ds4/ds4_ref.cpp`): **structural bug FIXED, strict gate still red on numerics.**
+  The compressed-attention **mask was filled transposed** (`7fab6eb`): `make_comp` wrote `m16[b*nt + t]`, but ggml
+  indexes the mask as `mask[key + query*ne0]`, so element `(block b, query t)` lives at `t*n_blocks + b` - every
+  query saw only the last few compressed blocks. Fixed in both the f16 and f32 masks. Proven by rebuilding the
+  attention in numpy from ds4_ref's own dumped `q-2`/`k_all-2`: the transposed mask reproduces ds4_ref at cos
+  1.000000, the correct mask reproduces the golden at 0.999979. After the fix (`dec40d8`): p64 **35/477** (was 21),
+  p600 42/477, p3000 38/477; `attn_csa_lid-2` 0.999979, `attn_hca-3` 0.999975; **p600 logits top1 1.0 KL 0.0086,
+  p3000 top1 1.0 KL 0.0079 - both PASS the < 0.01 KL gate.** Earlier real bugs fixed on the way: `dcecd11`
+  (`hc_scale` byte offsets, `attn_out` dump aliasing). Step 1 answered: the goldens are **NOT** post-Hadamard under
+  `-ctk f16` (only `kv_lid` rotates), so this was arithmetic, not a comparison artifact.
+  **Remaining (the only thing red): a slow compounding numeric drift**, not structural - `attn_raw-0` matches to
+  2.2e-8 but `attn_out-0` (de-rope + two grouped Q8_0 output-LoRA matmuls) is 0.9999892 and `ffn_moe_out-0` 0.999657,
+  growing ~1e-3/layer until MoE routing flips discrete top-6 picks. **INFERRED cause: ggml-cpu quantizes the
+  *activations* to Q8_0 for Q8_0/Q2_K matmuls while the CUDA oracle does not.** Confirming test: re-run the oracle
+  with those tensors promoted to F16 (or on the CPU backend) and see whether the residual collapses. Do NOT relax
+  the 0.9999 per-tensor gate before that test. Probe taps: `DS4_GOLDEN_PROBE=1` (golden_dump) / `DS4_PROBE=1` (ds4_ref).
 - **Phase 4a** (MoE engine replay on real routes) **DONE** - FINDINGS s10. Best arm **17.28 tok/s** implied
   (slots 2300 / 15.1 GiB, un-captured loop), which beats the bar 16.34 but not the go line 19.6, so **the kill
   criterion fires as written** - BUT ~13 ms/token of the wall is an un-captured per-layer sync + ~10 launches +
@@ -66,9 +73,11 @@ Phase 3 (the oracle gate) is RED at layer 2.** Use /conductor. **Status table: `
 - Keep tools and results in the repo, not `/tmp` (wiped on reboot).
 
 **Next order:**
-1. **Finish Phase 3**: use the `DS4_GOLDEN_PROBE` / `DS4_PROBE` taps to diff the layer-2 CSA path tensor by tensor
-   and fix the arithmetic in `ds4_ref.cpp`. Gate: `bash tools/ds4/run_ref_gate.sh p64` to green (cos > 0.9999),
-   then p600/p3000 (top-1 > 0.99, KL < 0.01, teacher-forced). Do NOT weaken thresholds.
+1. **Finish Phase 3**: run the confirming test for the residual numeric drift - re-run the oracle with the
+   Q8_0/Q2_K tensors promoted to F16, or on the CPU backend, and see whether `attn_out-*`/`ffn_moe_out-*` collapse
+   toward the golden. If it does, the drift is CPU-vs-CUDA activation quantization and the per-tensor 0.9999 gate
+   needs a CPU-vs-CUDA-justified tolerance (document the evidence); if not, the residual is still in `ds4_ref.cpp`.
+   p600/p3000 logits already pass; the goal is p64 green. Do NOT weaken thresholds before that test.
 2. **Phase 4b**: the captured token graph (CUDA graph per token) over the s10 engine - the ~13 ms/token of
    un-overlapped loop cost is the whole 17.28 -> 22.3 gap. Gate: >= 19.6 tok/s vs 16.34, top-1 > 99% vs golden.
 3. **antirez ds4** run (`~/AI/ds4-ref/ds4`, built for CUDA) on the same prompts with `--ssd-streaming`.
