@@ -705,8 +705,16 @@ bool cpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
 /// One layer of the three-tier path.  The shape is `moe_replay.cpp`'s `Engine::layer`, with the replay's
 /// synthetic dense gap and `--serial` wait removed: `run` is called AFTER the layer's dense work by contract, so
 /// there is nothing to overlap the CPU tier against except the GPU tier, which is what runs beside it.
+// DS4_TIER_PROF=1: where a layer's wall time goes inside gpu_run (summed, printed by close())
+double g_prof[9] = {};
+int64_t g_prof_n = 0;
+const char* const g_prof_name[9] = {"split", "activation", "gpu launch", "cpu pool", "layer sync", "d2h parts",
+                                    "sum", "admission", "pcie budget"};
 bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x_host,
              const void* x_dev, float* out) {
+    static const bool prof = std::getenv("DS4_TIER_PROF") != nullptr;
+    double tp = prof ? now_ms() : 0;
+    auto mark = [&](int i) { if (prof) { const double t = now_ms(); g_prof[i] += t - tp; tp = t; } };
     Gpu& gp = *im.gpu;
     const int64_t H = im.g.n_embd;
     const int64_t K = im.g.top_k;
@@ -736,6 +744,7 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
         }
     }
     st.prefetched_useful = npf_hit;
+    mark(0);
 
     // The PCIe share of the misses, with the replay's error-diffused budget AND its eligibility rule: the DMA
     // reads straight out of the pinned host arena, so a blob the arena does not hold (the file tier) stays on the
@@ -758,6 +767,7 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
             if (gp.arena.ptr(layer, ids6[k])) pcie_i[np++] = (int32_t) k;
         }
     }
+    mark(8);
     int32_t cpu_keep[kMaxParts], nk = 0;
     bool cpu_k[kMaxParts] = {};   ///< routing index -> the pool computed it (the sum's source selector)
     for (int i = 0; i < nc; ++i) {
@@ -780,6 +790,7 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
     ck(cudaMemcpyAsync(gp.d_x, gp.h_x, (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "x h2d");
     strata::kernels::native_quantize_q8_1((const float*) gp.d_x, gp.d_xq, (int) H, 1, gp.s);
     ck(cudaEventRecord(gp.ev[0], gp.s), "record activation");
+    mark(1);
 
     // ---- one group's metadata, then the grouped kernel: w 0 = the GPU's hits, 1 = the PCIe share ----
     auto launch_group = [&](int w, int n, const std::vector<unsigned long long>& ptr,
@@ -833,6 +844,7 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
         ev_pcie = 3;
     }
 
+    mark(2);
     // ---- the CPU tier on what is left, WHILE the card works ----
     if (nk > 0) {
         std::vector<const uint8_t*> held((size_t) nk, nullptr);
@@ -854,7 +866,9 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
         st.cpu_ms = now_ms() - c0;
     }
 
+    mark(3);
     ck(cudaStreamSynchronize(gp.s), "layer sync");
+    mark(4);
     float ms = 0;
     if (ev_hit > 0) {
         ck(cudaEventElapsedTime(&ms, gp.ev[0], gp.ev[ev_hit]), "hits elapsed");
@@ -868,6 +882,7 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
                        cudaMemcpyDeviceToHost, gp.s), "d2h parts");
     ck(cudaStreamSynchronize(gp.s), "parts sync");
     const float* gpu_parts = (const float*) gp.h_parts;
+    mark(5);
     // DS4_CHECK_GPU=1: every card-computed expert recomputed on the CPU from the arena's bytes (diagnostic, slow)
     static const bool check_gpu = std::getenv("DS4_CHECK_GPU") != nullptr;
     if (check_gpu) {
@@ -902,6 +917,7 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
         out[i] = (float) s;
     }
 
+    mark(6);
     // ---- admission: a compulsory miss takes a free slot and is filled for the NEXT token ----
     if (gp.cache && !im.cfg.no_cache) {
         for (int i = 0; i < nc; ++i) {
@@ -919,6 +935,8 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
         }
     }
 
+    mark(7);
+    if (prof) ++g_prof_n;
     st.hits = nh;
     st.pcie = np;
     st.cpu = nk;
@@ -975,6 +993,15 @@ bool ds4_moe_cpu_expert(const cpu::NativeFmt& f, int64_t n_embd, int64_t n_ff, c
 }
 
 void Ds4MoeTier::close() {
+#if defined(DS4_MOE_CUDA)
+    if (g_prof_n > 0) {
+        double tot = 0;
+        for (double v : g_prof) tot += v;
+        std::fprintf(stderr, "tier profile (%lld layer calls, %.3f ms/call):", (long long) g_prof_n, tot / g_prof_n);
+        for (int i = 0; i < 9; ++i) std::fprintf(stderr, " %s %.3f", g_prof_name[i], g_prof[i] / g_prof_n);
+        std::fprintf(stderr, "\n");
+    }
+#endif
     if (!im_) return;
     if (im_->gpu) im_->gpu->close();
     im_->gpu.reset();

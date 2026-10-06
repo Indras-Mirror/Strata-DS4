@@ -161,6 +161,7 @@ int main(int argc, char** argv) {
     mc.pf_b = a.pf_b;
     mc.threads = a.threads;
     mc.arena_gib = a.arena_gib;
+    mc.max_arena_gib = a.arena_gib;   // the explicit flag is the ceiling; mem_floor_gib + memguard still guard RAM
     mc.cpu_only = a.experts == "cpu";
     if (!tier.init(a.model, mc, err)) { std::fprintf(stderr, "ds4_generate: tier init: %s\n", err.c_str()); return 1; }
     if (!a.profile.empty() && !mc.cpu_only && !tier.seed_from_routes(a.profile, err)) {
@@ -280,6 +281,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "decode ms/token: predict+prefetch %.2f, attention+router %.2f, experts %.2f, finish %.2f, "
                          "head %.2f\n", t_ph[0] / dec_steps, t_ph[1] / dec_steps, t_ph[2] / dec_steps,
                  t_ph[3] / dec_steps, t_ph[4] / dec_steps);
+    std::fprintf(stderr, "tier ms/token: wall %.2f (gpu hits %.2f, pcie %.2f, cpu pool %.2f)\n", st.wall_ms / dec_steps,
+                 st.hit_ms / dec_steps, st.pcie_ms / dec_steps, st.cpu_ms / dec_steps);
     (void) pf_stats;
     tier.close();
     ggml_backend_free(be);
