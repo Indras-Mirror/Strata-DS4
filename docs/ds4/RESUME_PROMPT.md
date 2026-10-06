@@ -68,7 +68,7 @@ Read first: `docs/ds4/FINDINGS.md` s8 (status table), s9, s11, s12; then `docs/d
 1. `test_ds4_dense --cuda` mini gate, same thresholds as the CPU gate (cos >= 0.99999, top-1 identical):
    `nice -n 10 systemd-run --user --scope -q -p MemoryMax=8G ./build-ds4-gpu/test_ds4_dense
    bench/ds4-2026-10-06/dense/mini-ds4-swa16.gguf --tokens 40 --cuda --work bench/ds4-2026-10-06/dense/gpu-swa16
-   --ref-dir bench/ds4-2026-10-06/dense/gpu-swa16/ref-allpos` (check the exact mini file names in that dir).
+   --ref-dir bench/ds4-2026-10-06/dense/gpu-swa16/ref-allpos` (fixtures: mini-ds4.gguf, mini-ds4-swa16.gguf, mini-ds4-tame.gguf).
 2. `nice -n 10 systemd-run --user --scope -q -p MemoryMax=8G -p MemorySwapMax=0 build-ds4-gpu/test_ds4_moe_gpu --gpu`
    (4 sources x 24 real slices, rel < 1e-3 each).
 3. `bash tools/ds4/memguard.sh 64 62 -- build-ds4-gpu/test_ds4_moe_gpu --timing --routes
@@ -110,4 +110,5 @@ Read first: `docs/ds4/FINDINGS.md` s8 (status table), s9, s11, s12; then `docs/d
 - Never `pgrep -f`/`pkill -f` a pattern that's in your own command line (it self-matches). Kill only PIDs you started.
 - Keep tools/results in the repo, not /tmp. Commit only your own paths.
 - Untracked, deletable later: `bench/ds4-2026-10-06/hidden-probe/h.bin` (1.4 GB - keep until blocker 3 is done),
-  `bench/ds4-2026-10-05/{goldens-probe*,ref-probe*,ref}`, `bench/ds4-2026-10-06/dense/` test outputs.
+  `bench/ds4-2026-10-05/{goldens-probe*,ref-probe*,ref}`, `bench/ds4-2026-10-06/dense/diag*` test outputs.
+  **KEEP** `bench/ds4-2026-10-06/dense/mini-ds4{,-swa16,-tame}.gguf` (the GPU mini gate's fixtures; untracked).
