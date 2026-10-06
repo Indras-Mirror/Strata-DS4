@@ -62,7 +62,7 @@ def main():
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--bin", default=str(REPO / "build-ds4-gpu/ds4_generate"))
     ap.add_argument("--cap", default="80")
-    ap.add_argument("--need", default="82")
+    ap.add_argument("--need", default="78")
     ap.add_argument("--print-ids", action="store_true")
     ap.add_argument("rest", nargs=argparse.REMAINDER)
     a = ap.parse_args()
