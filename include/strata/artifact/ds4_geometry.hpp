@@ -253,6 +253,33 @@ inline std::string ds4_read_geometry(const GgufModel& model, Ds4Geometry& out) {
     return {};
 }
 
+/// The MTP (nextn) head shipped as its own GGUF (DeepSeek-V4-Flash-MTP-*.gguf): its block is `blk.<n_layer()>`,
+/// one index past the trunk.  Checks the file against the trunk geometry and extends the per-block arrays (SwiGLU
+/// clamps, compress ratio) to that index from the MTP file's own metadata.  `il_mtp` = the block index.
+inline std::string ds4_attach_mtp(const GgufModel& mtp, Ds4Geometry& g, int64_t& il_mtp) {
+    il_mtp = g.n_layer();
+    const std::string p = "blk." + std::to_string(il_mtp) + ".";
+    for (const char* n : { "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight", "attn_norm.weight",
+                           "ffn_gate_inp.weight", "ffn_gate_exps.weight" })
+        if (mtp.find(p + n) == nullptr) return "MTP file has no " + p + n;
+    const GgufFile& f = mtp.meta();
+    uint64_t u = 0;
+    std::string err;
+    if (!(err = ds4_want_u64(f, "deepseek4.embedding_length", u)).empty()) return "MTP file: " + err;
+    if ((int64_t)u != g.n_embd) return "MTP file: embedding_length differs from the trunk's";
+    std::vector<double> ce, cs, cr;
+    if (!(err = ds4_key_f64_arr(f, "deepseek4.swiglu_clamp_exp", ce)).empty()) return "MTP file: " + err;
+    if (!ds4_key_f64_arr(f, "deepseek4.swiglu_clamp_shexp", cs).empty()) cs = ce;
+    if ((int64_t)ce.size() <= il_mtp || (int64_t)cs.size() <= il_mtp) return "MTP file: clamp arrays too short";
+    g.swiglu_clamp_exp.resize((size_t)il_mtp + 1, ce[(size_t)il_mtp]);
+    g.swiglu_clamp_exp[(size_t)il_mtp] = ce[(size_t)il_mtp];
+    g.swiglu_clamp_shexp.resize((size_t)il_mtp + 1, cs[(size_t)il_mtp]);
+    g.swiglu_clamp_shexp[(size_t)il_mtp] = cs[(size_t)il_mtp];
+    if ((int64_t)g.compress_ratios.size() <= il_mtp) g.compress_ratios.resize((size_t)il_mtp + 1, 0);
+    if (g.compress_ratios[(size_t)il_mtp] != 0) return "MTP block is not a ratio-0 (sliding-window) layer";
+    return {};
+}
+
 // ------------------------------------------------------------------ the tensor map
 struct Ds4TensorSpec {
     std::string name;

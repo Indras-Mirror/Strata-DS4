@@ -4,7 +4,7 @@
 // mul_mat_id, right here in the test) reproduces ds4_ref's full-sequence forward on the same tokens.
 //
 //   test_ds4_dense <mini.gguf> [--tokens N] [--work DIR] [--ref-dir DIR] [--ref-bin PATH] [--cuda]
-//                  [--multi 2,3,1,4] [--dump-logits FILE]
+//                  [--multi 2,3,1,4] [--dump-logits FILE] [--mtp mtp.gguf]
 //
 // It writes a deterministic token file, runs `ds4_ref --all-pos` into <work>/ref-allpos, decodes the same
 // tokens one at a time, and checks:
@@ -18,6 +18,9 @@
 // multi-token graph must reproduce one-token decoding (max |diff| / max |logit| <= 1e-5, top-1 identical).  With
 // --cuda, whose kernels change with the column count, it must instead be as close to ds4_ref as the one-token decode.
 // --dump-logits writes the one-token decode's logits (all positions, f32) for bit-exactness checks across builds.
+//
+// --mtp loads the MTP head too: after the trunk's logits at position t it runs the MTP block on (h_t, token t+1) and
+// checks its logits at every position against ds4_ref --mtp (the reference runs with the same flag).
 //
 // The decoder runs on the CPU backend by default; --cuda puts Ds4Dense (and the test-side expert reference) on
 // ggml's GPU backend (needs a tree built with -DSTRATA_GGML_CUDA=ON, i.e. build-ds4-gpu). ds4_ref, the oracle,
@@ -146,7 +149,7 @@ int main(int argc, char ** argv) {
     std::string model, work = "bench/ds4-2026-10-06/dense", refbin, refdir;
     int nt_tokens = 0;
     bool use_cuda = false;
-    std::string multi, dump_logits;
+    std::string multi, dump_logits, mtp;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -162,6 +165,7 @@ int main(int argc, char ** argv) {
         else if (a == "--cuda")     use_cuda = true;
         else if (a == "--multi")    multi = next();
         else if (a == "--dump-logits") dump_logits = next();
+        else if (a == "--mtp")      mtp = next();
         else if (a == "-h" || a == "--help") {
             std::printf("usage: test_ds4_dense <mini.gguf> [--tokens N] [--work DIR] [--ref-dir DIR] [--ref-bin PATH] [--cuda]\n");
             return 0;
@@ -188,6 +192,7 @@ int main(int argc, char ** argv) {
     cfg.backend   = gpu;       // nullptr = CPU
     cfg.n_threads = 8;
     cfg.gate_taps = true;
+    cfg.mtp_path  = mtp;
     std::printf("[gate] decoder backend: %s\n", gpu ? ggml_backend_name(gpu) : "CPU");
 
     Ds4Dense d;
@@ -244,7 +249,8 @@ int main(int argc, char ** argv) {
             return 1;
         }
         const std::string cmd = "\"" + refbin + "\" -m \"" + model + "\" --tokens \"" + tokfile +
-                                "\" --out \"" + refdir + "\" --all-pos -t 8 2>&1 | tee \"" + work + "/ref.log\"";
+                                "\" --out \"" + refdir + "\" --all-pos -t 8" + (mtp.empty() ? "" : " --mtp \"" + mtp + "\"") +
+                                " 2>&1 | tee \"" + work + "/ref.log\"";
         std::printf("[gate] %s\n", cmd.c_str());
         const int rc = std::system(cmd.c_str());
         if (rc != 0) { std::fprintf(stderr, "[gate] ds4_ref failed (rc=%d)\n", rc); return 1; }
@@ -266,13 +272,36 @@ int main(int argc, char ** argv) {
     };
 
     const float * r_logits = load_ref("result_output", (size_t) V);
+    const int il_mtp = d.mtp_layer();
+    const float * r_mtp = il_mtp >= 0 ? load_ref("mtp_result_output", (size_t) V) : nullptr;
 
     // ---- decode ------------------------------------------------------------------------
-    std::vector<MoeRef> moe((size_t) nl);
-    for (int64_t il = 0; il < nl; ++il)
+    std::vector<MoeRef> moe((size_t) nl + (il_mtp >= 0 ? 1 : 0));
+    for (int64_t il = 0; il < (int64_t) moe.size(); ++il)
         if (!moe[(size_t) il].init(d, (int) il)) { std::fprintf(stderr, "[gate] MoE ref init failed\n"); return 1; }
 
-    std::vector<std::vector<float>> my_logits((size_t) nt);
+    std::vector<std::vector<float>> my_logits((size_t) nt), my_mtp((size_t) nt);
+    // the MTP block at the positions of a pass [t0, t0+n): next tokens tokens[t+1] (token 0 past the end, as ds4_ref)
+    auto run_mtp = [&](Ds4Dense & dd, int64_t t0, int n, std::vector<std::vector<float>> & out) -> bool {
+        std::vector<int> nxt((size_t) n), mi((size_t) (g.n_expert_used * n));
+        std::vector<float> mw2((size_t) (g.n_expert_used * n)), rs2((size_t) (D * n));
+        for (int t = 0; t < n; ++t) nxt[(size_t) t] = t0 + t + 1 < nt ? tokens[(size_t) (t0 + t + 1)] : 0;
+        if (!dd.mtp_begin(nxt.data(), n)) return false;
+        const float * fn = nullptr;
+        if (!dd.attn_router_n(il_mtp, (int) t0, n, mi.data(), mw2.data(), &fn)) return false;
+        for (int t = 0; t < n; ++t) {
+            const float * rsum = nullptr;
+            if (!moe[(size_t) il_mtp].run(fn + (size_t) t * D, mi.data() + t * g.n_expert_used,
+                                          mw2.data() + t * g.n_expert_used, &rsum)) return false;
+            std::copy(rsum, rsum + D, rs2.begin() + (size_t) t * D);
+        }
+        if (!dd.finish_layer_n(il_mtp, n, rs2.data())) return false;
+        const float * lg = nullptr;
+        int nv = 0;
+        if (!dd.mtp_logits_n(n, &lg, &nv)) return false;
+        for (int t = 0; t < n; ++t) out[(size_t) (t0 + t)].assign(lg + (size_t) t * nv, lg + (size_t) (t + 1) * nv);
+        return true;
+    };
     std::vector<std::vector<float>> my_raw, my_out, my_fn, my_ll;   // last position, per layer
     std::vector<int> ids((size_t) g.n_expert_used), ids2((size_t) g.n_expert_used);
     std::vector<float> wts((size_t) g.n_expert_used), w2((size_t) g.n_expert_used);
@@ -323,6 +352,15 @@ int main(int argc, char ** argv) {
         int nv = 0;
         if (!d.logits(&lg, &nv)) { std::fprintf(stderr, "[gate] logits: %s\n", d.last_error().c_str()); return 1; }
         my_logits[(size_t) t].assign(lg, lg + nv);
+        if (il_mtp >= 0 && !run_mtp(d, t, 1, my_mtp)) {
+            std::fprintf(stderr, "[gate] MTP at pos %lld: %s\n", (long long) t, d.last_error().c_str());
+            return 1;
+        }
+        if (il_mtp >= 0 && t == t_last) {   // the MTP block's taps, compared after the trunk's below
+            my_raw.push_back(std::vector<float>(d.tap_attn_raw(il_mtp), d.tap_attn_raw(il_mtp) + NH * DH));
+            my_out.push_back(std::vector<float>(d.tap_attn_out(il_mtp), d.tap_attn_out(il_mtp) + D));
+            my_ll.push_back(std::vector<float>(d.tap_l_last(il_mtp), d.tap_l_last(il_mtp) + D * HC));
+        }
     }
 
     if (!dump_logits.empty()) {
@@ -382,6 +420,32 @@ int main(int argc, char ** argv) {
     if (n_bad) fails += (int) n_bad;
     if (top1_mine != top1_ref) fails++;
 
+    if (il_mtp >= 0) {   // MTP block taps at the last position
+        const size_t L = (size_t) nl;
+        const float * r_raw = load_ref("attn_raw-" + std::to_string(il_mtp), (size_t) (NH * DH));
+        const float * r_out = load_ref("attn_out-" + std::to_string(il_mtp), (size_t) D);
+        const float * r_ll  = load_ref("l_last-" + std::to_string(il_mtp), (size_t) (D * HC));
+        std::printf("  MTP block taps, last position: attn_raw %.8f attn_out %.8f l_last %.8f\n",
+                    cosine(my_raw[L].data(), r_raw + (size_t) t_last * NH * DH, (size_t) (NH * DH)),
+                    cosine(my_out[L].data(), r_out + (size_t) t_last * D, (size_t) D),
+                    cosine(my_ll[L].data(), r_ll + (size_t) t_last * D * HC, (size_t) (D * HC)));
+    }
+    if (il_mtp >= 0) {   // the MTP head vs ds4_ref --mtp; the last position's next token is a placeholder, skip it
+        double wc = 2;
+        int64_t wt = -1, bad = 0, top_same = 0;
+        for (int64_t t = 0; t + 1 < nt; ++t) {
+            const double c = cosine(my_mtp[(size_t) t].data(), r_mtp + (size_t) t * V, (size_t) V);
+            if (c < wc) { wc = c; wt = t; }
+            if (c < COS_GATE) bad++;
+            if (argmax(my_mtp[(size_t) t].data(), V) == argmax(r_mtp + (size_t) t * V, V)) top_same++;
+        }
+        std::printf("\n[gate] MTP head logits vs ds4_ref --mtp, positions 0..%lld: worst cos %.8f at %lld, %lld below "
+                    "the gate, top-1 identical at %lld/%lld\n", (long long) (nt - 2), wc, (long long) wt,
+                    (long long) bad, (long long) top_same, (long long) (nt - 1));
+        fails += (int) bad;
+        if (top_same != nt - 1) fails++;
+    }
+
     std::printf("\n[gate] predictor (prefetch hint) recall@16 on the true routed ids, non-hash layers\n");
     for (int64_t il = 0; il < nl; ++il) {
         if (il < (int) g.hash_layer_count || pred_tot[(size_t) il] == 0) continue;
@@ -403,7 +467,7 @@ int main(int argc, char ** argv) {
         for (int p : pat)
             if (p < 1 || p > d2.max_tokens()) { std::fprintf(stderr, "[gate] --multi: sizes 1..%d\n", d2.max_tokens()); return 1; }
         const int64_t K = g.n_expert_used;
-        std::vector<std::vector<float>> ml((size_t) nt);
+        std::vector<std::vector<float>> ml((size_t) nt), mml((size_t) nt);
         std::vector<int> mids((size_t) (K * d2.max_tokens()));
         std::vector<float> mw((size_t) (K * d2.max_tokens())), rs((size_t) (D * d2.max_tokens()));
         std::vector<int> sizes_seen(d2.max_tokens() + 1, 0);
@@ -433,6 +497,10 @@ int main(int argc, char ** argv) {
             int nv = 0;
             if (!d2.logits_n(n, &lg, &nv)) { std::fprintf(stderr, "[gate] logits_n: %s\n", d2.last_error().c_str()); return 1; }
             for (int t = 0; t < n; ++t) ml[(size_t) (t0 + t)].assign(lg + (size_t) t * nv, lg + (size_t) (t + 1) * nv);
+            if (il_mtp >= 0 && !run_mtp(d2, t0, n, mml)) {
+                std::fprintf(stderr, "[gate] multi MTP at pos0 %lld: %s\n", (long long) t0, d2.last_error().c_str());
+                return 1;
+            }
             t0 += n;
         }
         std::printf("\n[gate] multi-token passes (pattern %s; passes by size:", multi.c_str());
@@ -468,6 +536,20 @@ int main(int argc, char ** argv) {
             std::printf(" %lld:%.2g", (long long) t, md / (mx + 1e-30));
         }
         std::printf("\n");
+        if (il_mtp >= 0) {
+            int64_t mexact = 0;
+            double mrel = 0;
+            for (int64_t t = 0; t < nt; ++t) {
+                const float * a = mml[(size_t) t].data(), * r = my_mtp[(size_t) t].data();
+                double md = 0, mx = 0;
+                for (int64_t v = 0; v < V; ++v) { md = std::max(md, (double) std::fabs(a[v] - r[v])); mx = std::max(mx, (double) std::fabs(r[v])); }
+                if (md == 0) mexact++;
+                mrel = std::max(mrel, md / (mx + 1e-30));
+            }
+            std::printf("  MTP head in multi-token passes: bit-identical positions %lld/%lld, worst rel diff %.3g\n",
+                        (long long) mexact, (long long) nt, mrel);
+            if (!use_cuda && mrel > 1e-5) { std::printf("  ^ multi-token MTP FAIL\n"); fails++; }
+        }
         if (!use_cuda) {   // CPU: the kernels do not depend on the column count - the passes must reproduce it
             if (worst_rel > 1e-5) { std::printf("  ^ multi-token FAIL (gate 1e-5)\n"); fails++; }
             if (n_top_diff) { std::printf("  ^ multi-token top-1 FAIL\n"); fails++; }

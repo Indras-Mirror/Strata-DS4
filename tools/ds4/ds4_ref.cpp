@@ -120,10 +120,14 @@ struct Weights {
     }
 };
 
-static bool load_weights(const GgufModel & model, Weights & w) {
-    ggml_init_params ip = { /*mem_size*/ 1024ull * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
-    w.ctx = ggml_init(ip);
-    if (!w.ctx) return false;
+// `prefix` non-empty: bind only the tensors whose name starts with it (the MTP file: its own block, not its
+// duplicate token_embd/output).  A second call appends to the same context.
+static bool load_weights(const GgufModel & model, Weights & w, const std::string & prefix = "") {
+    if (!w.ctx) {
+        ggml_init_params ip = { /*mem_size*/ 1024ull * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
+        w.ctx = ggml_init(ip);
+        if (!w.ctx) return false;
+    }
     ggml_set_no_alloc(w.ctx, true);
 
     for (size_t s = 0; s < model.size(); ++s) {
@@ -136,6 +140,7 @@ static bool load_weights(const GgufModel & model, Weights & w) {
         if (!buf) { std::fprintf(stderr, "[ds4_ref] cannot wrap %s\n", sh.path().c_str()); return false; }
         w.bufs.push_back(buf);
         for (const auto & ti : tensors) {
+            if (!prefix.empty() && ti.name.rfind(prefix, 0) != 0) continue;
             if (!model.in_bounds(ti, s)) { std::fprintf(stderr, "[ds4_ref] %s out of bounds\n", ti.name.c_str()); return false; }
             int64_t ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
             for (size_t d = 0; d < ti.shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) ti.shape[d];
@@ -670,6 +675,7 @@ int main(int argc, char ** argv) {
     int  n_threads = 8;
     int  max_layer = 1 << 20;
     bool do_hca = true;
+    std::string mtp_path;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -681,10 +687,11 @@ int main(int argc, char ** argv) {
         else if (a == "-t" || a == "--threads") n_threads = std::atoi(next().c_str());
         else if (a == "--max-layer") max_layer = std::atoi(next().c_str());
         else if (a == "--no-hca") do_hca = false;
+        else if (a == "--mtp") mtp_path = next();
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 1; }
     }
     if (model_path.empty() || tokens_path.empty() || out_dir.empty()) {
-        std::fprintf(stderr, "usage: ds4_ref -m model.gguf --tokens tokens.i32 --out dir [--all-pos] [-t N] [--max-layer N]\n");
+        std::fprintf(stderr, "usage: ds4_ref -m model.gguf --tokens tokens.i32 --out dir [--all-pos] [-t N] [--max-layer N] [--mtp mtp.gguf]\n");
         return 1;
     }
 
@@ -713,6 +720,20 @@ int main(int argc, char ** argv) {
     if (!load_weights(model, w)) { std::fprintf(stderr, "error: weight load failed\n"); return 1; }
     std::printf("[ds4_ref] bound %lld tensors zero-copy from %zu shard(s)\n",
                 (long long) w.n_tensors, model.size());
+    // --mtp: the nextn block (its own GGUF), bound next to the trunk as blk.<n_layer>
+    std::unique_ptr<GgufModel> mtp_model;
+    int64_t il_mtp = -1;
+    if (!mtp_path.empty()) {
+        mtp_model = std::make_unique<GgufModel>(GgufModel::open(mtp_path));
+        if (mtp_model->size() == 0) { std::fprintf(stderr, "error: cannot open %s\n", mtp_path.c_str()); return 1; }
+        if (!(err = ds4_attach_mtp(*mtp_model, g, il_mtp)).empty()) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+        const int64_t before = w.n_tensors;
+        if (!load_weights(*mtp_model, w, "blk." + std::to_string(il_mtp) + ".")) {
+            std::fprintf(stderr, "error: MTP weight load failed\n"); return 1;
+        }
+        std::printf("[ds4_ref] MTP block %lld: bound %lld tensors from %s\n", (long long) il_mtp,
+                    (long long) (w.n_tensors - before), mtp_path.c_str());
+    }
 
     const int64_t D = g.n_embd, hc = g.hc, n_head = g.n_head, d_h = g.d_head, dh_rope = g.d_rope;
     (void) n_head;
@@ -847,7 +868,8 @@ int main(int argc, char ** argv) {
 
     // ---------------- layers
     ggml_set_no_alloc(w.ctx, true);
-    for (int64_t il = 0; il < n_layer; ++il) {
+    // one layer over the whole sequence: hc_state in, hc_state out (the trunk layers, and the MTP block)
+    auto do_layer = [&](int64_t il) -> bool {
         G.fills.clear();
         G.probes.clear();
         const int64_t ratio = (size_t) il < g.compress_ratios.size() ? g.compress_ratios[(size_t) il] : 0;
@@ -964,7 +986,7 @@ int main(int argc, char ** argv) {
         // compute
         ggml_cgraph * gf = ggml_new_graph_custom(w.ctx, 2048, false);
         ggml_build_forward_expand(gf, l_last);
-        if (!run(gf)) return 1;
+        if (!run(gf)) return false;
 
         // read dumps
         dump_put(ds, attn_name, il, {n_head * d_h}, (const float *) attn_raw->data, nt);
@@ -992,14 +1014,16 @@ int main(int argc, char ** argv) {
         std::memcpy(hc_state.data(), l_last->data, hc_state.size() * 4);
         std::printf("[ds4_ref] layer %lld/%lld done (ratio=%lld)\n", (long long) (il + 1), (long long) n_layer, (long long) ratio);
         std::fflush(stdout);
-    }
+        return true;
+    };
+    for (int64_t il = 0; il < n_layer; ++il)
+        if (!do_layer(il)) return 1;
+    std::vector<float> h_trunk = hc_state;   // the trunk's final hc streams (the MTP block's `h` input)
 
-    // ---------------- head
-    if (n_layer == g.n_layer()) {
+    // ---------------- head: hc_head -> norm -> output, over hc_state; `pfx` "" = the trunk's, "mtp_" = the MTP block's
+    auto do_head = [&](ggml_tensor * norm_w, const std::string & pfx) -> bool {
         G.fills.clear();
         ggml_tensor * xin = G.input({D, hc, nt}, hc_state.data(), hc_state.size() * 4);
-        const int64_t mix_dim = g.hc_mix_dim();
-        (void) mix_dim;
         ggml_tensor * flat = ggml_reshape_2d(w.ctx, xin, hc * D, nt);
         ggml_tensor * flat_norm = ggml_rms_norm(w.ctx, flat, (float) g.rms_eps);
         ggml_tensor * mixes = ggml_mul_mat(w.ctx, w.get("output_hc_fn.weight"), flat_norm);   // [hc, nt]
@@ -1009,17 +1033,52 @@ int main(int argc, char ** argv) {
         pre = ggml_scale_bias(w.ctx, pre, 1.0f, (float) g.hc_eps);
         ggml_tensor * hc_head = G.hc_mean(xin, pre);
         ggml_set_output(hc_head); ggml_set_name(hc_head, "hc_head");
-        ggml_tensor * rn2 = G.rms_w(hc_head, w.get("output_norm.weight"));
+        ggml_tensor * rn2 = G.rms_w(hc_head, norm_w);
         ggml_set_output(rn2); ggml_set_name(rn2, "result_norm");
         ggml_tensor * logits = ggml_mul_mat(w.ctx, w.get("output.weight"), rn2);
         ggml_set_output(logits); ggml_set_name(logits, "result_output");
 
         ggml_cgraph * gf = ggml_new_graph_custom(w.ctx, 256, false);
         ggml_build_forward_expand(gf, logits);
+        if (!run(gf)) return false;
+        dump_put(ds, pfx + "hc_head", -1, {D}, (const float *) hc_head->data, nt);
+        dump_put(ds, pfx + "result_norm", -1, {D}, (const float *) rn2->data, nt);
+        dump_put(ds, pfx + "result_output", -1, {g.vocab_size}, (const float *) logits->data, nt);
+        return true;
+    };
+    if (n_layer == g.n_layer() && !do_head(w.get("output_norm.weight"), "")) return 1;
+
+    // ---------------- MTP block (llama.cpp deepseek4.cpp graph_mtp): position t takes the trunk's final hc streams
+    // h_t and the embedding of token t+1 (the last position, whose next token is unknown, takes token 0 - attention is
+    // causal, so that only changes its own output), predicts token t+2.
+    if (il_mtp >= 0 && n_layer == g.n_layer()) {
+        // DS4_REF_MTP_H=<file>: take h from a file (D*hc*nt f32, e.g. a decoder's own trunk state) instead of this
+        // trunk's - isolates the MTP block from last-bit trunk differences, which its experts' Q8_0 rounding amplifies
+        if (const char * hf = std::getenv("DS4_REF_MTP_H")) {
+            std::ifstream in(hf, std::ios::binary);
+            in.read((char *) h_trunk.data(), (std::streamsize) (h_trunk.size() * 4));
+            if (!in) { std::fprintf(stderr, "error: DS4_REF_MTP_H %s is short\n", hf); return 1; }
+            std::printf("[ds4_ref] MTP h from %s\n", hf);
+        }
+        G.fills.clear();
+        std::vector<int32_t> nxt((size_t) nt);
+        for (int64_t t = 0; t < nt; ++t) nxt[(size_t) t] = t + 1 < nt ? tokens[(size_t) (t + 1)] : 0;
+        ggml_tensor * ids = G.input_i32({nt}, nxt.data(), nxt.size() * 4);
+        ggml_tensor * h = G.input({D, hc, nt}, h_trunk.data(), h_trunk.size() * 4);
+        const std::string p = "blk." + std::to_string(il_mtp) + ".";
+        ggml_tensor * emb = ggml_cast(w.ctx, ggml_get_rows(w.ctx, w.get("token_embd.weight"), ids), GGML_TYPE_F32);
+        ggml_tensor * en = G.rms_w(emb, w.get(p + "nextn.enorm.weight"));                 // [D, nt]
+        en = ggml_repeat_4d(w.ctx, ggml_reshape_3d(w.ctx, en, D, 1, nt), D, hc, nt, 1);
+        ggml_tensor * hn = G.rms_w(h, w.get(p + "nextn.hnorm.weight"));                   // per stream
+        ggml_tensor * x = ggml_mul_mat(w.ctx, w.get(p + "nextn.eh_proj.weight"), ggml_concat(w.ctx, en, hn, 0));
+        ggml_set_output(x); ggml_set_name(x, "mtp_eh_proj");
+        ggml_cgraph * gf = ggml_new_graph_custom(w.ctx, 256, false);
+        ggml_build_forward_expand(gf, x);
         if (!run(gf)) return 1;
-        dump_put(ds, "hc_head", -1, {D}, (const float *) hc_head->data, nt);
-        dump_put(ds, "result_norm", -1, {D}, (const float *) rn2->data, nt);
-        dump_put(ds, "result_output", -1, {g.vocab_size}, (const float *) logits->data, nt);
+        dump_put(ds, "mtp_eh_proj", -1, {D, hc}, (const float *) x->data, nt);
+        std::memcpy(hc_state.data(), x->data, hc_state.size() * 4);
+        if (!do_layer(il_mtp)) return 1;
+        if (!do_head(w.get(p + "nextn.shared_head_norm.weight"), "mtp_")) return 1;
     }
 
     if (!write_dumps(ds, tokens)) return 1;

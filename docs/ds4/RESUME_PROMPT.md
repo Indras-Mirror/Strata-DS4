@@ -41,7 +41,13 @@ the stock fixture the indexer top-k ties at exact zeros break differently on CUD
    flash-attn at d_head 512 on CUDA, strided I32 copies), then ds4_generate unchanged-speed check (state grew a little).
    Follow-up: the per-pass input upload carries `vis` as comp_max*4 floats per compressed layer (~0.35 ms/token at 32K
    context) - build visibility on the device from i_pos if long contexts matter.
-3. Then the MTP head as a 44th layer: `/media/mal/NVME1TB/Models/DS4-MTP/DeepSeek-V4-Flash-MTP-bf16.gguf` (philpax,
+3. IN PROGRESS - MTP head.  DONE (CPU, `Ds4Dense` + `ds4_ref --mtp` + mini fixture, ENGINE_DENSE.md "MTP head"):
+   the block loads from the MTP GGUF as layer 43 (`mtp_path`, `mtp_begin`, `mtp_logits_n`); gate exact vs the oracle
+   when fed the same trunk state.  NEXT: ds4_generate - load it (`--mtp FILE`, dense part requantized like the trunk:
+   eh_proj and the BF16 matrices are requant targets), MTP experts v1 = CPU ggml mul_mat_id straight off the MTP file
+   (MXFP4; ~80 MB read per draft), draft-acceptance measurement (greedy: does MTP's argmax at p equal the trunk's
+   token at p+2?) on the p600 prompt before building the verify loop.  Original notes:
+   the MTP head as a 44th layer: `/media/mal/NVME1TB/Models/DS4-MTP/DeepSeek-V4-Flash-MTP-bf16.gguf` (philpax,
    sha verified). Layer 43 is a ratio-0 sliding-window layer: inputs h_t (main final hc streams, before the head) and
    embd(t+1) -> hnorm/enorm -> concat -> nextn.eh_proj -> normal DS4 layer (own SWA KV) -> hc_head ->
    nextn.shared_head_norm -> main `output`. Mirror llama.cpp `src/models/deepseek4.cpp` graph_mtp

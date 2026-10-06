@@ -77,15 +77,21 @@ bool requant_target(const std::string & n) {
         if (n.size() > std::strlen(s) && n.compare(n.size() - std::strlen(s), std::string::npos, s) == 0 &&
             n.rfind("blk.", 0) == 0 && n.find("indexer") == std::string::npos)
             return true;
+    if (n.size() > 21 && n.compare(n.size() - 21, 21, ".nextn.eh_proj.weight") == 0) return true;   // MTP block (BF16)
     return n == "output.weight";
 }
 
+// `prefix` non-empty: only the tensors whose name starts with it (the MTP file: its own block - its token_embd and
+// output duplicate the trunk's).  A second call appends to the same store.
 bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, bool skip_experts, int requant,
-                  std::string & err) {
-    ggml_init_params ip = { /*mem_size*/ 256ull * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
-    w.ctx = ggml_init(ip);
-    if (!w.ctx) { err = "ggml_init(weights) failed"; return false; }
+                  std::string & err, const std::string & prefix = "") {
+    if (!w.ctx) {
+        ggml_init_params ip = { /*mem_size*/ 256ull * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
+        w.ctx = ggml_init(ip);
+        if (!w.ctx) { err = "ggml_init(weights) failed"; return false; }
+    }
     ggml_set_no_alloc(w.ctx, true);
+    auto wanted = [&](const std::string & n) { return prefix.empty() || n.rfind(prefix, 0) == 0; };
 
     const bool cpu = ggml_backend_get_default_buffer_type(backend) == ggml_backend_cpu_buffer_type();
 
@@ -101,6 +107,7 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, b
             if (!buf) { err = "cannot wrap " + sh.path(); return false; }
             w.bufs.push_back(buf);
             for (const auto & ti : tensors) {
+                if (!wanted(ti.name)) continue;
                 if (!model.in_bounds(ti, s)) { err = ti.name + " out of bounds"; return false; }
                 int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
                 for (size_t d = 0; d < ti.shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) ti.shape[d];
@@ -119,7 +126,7 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, b
 
     // non-CPU: create the tensor set, allocate one backend buffer for it, upload the payloads
     auto skip = [&](const std::string & n) {
-        return n == "token_embd.weight" || (skip_experts && is_routed_expert(n));
+        return !wanted(n) || n == "token_embd.weight" || (skip_experts && is_routed_expert(n));
     };
     for (size_t s = 0; s < model.size(); ++s) {
         for (const auto & ti : model.shard(s).tensors()) {
@@ -128,7 +135,8 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, b
             int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
             for (size_t d = 0; d < ti.shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) ti.shape[d];
             ggml_type ty = (ggml_type) ti.type;
-            if (requant >= 0 && ty == GGML_TYPE_Q8_0 && requant_target(ti.name) && ne[0] % ggml_blck_size((ggml_type) requant) == 0)
+            if (requant >= 0 && (ty == GGML_TYPE_Q8_0 || ty == GGML_TYPE_BF16) && requant_target(ti.name) &&
+                ne[0] % ggml_blck_size((ggml_type) requant) == 0)
                 ty = (ggml_type) requant;
             ggml_tensor * t = ggml_new_tensor(w.ctx, ty, (int) ti.shape.size(), ne);
             if (!t) { err = "cannot create " + ti.name; return false; }
@@ -182,6 +190,9 @@ struct Ds4Dense::Impl {
     int  n_threads = 8;
 
     WStore          w;
+    std::unique_ptr<GgufModel> mtp_model; // the MTP (nextn) head's own GGUF, when loaded
+    int64_t         il_mtp = -1;          // its block index (= n_trunk), or -1
+    int64_t         n_trunk = 0;          // trunk layers (ly holds n_trunk + 1 entries with the MTP block)
     ggml_context *  sctx = nullptr;     // persistent decode state
     // Per-step inputs and per-layer router outputs live at fixed offsets in two small buffers so a token costs ONE
     // upload of every layer's inputs and one readback per layer (was ~11 tensor_set + 3 tensor_get per layer, each a
@@ -297,6 +308,11 @@ struct Ds4Dense::Impl {
     std::vector<Layer> ly;
 
     ggml_cgraph * gf_init[kNtMax + 1] = {};       // by n
+    ggml_cgraph * gf_mtp_in[kNtMax + 1] = {};     // MTP input: eh_proj(enorm(embd) | hnorm(trunk state)), by n
+    ggml_cgraph * gf_mtp_head[kNtMax + 1] = {};   // MTP head: hc_head -> shared_head_norm -> output, by n
+    ggml_tensor * mtp_logits_t[kNtMax + 1] = {};
+    ggml_gallocr_t allo_mtp_in[kNtMax + 1] = {};
+    ggml_gallocr_t allo_mtp_head[kNtMax + 1] = {};
     ggml_cgraph * gf_head[kNtMax + 1] = {};
     ggml_tensor * logits_t[kNtMax + 1] = {};      // [V, n] head graph outputs
     ggml_gallocr_t allo_init[kNtMax + 1] = {};
@@ -310,6 +326,8 @@ struct Ds4Dense::Impl {
         }
         for (ggml_gallocr_t a : allo_init) if (a) ggml_gallocr_free(a);
         for (ggml_gallocr_t a : allo_head) if (a) ggml_gallocr_free(a);
+        for (ggml_gallocr_t a : allo_mtp_in) if (a) ggml_gallocr_free(a);
+        for (ggml_gallocr_t a : allo_mtp_head) if (a) ggml_gallocr_free(a);
         if (sbuf) ggml_backend_buffer_free(sbuf);
         if (ibuf) ggml_backend_buffer_free(ibuf);
         if (obuf) ggml_backend_buffer_free(obuf);
@@ -837,8 +855,9 @@ static ggml_cgraph * build_init(Ds4Dense::Impl & im, int64_t n) {
     return gf;
 }
 
-// logits: hc_head -> output_norm -> output, per token
-static ggml_cgraph * build_head(Ds4Dense::Impl & im, int64_t n) {
+// logits: hc_head -> output_norm -> output, per token.  `mtp`: the MTP head (its shared_head_norm, the trunk's
+// hc_head and output - llama.cpp deepseek4.cpp graph_mtp)
+static ggml_cgraph * build_head(Ds4Dense::Impl & im, int64_t n, bool mtp = false) {
     ggml_context * gc = im.gctx;
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 256, false);
     B b { &im, gc, &im.g };
@@ -853,11 +872,30 @@ static ggml_cgraph * build_head(Ds4Dense::Impl & im, int64_t n) {
     ggml_tensor * pre = ggml_sigmoid(gc, b.hc_affine(mixes, b.v1(scale, 1, 0), b.v1(base, HC, 0)));
     pre = ggml_scale_bias(gc, pre, 1.0f, (float) im.g.hc_eps);
     ggml_tensor * hc_head = b.hc_mean(xin, pre);
-    ggml_tensor * rn = b.rms_w(hc_head, im.w.get("output_norm.weight"));
+    ggml_tensor * rn = b.rms_w(hc_head, mtp ? b.BL((int) im.il_mtp, "nextn.shared_head_norm.weight")
+                                            : im.w.get("output_norm.weight"));
     ggml_tensor * lg = ggml_mul_mat(gc, im.w.get("output.weight"), rn);
     ggml_set_output(lg);
     ggml_build_forward_expand(gf, lg);
-    im.logits_t[n] = lg;
+    (mtp ? im.mtp_logits_t : im.logits_t)[n] = lg;
+    return gf;
+}
+
+// MTP input: x_state <- eh_proj(concat(enorm(embd[next]) repeated over the hc streams, hnorm(x_state))), per token.
+// x_state holds the trunk's final hc streams (after the last finish_layer); i_emb the next tokens' embeddings.
+static ggml_cgraph * build_mtp_in(Ds4Dense::Impl & im, int64_t n) {
+    ggml_context * gc = im.gctx;
+    ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
+    B b { &im, gc, &im.g };
+    const int64_t D = im.D, HC = im.HC;
+    const int il = (int) im.il_mtp;
+    ggml_tensor * xs = ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1], im.x_state->nb[2], 0);
+    ggml_tensor * emb = ggml_view_2d(gc, im.i_emb, D, n, im.i_emb->nb[1], 0);
+    ggml_tensor * en = b.rms_w(emb, b.BL(il, "nextn.enorm.weight"));
+    en = ggml_repeat_4d(gc, ggml_reshape_3d(gc, en, D, 1, n), D, HC, n, 1);
+    ggml_tensor * hn = b.rms_w(xs, b.BL(il, "nextn.hnorm.weight"));
+    ggml_tensor * x = ggml_mul_mat(gc, b.BL(il, "nextn.eh_proj.weight"), ggml_concat(gc, en, hn, 0));   // [D, HC, n]
+    ggml_build_forward_expand(gf, ggml_cpy(gc, x, xs));
     return gf;
 }
 
@@ -885,6 +923,15 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
     if (!(err = check_ds4_model(*im.model, im.g)).empty()) return false;
     if (!load_weights(*im.model, im.backend, im.w, cfg.skip_routed_experts,
                       ggml_backend_is_cpu(im.backend) ? -1 : cfg.requant_type, err)) return false;
+    im.n_trunk = im.g.n_layer();
+    if (!cfg.mtp_path.empty()) {   // the MTP head: its own GGUF, block blk.<n_trunk>
+        im.mtp_model = std::make_unique<GgufModel>(GgufModel::open(cfg.mtp_path));
+        if (im.mtp_model->size() == 0) { err = "cannot open " + cfg.mtp_path; return false; }
+        if (!(err = ds4_attach_mtp(*im.mtp_model, im.g, im.il_mtp)).empty()) return false;
+        if (!load_weights(*im.mtp_model, im.backend, im.w, cfg.skip_routed_experts,
+                          ggml_backend_is_cpu(im.backend) ? -1 : cfg.requant_type, err,
+                          "blk." + std::to_string(im.il_mtp) + ".")) return false;
+    }
     {
         size_t sh = 0;
         const TensorInfo * te = im.model->find("token_embd.weight", &sh);
@@ -904,7 +951,7 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
     im.IDXH = g.indexer_n_head; im.IDXK = g.indexer_key_dim; im.IDXTOPK = g.indexer_top_k;
     im.NEXP = g.n_expert; im.NUSED = g.n_expert_used; im.NFF = g.n_ff; im.NSHEXP = g.n_expert_shared;
 
-    const int64_t nl = g.n_layer();
+    const int64_t nl = im.n_trunk + (im.il_mtp >= 0 ? 1 : 0);   // + the MTP block
     if (nl <= 0 || im.D <= 0 || im.HC <= 0 || im.SWA <= 0) { err = "degenerate geometry"; return false; }
     if (im.NUSED <= 0) { err = "expert_used_count is zero"; return false; }
 
@@ -1103,6 +1150,13 @@ bool Ds4Dense::Impl::ensure_n(int64_t n) {
         allo_head[n] = make_allo();
         if (!allo_init[n] || !allo_head[n]) { err = "ggml_gallocr_new failed"; return false; }
     }
+    if (il_mtp >= 0 && !gf_mtp_in[n]) {
+        gf_mtp_in[n] = build_mtp_in(*this, n);
+        allo_mtp_in[n] = make_allo();
+        gf_mtp_head[n] = build_head(*this, n, true);
+        allo_mtp_head[n] = make_allo();
+        if (!allo_mtp_in[n] || !allo_mtp_head[n]) { err = "ggml_gallocr_new failed"; return false; }
+    }
     for (Layer & L : ly) {
         if (L.gf_finish[n]) continue;
         build_finish(*this, n, L);
@@ -1128,7 +1182,8 @@ static int64_t attn_cap(const Ds4Dense::Impl::Layer & L, int64_t pos_last) {
 }
 
 const strata::Ds4Geometry & Ds4Dense::geom()    const { return p_->g; }
-int64_t                     Ds4Dense::n_layer() const { return (int64_t) p_->ly.size(); }
+int64_t                     Ds4Dense::n_layer() const { return p_->n_trunk; }
+int                         Ds4Dense::mtp_layer() const { return (int) p_->il_mtp; }
 int                         Ds4Dense::max_tokens() const { return (int) kNtMax; }
 ggml_backend_t              Ds4Dense::backend() const { return p_->backend; }
 const std::string &         Ds4Dense::last_error() const { return p_->err; }
@@ -1352,6 +1407,10 @@ bool Ds4Dense::reserve_graphs(int n_max) {
     for (int n = 1; n <= n_max; ++n) {
         if (!ggml_gallocr_reserve(im.allo_init[n], im.gf_init[n])) { im.err = "reserve: init"; return false; }
         if (!ggml_gallocr_reserve(im.allo_head[n], im.gf_head[n])) { im.err = "reserve: head"; return false; }
+        if (im.il_mtp >= 0 && (!ggml_gallocr_reserve(im.allo_mtp_in[n], im.gf_mtp_in[n]) ||
+                               !ggml_gallocr_reserve(im.allo_mtp_head[n], im.gf_mtp_head[n]))) {
+            im.err = "reserve: mtp"; return false;
+        }
     }
     return true;
 }
@@ -1393,6 +1452,53 @@ bool Ds4Dense::logits_n(int n, const float ** out, int * n_vocab) {
         return false;
     }
     ggml_backend_tensor_get(im.logits_t[n], im.host_logits.data(), 0, (size_t) (im.g.vocab_size * n) * 4);
+    if (out) *out = im.host_logits.data();
+    if (n_vocab) *n_vocab = (int) im.g.vocab_size;
+    return true;
+}
+
+bool Ds4Dense::mtp_begin(const int * next_tids, int n) {
+    Impl & im = *p_;
+    if (im.il_mtp < 0) { im.err = "mtp_begin: no MTP head loaded"; return false; }
+    if (!im.ensure_n(n)) return false;
+    if (!ggml_gallocr_alloc_graph(im.allo_mtp_in[n], im.gf_mtp_in[n])) { im.err = "gallocr(mtp_in) failed"; return false; }
+    im.host_emb.resize((size_t) (im.D * n));
+    for (int t = 0; t < n; ++t) {
+        const int tid = next_tids[t];
+        if (tid < 0 || tid >= im.g.vocab_size) { im.err = "token id out of range"; return false; }
+        const uint8_t * row = im.embd_data + (size_t) tid * im.embd_row;
+        float * dst = im.host_emb.data() + (size_t) t * im.D;
+        if (im.embd_type == GGML_TYPE_F32) std::memcpy(dst, row, (size_t) im.D * 4);
+        else ggml_get_type_traits((ggml_type) im.embd_type)->to_float(row, dst, im.D);
+    }
+    ggml_backend_tensor_set(im.i_emb, im.host_emb.data(), 0, im.host_emb.size() * 4);
+    if (const char * dbg = std::getenv("DS4_DBG_MTP_H")) {    // append the trunk state the MTP reads (D*HC*n f32)
+        std::vector<float> v((size_t) (im.D * im.HC * n));
+        ggml_backend_tensor_get(im.x_state, v.data(), 0, v.size() * 4);
+        if (std::FILE * f = std::fopen(dbg, "ab")) { std::fwrite(v.data(), 4, v.size(), f); std::fclose(f); }
+    }
+    if (ggml_backend_graph_compute(im.backend, im.gf_mtp_in[n]) != GGML_STATUS_SUCCESS) {
+        im.err = "mtp input graph compute failed";
+        return false;
+    }
+    if (const char * dbg = std::getenv("DS4_DBG_MTP_IN")) {   // append the MTP input state (D*HC*n f32) to a file
+        std::vector<float> v((size_t) (im.D * im.HC * n));
+        ggml_backend_tensor_get(im.x_state, v.data(), 0, v.size() * 4);
+        if (std::FILE * f = std::fopen(dbg, "ab")) { std::fwrite(v.data(), 4, v.size(), f); std::fclose(f); }
+    }
+    return true;
+}
+
+bool Ds4Dense::mtp_logits_n(int n, const float ** out, int * n_vocab) {
+    Impl & im = *p_;
+    if (im.il_mtp < 0) { im.err = "mtp_logits_n: no MTP head loaded"; return false; }
+    if (!im.ensure_n(n)) return false;
+    if (!ggml_gallocr_alloc_graph(im.allo_mtp_head[n], im.gf_mtp_head[n])) { im.err = "gallocr(mtp head) failed"; return false; }
+    if (ggml_backend_graph_compute(im.backend, im.gf_mtp_head[n]) != GGML_STATUS_SUCCESS) {
+        im.err = "mtp head graph compute failed";
+        return false;
+    }
+    ggml_backend_tensor_get(im.mtp_logits_t[n], im.host_logits.data(), 0, (size_t) (im.g.vocab_size * n) * 4);
     if (out) *out = im.host_logits.data();
     if (n_vocab) *n_vocab = (int) im.g.vocab_size;
     return true;

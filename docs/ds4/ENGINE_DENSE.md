@@ -80,6 +80,25 @@ Every per-token tensor (`x_state`, `routed_sum`, `hap`, `post_f`, `comb_f`, `she
 Rollback after a rejected draft is free: all of this state is position-indexed and rewritten when the position is
 decoded again.
 
+## MTP head (`Ds4DenseConfig::mtp_path`)
+
+The DeepSeek-V4 MTP (nextn) head ships as its own GGUF; its block `blk.<n_layer>` loads as one extra ratio-0
+sliding-window layer (`mtp_layer()`; `n_layer()` stays the trunk's).  `ds4_attach_mtp` extends the per-block clamp /
+ratio arrays from the MTP file.  Drafting at position p (llama.cpp `deepseek4.cpp` graph_mtp):
+`mtp_begin(tok[p+1])` replaces the state (the trunk's final hc streams, after its logits) with
+`eh_proj(concat(enorm(embd) x hc, hnorm(h)))`; the block runs through the usual `attn_router(_n)` / routed experts /
+`finish_layer(_n)` at position p with its own raw-window KV; `mtp_logits_n` = trunk `hc_head` ->
+`nextn.shared_head_norm` -> trunk `output`, predicting token p+2.  Works for n-token passes like every layer.
+
+Gate: `ds4_ref --mtp` runs the same block over the whole sequence (the oracle); `tools/ds4/make_mini_mtp.py` writes a
+mini MTP file (real random MXFP4 experts - the mini trunk's experts are all zeros).  The trunk's final state differs
+from ds4_ref's by ~1 ulp (rel 1.6e-7) at every position - invisible in the trunk gate because its experts are zero,
+but the MTP block's MXFP4 experts round activations to Q8_0 and amplify it to cos ~0.99996 on the MTP logits (top-1
+still identical).  To gate the block itself, feed the oracle the decoder's own trunk state:
+`DS4_DBG_MTP_H=h.f32 test_ds4_dense ... --mtp m.gguf` then `DS4_REF_MTP_H=h.f32 ds4_ref ... --mtp m.gguf --out R`
+and `test_ds4_dense ... --ref-dir R --mtp m.gguf`: **MTP logits cos 1.00000000 at all 62 positions, block taps 1.0,
+top-1 62/62; multi-token MTP passes bit-identical to one-token** (tame fixture).
+
 ## Graphs
 
 `init`, `head`, `predict` and `finish` are one graph each per layer; attention is built **per capacity**

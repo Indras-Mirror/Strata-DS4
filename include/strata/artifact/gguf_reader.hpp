@@ -228,6 +228,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 1;
         bytes = 8;
         return true;
+    case 39:   // MXFP4: one E8M0 scale + 16 bytes of e2m1 nibbles (the DeepSeek-V4 MTP head's experts)
+        elems = 32;
+        bytes = 17;
+        return true;
     case 42:
         elems = 64;
         bytes = 18;

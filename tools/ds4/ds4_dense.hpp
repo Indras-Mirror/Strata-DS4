@@ -46,6 +46,9 @@ struct Ds4DenseConfig {
     /// Off-CPU only: requantize the big Q8_0 dense matrices (attn_q_b, attn_output_a/b, shared expert, output) to this
     /// ggml type at load (e.g. GGML_TYPE_Q4_K) - ~3 GiB of VRAM back for the expert cache.  -1 = keep the file's types.
     int            requant_type = -1;
+    /// The MTP (nextn) head's own GGUF (DeepSeek-V4-Flash-MTP-*.gguf): loads its block as layer n_layer() (an extra
+    /// ratio-0 sliding-window layer, see mtp_begin).  Empty = no MTP head.
+    std::string    mtp_path;
 };
 
 /// One-token decode of the DS4 dense half.  Not thread-safe; one instance decodes one sequence.
@@ -66,6 +69,11 @@ public:
     const strata::Ds4Geometry & geom()     const;
     int64_t                     n_layer()  const;
     int                         max_tokens() const;   ///< tokens a multi-token pass may carry
+    /// The MTP block's layer index (== n_layer()) when an MTP head is loaded, else -1.  Drafting a token at position
+    /// p: after the trunk's last finish_layer and logits for p, mtp_begin(&tok[p+1], 1), then the usual
+    /// attn_router(_n) / routed experts / finish_layer(_n) with il = mtp_layer() at position p, then mtp_logits_n()
+    /// predicts token p+2.  The MTP block keeps its own sliding-window KV, written at position p.
+    int                         mtp_layer() const;
     ggml_backend_t              backend()  const;
     /// Borrowed weight tensor (zero-copy on the CPU backend).  Aborts on an unknown name.
     ggml_tensor *               weight(const std::string & name) const;
@@ -104,6 +112,11 @@ public:
     bool logits(const float ** out, int * n_vocab);
     /// Head for every token of an n-token pass: `*out` is n * n_vocab floats (token-major).
     bool logits_n(int n, const float ** out, int * n_vocab);
+    /// MTP input for n tokens: replaces the state (the trunk's final hc streams) with eh_proj(enorm(embd[next_tids]),
+    /// hnorm(state)).  Call after the trunk's logits - they read the same state.
+    bool mtp_begin(const int * next_tids, int n);
+    /// MTP head (hc_head -> nextn.shared_head_norm -> output) after the MTP block's finish_layer(_n).
+    bool mtp_logits_n(int n, const float ** out, int * n_vocab);
 
     /// Diagnostics for the gate, all as computed on the last `attn_router`/`finish_layer` call (host copies):
     /// the flash-attn output before the output LoRA [n_head*d_head], the attention output after it [n_embd],
