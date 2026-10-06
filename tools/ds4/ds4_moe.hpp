@@ -249,6 +249,11 @@ public:
     int64_t arena_experts() const;     ///< blobs the host arena holds
     int64_t file_tier() const;         ///< blobs the arena could not take
     double arena_gib() const;
+    /// Whether `expert` of `layer` is resident in a VRAM slot right now (false in CPU-only mode).
+    bool resident(int64_t layer, int64_t expert) const;
+    /// `nt` (1..4) tokens of one layer at once - draft verification: `ids`/`w` are nt*top_k (token-major), `x` and
+    /// `out` nt*n_embd.  Each distinct expert is read/fetched once and applied to every token that routed to it.
+    bool run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out);
     cpu::ExpertPool& pool();           ///< the CPU tier's worker pool (the gate's single-expert check uses it)
 
 private:

@@ -235,6 +235,7 @@ struct Ds4Dense::Impl {
         std::vector<float> host_fn, host_attn_raw, host_attn, host_llast;
         bool have_attn = false, have_finish = false;
         ggml_tensor * vis_full = nullptr; // F32 [comp_max]   compressed-row visibility (graphs view [cap])
+        ggml_tensor * rbias = nullptr;    // F32 [NEXP]       cache-aware routing: added to the SELECTION score only
         ggml_tensor * o_ids = nullptr;    // I32 [NUSED]      router ids    } one contiguous block with fn,
         ggml_tensor * o_wts = nullptr;    // F32 [NUSED]      router weights} read back by one tensor_get
         ggml_tensor * o_span = nullptr;   // I8 over [fn | ids | wts]
@@ -651,6 +652,9 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, Ds4Den
         selected = ggml_get_rows(gc, b.BL(il, "ffn_gate_tid2eid.weight"), im.i_tid);
     } else {
         ggml_tensor * sel = ggml_add(gc, probs, b.BL(il, "exp_probs_b.bias"));
+        // cache-aware routing (set_route_bias): a selection-only bias like exp_probs_b; the mixing weights below still
+        // come from the unbiased probs.  All zeros (the default) = the model's own routing, bit for bit.
+        sel = ggml_add(gc, sel, ggml_reshape_2d(gc, L.rbias, im.NEXP, 1));
         selected = ggml_argsort_top_k(gc, sel, (int) im.NUSED);
     }
     ggml_set_output(selected);
@@ -890,6 +894,7 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
             L.i_state_pos = in1(GGML_TYPE_I32, 1);
             L.i_idx_state = in1(GGML_TYPE_I32, std::max<int64_t>(1, L.ring));
             if (L.ratio != 0) L.vis_full = in1(GGML_TYPE_F32, L.comp_max);
+            L.rbias = in1(GGML_TYPE_F32, im.NEXP);
 
             if (L.ratio != 0) {
                 L.comp  = nt2(GGML_TYPE_F32, im.DH, L.comp_max);
@@ -1179,6 +1184,14 @@ bool Ds4Dense::attn_router(int il, int pos, int tid, int * routed_ids, float * r
     if (ffn_norm_host) *ffn_norm_host = L.host_fn.empty() ? nullptr : L.host_fn.data();
     L.have_attn = true;
     return true;
+}
+
+void Ds4Dense::set_route_bias(int il, const float * bias) {
+    Impl & im = *p_;
+    if (il < 0 || il >= (int) im.ly.size() || !im.ly[(size_t) il].rbias) return;
+    Impl::Layer & L = im.ly[(size_t) il];
+    std::memcpy(im.in_host.data() + ((const uint8_t *) L.rbias->data - im.in_base), bias, (size_t) im.NEXP * 4);
+    im.in_pos = -1;   // re-upload the span before the next attention graph
 }
 
 bool Ds4Dense::finish_layer(int il, const float * routed_sum) {

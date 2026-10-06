@@ -748,6 +748,68 @@ double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+
+// ================================ arm 5: run_multi (draft verification) ================================
+//
+// Three tokens whose routed experts overlap (two VRAM hits, eight distinct misses), through run_multi in one pass
+// vs run() for each token alone.  The same expert must take the same path in both (so the format is the same):
+// every miss on the CPU pool (pcie 0) and every miss on PCIe (pcie 1; 8 distinct misses = the stage's cap).
+int arm_multi(const std::string& gguf) {
+    std::printf("\n-- arm 5: run_multi, 3 tokens sharing experts, vs run() per token\n");
+    std::string err;
+    Ds4MoeGeom g;
+    if (!strata::ds4::ds4_moe_geom_from_gguf(gguf, g, err)) { std::printf("multi: %s\n", err.c_str()); return 1; }
+    cpu::NativeFmt f;
+    if (!strata::ds4::ds4_moe_blob_layout(g, f, err)) { std::printf("multi: %s\n", err.c_str()); return 1; }
+    const int64_t L = 0, H = f.n_embd, K = g.top_k;
+    std::vector<std::pair<int32_t, int32_t>> ranked;
+    for (int e = 0; e < kArena; ++e) ranked.push_back({(int32_t) L, (int32_t) e});
+    const int32_t ids[3][6] = {{0, 1, 4, 5, 6, 7}, {1, 2, 5, 6, 8, 9}, {0, 3, 4, 8, 10, 11}};
+    std::vector<float> nw((size_t) H);
+    read_ffn_norm(gguf, L, H, nw);
+    std::mt19937 rng(7);
+    std::normal_distribution<float> xn(0.f, 1.0f);
+    std::vector<float> x((size_t) 3 * H), w((size_t) 3 * K);
+    for (int64_t i = 0; i < 3 * H; ++i) x[(size_t) i] = nw[(size_t) (i % H)] * xn(rng);
+    for (int t = 0; t < 3; ++t) router_weights(rng, K, w.data() + t * K);
+    std::vector<int32_t> idv((size_t) 3 * K);
+    for (int t = 0; t < 3; ++t) for (int64_t k = 0; k < K; ++k) idv[(size_t) (t * K + k)] = ids[t][k];
+    for (double pc : {0.0, 1.0}) {
+        Ds4GgufBlobs blobs(g, gguf);
+        if (!blobs.open(err)) { std::printf("multi: %s\n", err.c_str()); return 1; }
+        Ds4MoeConfig cfg;
+        cfg.slots = 4;
+        cfg.pf_b = 0.0;
+        cfg.dither = false;
+        cfg.pcie_frac = pc;
+        cfg.arena_gib = 0.16;
+        cfg.max_arena_gib = 0.16;
+        cfg.mem_floor_gib = 0.5;
+        Ds4MoeTier tier;
+        if (!tier.init(g, &blobs, cfg, err) || !tier.seed_from_ranked(ranked, err)) {
+            std::printf("multi: init/seed: %s\n", err.c_str()); return 1;
+        }
+        std::vector<float> single((size_t) 3 * H), multi((size_t) 3 * H);
+        for (int t = 0; t < 3; ++t)
+            if (!tier.run(L, idv.data() + t * K, w.data() + t * K, x.data() + (size_t) t * H, single.data() + (size_t) t * H)) {
+                std::printf("  run refused\n"); ++g_fail; return 1;
+            }
+        tier.reset_stats();
+        if (!tier.run_multi(L, 3, idv.data(), w.data(), x.data(), multi.data())) {
+            std::printf("  run_multi refused\n"); ++g_fail; return 1;
+        }
+        const Ds4MoeStats& st = tier.stats();
+        std::printf("   pcie %.0f: lookups hit %lld pcie %lld cpu %lld\n", pc, (long long) st.hits, (long long) st.pcie,
+                    (long long) st.cpu);
+        for (int t = 0; t < 3; ++t)
+            check(rel(multi.data() + (size_t) t * H, single.data() + (size_t) t * H, H) < kLimit,
+                  "pcie " + std::to_string((int) pc) + " token " + std::to_string(t) + ": run_multi vs run",
+                  rel(multi.data() + (size_t) t * H, single.data() + (size_t) t * H, H));
+        tier.close();
+    }
+    return 0;
+}
+
 int arm_timing(const std::string& gguf, const Args& a) {
     std::printf("== ds4_moe tier timing: the real model through Ds4MoeTier ==\n");
     std::string err;
@@ -950,6 +1012,7 @@ int main(int argc, char** argv) {
     if (!a.no_real) rc |= arm_real(a.gguf, a.sets, a.require_gguf);
 #if defined(DS4_MOE_CUDA)
     if (a.gpu) rc |= arm_gpu(a.gguf, a.sets);
+    if (a.gpu) rc |= arm_multi(a.gguf);
 #endif
     const Probe at_model_limit = probe_total;
     // the clamp path itself: the same real arms with a limit that binds on a large share of the elements

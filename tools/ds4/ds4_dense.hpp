@@ -90,6 +90,9 @@ public:
     /// Diagnostics for the gate, all as computed on the last `attn_router`/`finish_layer` call (host copies):
     /// the flash-attn output before the output LoRA [n_head*d_head], the attention output after it [n_embd],
     /// and l_last [n_embd*hc].  NULL when unavailable.
+    /// Cache-aware routing: `bias` (n_expert floats) is added to layer `il`'s expert SELECTION score (not to the mixing
+    /// weights) from the next attention graph on.  Zeros = the model's routing.  Hash layers ignore it.
+    void set_route_bias(int il, const float * bias);
     const float * tap_attn_raw(int il) const;
     const float * tap_attn_out(int il) const;
     const float * tap_l_last  (int il) const;

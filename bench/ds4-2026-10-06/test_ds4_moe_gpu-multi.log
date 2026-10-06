@@ -1,0 +1,74 @@
+== test_ds4_moe: the routed-expert tier vs dequant+F32 (limit 1.0e-03), CUDA flavour ==
+
+-- arm 2: real slices of the GGUF: 43 layers x 256 experts top-6, blob 6.75 MiB (12 slices touched)
+   L0: ffn_norm.weight RMS 0.2255 (the activation's scale)
+  real L0: weighted sum vs dequant+F32                       rel 2.273e-07  ok
+  real L0: single expert vs dequant+F32 (worst of 6)         rel 2.451e-07  ok
+                                                                  (pure-float, i.e. the 8-bit activation rounding: 1.936e-02)
+   L20: ffn_norm.weight RMS 0.4640 (the activation's scale)
+  real L20: weighted sum vs dequant+F32                      rel 2.572e-07  ok
+  real L20: single expert vs dequant+F32 (worst of 6)        rel 2.783e-07  ok
+                                                                  (pure-float, i.e. the 8-bit activation rounding: 1.839e-02)
+
+-- arm 3: the GPU's four sources (VRAM slot / prefetch staging / PCIe DMA / file tier) vs the same dequant+F32 reference
+   tier gpu: arena 24 experts (0.158 GiB), cache 4 of 4 slots, file tier 0, pool 7 workers
+   L0: ffn_norm.weight RMS 0.2255 (the activation's scale)
+                             unclamped answer vs clamped reference: rel 0.000e+00 (tier: 6.230e-04)
+  hit (VRAM slot)      e001: hits 6 pf 0 pcie 0 cpu 0 file 0 (want 6/0/0/0/0)  rel 6.230e-04  ok
+                             unclamped answer vs clamped reference: rel 0.000e+00 (tier: 7.032e-04)
+  prefetch staging     e005: hits 6 pf 6 pcie 0 cpu 0 file 0 (want 6/6/0/0/0)  rel 7.032e-04  ok
+                             unclamped answer vs clamped reference: rel 0.000e+00 (tier: 3.284e-04)
+  PCIe DMA             e009: hits 0 pf 0 pcie 6 cpu 0 file 0 (want 0/0/6/0/0)  rel 3.284e-04  ok
+                             unclamped answer vs clamped reference: rel 0.000e+00 (tier: 2.600e-07)
+  file tier (CPU)      e200: hits 0 pf 0 pcie 0 cpu 6 file 6 (want 0/0/0/6/6)  rel 2.600e-07  ok
+  set 0 run (host x)   : hits 3 pf 1 pcie 2 cpu 1 file 1 (want 3/1/2/1/1)  rel 4.538e-04  ok
+  set 0 run_dev        : hits 3 pf 1 pcie 2 cpu 1 file 1 (want 3/1/2/1/1)  rel 4.538e-04  ok
+  set 1 run (host x)   : hits 3 pf 1 pcie 2 cpu 1 file 1 (want 3/1/2/1/1)  rel 5.005e-04  ok
+  set 1 run_dev        : hits 3 pf 1 pcie 2 cpu 1 file 1 (want 3/1/2/1/1)  rel 5.005e-04  ok
+
+-- arm 5: run_multi, 3 tokens sharing experts, vs run() per token
+   pcie 0: lookups hit 6 pcie 0 cpu 12
+  pcie 0 token 0: run_multi vs run                           rel 1.574e-07  ok
+  pcie 0 token 1: run_multi vs run                           rel 1.648e-07  ok
+  pcie 0 token 2: run_multi vs run                           rel 8.963e-08  ok
+   pcie 1: lookups hit 6 pcie 12 cpu 0
+  pcie 1 token 0: run_multi vs run                           rel 0.000e+00  ok
+  pcie 1 token 1: run_multi vs run                           rel 0.000e+00  ok
+  pcie 1 token 2: run_multi vs run                           rel 0.000e+00  ok
+
+-- arm 2 again with the SwiGLU clamp forced to 1.00 (the GGUF's is 10.0)
+
+-- arm 2: real slices of the GGUF: 43 layers x 256 experts top-6, blob 6.75 MiB (12 slices touched)
+   L0: ffn_norm.weight RMS 0.2255 (the activation's scale)
+  real L0: weighted sum vs dequant+F32                       rel 2.291e-07  ok
+  real L0: single expert vs dequant+F32 (worst of 6)         rel 2.405e-07  ok
+                                                                  (pure-float, i.e. the 8-bit activation rounding: 1.782e-02)
+   L20: ffn_norm.weight RMS 0.4640 (the activation's scale)
+  real L20: weighted sum vs dequant+F32                      rel 2.179e-07  ok
+  real L20: single expert vs dequant+F32 (worst of 6)        rel 2.447e-07  ok
+                                                                  (pure-float, i.e. the 8-bit activation rounding: 1.384e-02)
+
+-- arm 3: the GPU's four sources (VRAM slot / prefetch staging / PCIe DMA / file tier) vs the same dequant+F32 reference
+   (arm 3 again with the SwiGLU clamp forced to 1.00)
+   tier gpu: arena 24 experts (0.158 GiB), cache 4 of 4 slots, file tier 0, pool 7 workers
+   L0: ffn_norm.weight RMS 0.2255 (the activation's scale)
+                             unclamped answer vs clamped reference: rel 1.930e-01 (tier: 6.685e-04)
+  hit (VRAM slot)      e001: hits 6 pf 0 pcie 0 cpu 0 file 0 (want 6/0/0/0/0)  rel 6.685e-04  ok
+                             unclamped answer vs clamped reference: rel 5.391e-02 (tier: 1.517e-03)
+  prefetch staging     e005: hits 6 pf 6 pcie 0 cpu 0 file 0 (want 6/6/0/0/0)  rel 1.517e-03  FAIL
+                             unclamped answer vs clamped reference: rel 3.745e-02 (tier: 3.338e-04)
+  PCIe DMA             e009: hits 0 pf 0 pcie 6 cpu 0 file 0 (want 0/0/6/0/0)  rel 3.338e-04  ok
+                             unclamped answer vs clamped reference: rel 7.823e-02 (tier: 2.545e-07)
+  file tier (CPU)      e200: hits 0 pf 0 pcie 0 cpu 6 file 6 (want 0/0/0/6/6)  rel 2.545e-07  ok
+  set 0 run (host x)   : hits 3 pf 1 pcie 2 cpu 1 file 1 (want 3/1/2/1/1)  rel 6.014e-04  ok
+  set 0 run_dev        : hits 3 pf 1 pcie 2 cpu 1 file 1 (want 3/1/2/1/1)  rel 6.014e-04  ok
+  set 1 run (host x)   : hits 3 pf 1 pcie 2 cpu 1 file 1 (want 3/1/2/1/1)  rel 9.093e-04  ok
+  set 1 run_dev        : hits 3 pf 1 pcie 2 cpu 1 file 1 (want 3/1/2/1/1)  rel 9.093e-04  ok
+
+forced clamp 1.00: the reference clamped 3742 of 65536 pre-activations (5.71%)
+  forced clamp actually binds (share of clamped pre-activations > 5%) rel 5.710e-02  ok
+
+clamp probe (max pre-activation over every expert sampled above; the model's swiglu_clamp_exp is 10.0)
+  max |gate| 3.4110, max |up| 3.3478 -> the clamp is inactive on these activations
+
+test_ds4_moe: 31 checks, 1 failures, 0 arm errors

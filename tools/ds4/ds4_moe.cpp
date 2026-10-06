@@ -41,6 +41,8 @@ namespace strata::ds4 {
 namespace {
 
 constexpr int kMaxParts = 8;   ///< the grouped kernel's group/entry cap; top-k 6 needs no more
+constexpr int kMaxTok = 4;     ///< tokens one run_multi call takes (draft verify: last token + up to 3 drafts)
+constexpr int kMaxEnt = kMaxTok * 8;   ///< (expert, token) entries and distinct experts of one run_multi call
 constexpr int kBatch = 512;    ///< a `ds4routes.bin` ubatch, in tokens (what route_probe tokenises)
 
 [[maybe_unused]] double now_ms() {
@@ -215,6 +217,8 @@ struct Ds4MoeImpl {
     int64_t blob = 0;
     std::unique_ptr<cpu::ExpertPool> pool;
     std::vector<uint8_t> nact;        ///< the Q8_K activation the CPU kernel consumes
+    std::vector<uint8_t> nact_n;      ///< run_multi: kMaxTok of them, f.act_bytes apart
+    std::vector<float> parts_n;       ///< run_multi: the pool's outputs, one row per (token, k) entry
     std::vector<float> parts;         ///< top_k * n_embd, one expert output per routing index
     std::vector<cpu::ExpertJobMulti> jobs;
     std::vector<uint8_t> ftmp;        ///< the file tier's read buffer, top_k blobs
@@ -243,8 +247,8 @@ const uint8_t* acquire(Ds4MoeImpl& im, int64_t layer, int64_t expert, int scratc
 #endif
     *from_file = true;
     ++im.st.file_tier;
-    if (im.ftmp.size() < (size_t) im.g.top_k * (size_t) im.blob)
-        im.ftmp.resize((size_t) im.g.top_k * (size_t) im.blob);
+    if (im.ftmp.size() < (size_t) (scratch + 1) * (size_t) im.blob)
+        im.ftmp.resize((size_t) std::max<int64_t>(im.g.top_k, scratch + 1) * (size_t) im.blob);
     uint8_t* dst = im.ftmp.data() + (size_t) scratch * (size_t) im.blob;
     im.blobs->read(layer, expert, dst);
     return dst;
@@ -435,6 +439,8 @@ bool Ds4MoeTier::init(const Ds4MoeGeom& geom, Ds4BlobSource* blobs, const Ds4Moe
     im_->jobs.resize((size_t) geom.top_k);
     im_->parts.assign((size_t) geom.top_k * (size_t) geom.n_embd, 0.0f);
     im_->nact.assign(cpu::kNativeActBytes, 0);
+    im_->nact_n.assign((size_t) kMaxTok * cpu::kNativeActBytes, 0);
+    im_->parts_n.assign((size_t) kMaxEnt * (size_t) geom.n_embd, 0.0f);
 
     if (cfg.cpu_only) {
         im_->inited = true;
@@ -457,19 +463,19 @@ bool Ds4MoeTier::init(const Ds4MoeGeom& geom, Ds4BlobSource* blobs, const Ds4Moe
     }
     ck(cudaStreamCreate(&gp.s), "stream");
     const size_t H4 = (size_t) geom.n_embd * 4;
-    ck(cudaMalloc(&gp.d_x, H4), "d_x");
-    ck(cudaMalloc(&gp.d_xq, strata::kernels::native_q8_1_bytes((int) geom.n_embd, 1)), "d_xq");
-    ck(cudaMalloc(&gp.d_parts, (size_t) std::max<int64_t>(kMaxParts, geom.top_k) * H4), "d_parts");
-    ck(cudaMalloc(&gp.d_grp_ptr, sizeof(unsigned long long) * kMaxParts), "d_grp_ptr");
-    ck(cudaMalloc(&gp.d_grp_start, sizeof(int32_t) * (kMaxParts + 1)), "d_grp_start");
+    ck(cudaMalloc(&gp.d_x, (size_t) kMaxTok * H4), "d_x");
+    ck(cudaMalloc(&gp.d_xq, strata::kernels::native_q8_1_bytes((int) geom.n_embd, kMaxTok)), "d_xq");
+    ck(cudaMalloc(&gp.d_parts, (size_t) kMaxEnt * H4), "d_parts");
+    ck(cudaMalloc(&gp.d_grp_ptr, sizeof(unsigned long long) * kMaxEnt), "d_grp_ptr");
+    ck(cudaMalloc(&gp.d_grp_start, sizeof(int32_t) * (kMaxEnt + 1)), "d_grp_start");
     ck(cudaMalloc(&gp.d_ngroups, sizeof(int32_t)), "d_ngroups");
-    ck(cudaMalloc(&gp.d_ent_dst, sizeof(int32_t) * kMaxParts), "d_ent_dst");
-    ck(cudaMalloc(&gp.d_ent_tok, sizeof(int32_t) * kMaxParts), "d_ent_tok");
-    ck(cudaMalloc(&gp.d_scratch, strata::kernels::native_expert_scratch_bytes(kMaxParts, geom.n_ff)), "d_scratch");
+    ck(cudaMalloc(&gp.d_ent_dst, sizeof(int32_t) * kMaxEnt), "d_ent_dst");
+    ck(cudaMalloc(&gp.d_ent_tok, sizeof(int32_t) * kMaxEnt), "d_ent_tok");
+    ck(cudaMalloc(&gp.d_scratch, strata::kernels::native_expert_scratch_bytes(kMaxEnt, geom.n_ff)), "d_scratch");
     ck(cudaMalloc(&gp.d_stage, (size_t) kMaxParts * (size_t) im_->blob), "d_stage");
     for (int i = 0; i < 4; ++i) ck(cudaEventCreate(&gp.ev[i]), "event");
-    ck(cudaMallocHost((void**) &gp.h_x, H4), "h_x");
-    ck(cudaMallocHost(&gp.h_parts, (size_t) std::max<int64_t>(kMaxParts, geom.top_k) * H4), "h_parts");
+    ck(cudaMallocHost((void**) &gp.h_x, (size_t) kMaxTok * H4), "h_x");
+    ck(cudaMallocHost(&gp.h_parts, (size_t) kMaxEnt * H4), "h_parts");
     if (cfg.pf_b > 0) {
         ck(cudaStreamCreateWithFlags(&gp.s_pf, cudaStreamNonBlocking), "pf stream");
         ck(cudaMalloc(&gp.d_pf, (size_t) Ds4MoeConfig::kMaxPf * (size_t) im_->blob), "d_pf");
@@ -946,6 +952,185 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
     return true;
 }
 
+
+/// `nt` tokens of one layer in one pass (draft verification): the distinct experts across the tokens are each
+/// fetched/read ONCE - a group with one entry per token that routed to it - so the second token's experts cost only
+/// what the first did not already pay.  Entry j = t*K + k writes output row j; token t's sum is taken over its own k
+/// in order, exactly as gpu_run does for one token.
+bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const float* w, const float* x_host,
+               float* out) {
+    Gpu& gp = *im.gpu;
+    const int64_t H = im.g.n_embd;
+    const int64_t K = im.g.top_k;
+    const int64_t B = im.blob;
+    const int NE = nt * (int) K;
+    const double t0 = now_ms();
+    Ds4MoeStats st;
+
+    // ---- distinct experts, first-seen order ----
+    int32_t ue[kMaxEnt], ent_u[kMaxEnt];
+    int nu = 0;
+    for (int j = 0; j < NE; ++j) {
+        int u = -1;
+        for (int i = 0; i < nu && u < 0; ++i)
+            if (ue[i] == ids[j]) u = i;
+        if (u < 0) { u = nu; ue[nu++] = ids[j]; }
+        ent_u[j] = u;
+    }
+    // ---- classify: resident slot / prefetch staging / miss ----
+    enum { HIT = 0, PCIE = 1, CPU = 2 };
+    int cls[kMaxEnt];
+    unsigned long long dptr[kMaxEnt] = {};
+    int32_t miss[kMaxEnt];
+    int nmiss = 0, npf = 0;
+    for (int u = 0; u < nu; ++u) {
+        const int32_t e = ue[u];
+        const int32_t sl = (gp.cache && !im.cfg.no_cache) ? gp.cache->slot_of(layer, e) : -1;
+        int pf_at = -1;
+        for (int j = 0; j < im.pf_n && sl < 0; ++j)
+            if (im.pf_e[j] == e) pf_at = j;
+        if (sl >= 0) {
+            cls[u] = HIT;
+            dptr[u] = (unsigned long long) gp.cache->device_slot(sl);
+        } else if (pf_at >= 0) {
+            cls[u] = HIT;
+            dptr[u] = (unsigned long long) gp.d_pf + (size_t) pf_at * (size_t) B;
+            ++npf;
+        } else {
+            cls[u] = CPU;
+            miss[nmiss++] = u;
+        }
+    }
+    // ---- the PCIe share of the distinct misses (same budget rule as gpu_run), at most kMaxParts staged ----
+    int np = 0;
+    {
+        int eligible = 0;
+        for (int i = 0; i < nmiss; ++i)
+            if (gp.arena.ptr(layer, ue[miss[i]])) ++eligible;
+        int budget;
+        if (im.cfg.dither) {
+            const double want = (double) eligible * im.cfg.pcie_frac + im.pcie_carry;
+            budget = (int) std::floor(want);
+            im.pcie_carry = want - budget;
+        } else {
+            budget = (int) std::lround((double) eligible * im.cfg.pcie_frac);
+        }
+        budget = std::min(budget, kMaxParts);
+        for (int i = 0; i < nmiss && np < budget; ++i) {
+            const int u = miss[nmiss - 1 - i];
+            if (gp.arena.ptr(layer, ue[u])) { cls[u] = PCIE; ++np; }
+        }
+    }
+
+    // ---- activations: Q8_K per token for the pool, q8_1 rows for the card ----
+    std::memcpy(gp.h_x, x_host, (size_t) nt * (size_t) H * 4);
+    for (int t = 0; t < nt; ++t)
+        cpu::native_quant_act(im.f, gp.h_x + (size_t) t * H, im.nact_n.data() + (size_t) t * im.f.act_bytes);
+    ck(cudaMemcpyAsync(gp.d_x, gp.h_x, (size_t) nt * (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "x h2d");
+    strata::kernels::native_quantize_q8_1((const float*) gp.d_x, gp.d_xq, (int) H, nt, gp.s);
+
+    // ---- one grouped launch per GPU class (hits, PCIe), groups = distinct experts, entries = their tokens ----
+    auto launch = [&](int want) {
+        std::vector<unsigned long long> ptr;
+        std::vector<int32_t> start, dst, tok;
+        int si = 0;
+        for (int u = 0; u < nu; ++u) {
+            if (cls[u] != want) continue;
+            if (want == PCIE) {
+                ck(cudaMemcpyAsync((uint8_t*) gp.d_stage + (size_t) si * (size_t) B, gp.arena.ptr(layer, ue[u]),
+                                   (size_t) B, cudaMemcpyHostToDevice, gp.s), "pcie dma");
+                dptr[u] = (unsigned long long) gp.d_stage + (size_t) si * (size_t) B;
+                ++si;
+            }
+            ptr.push_back(dptr[u]);
+            start.push_back((int32_t) dst.size());
+            for (int j = 0; j < NE; ++j)
+                if (ent_u[j] == u) { dst.push_back(j); tok.push_back(j / (int) K); }
+        }
+        const int ng = (int) ptr.size();
+        if (ng == 0) return;
+        start.push_back((int32_t) dst.size());
+        const int32_t ngv = ng;
+        ck(cudaMemcpyAsync(gp.d_grp_ptr, ptr.data(), sizeof(unsigned long long) * ng, cudaMemcpyHostToDevice, gp.s), "grp_ptr");
+        ck(cudaMemcpyAsync(gp.d_grp_start, start.data(), sizeof(int32_t) * (ng + 1), cudaMemcpyHostToDevice, gp.s), "grp_start");
+        ck(cudaMemcpyAsync(gp.d_ngroups, &ngv, sizeof(int32_t), cudaMemcpyHostToDevice, gp.s), "ngroups");
+        ck(cudaMemcpyAsync(gp.d_ent_dst, dst.data(), sizeof(int32_t) * dst.size(), cudaMemcpyHostToDevice, gp.s), "ent_dst");
+        ck(cudaMemcpyAsync(gp.d_ent_tok, tok.data(), sizeof(int32_t) * tok.size(), cudaMemcpyHostToDevice, gp.s), "ent_tok");
+        strata::kernels::native_expert_grouped(gp.gl, (const unsigned long long*) gp.d_grp_ptr,
+                                              (const int32_t*) gp.d_grp_start, (const int32_t*) gp.d_ngroups,
+                                              (const int32_t*) gp.d_ent_dst, (const int32_t*) gp.d_ent_tok, ng,
+                                              (int64_t) dst.size(), gp.d_xq, gp.d_scratch, (float*) gp.d_parts, gp.s, ng);
+    };
+    if (npf > 0) ck(cudaStreamWaitEvent(gp.s, gp.ev_pf, 0), "wait prefetch");
+    launch(HIT);
+    launch(PCIE);
+
+    // ---- the pool on the CPU misses, while the card works: one job per distinct expert, one row per token ----
+    int nj = 0;
+    if ((int) im.jobs.size() < nu) im.jobs.resize((size_t) nu);
+    for (int u = 0; u < nu; ++u) {
+        if (cls[u] != CPU) continue;
+        bool from_file = false;
+        cpu::ExpertJobMulti& jb = im.jobs[(size_t) nj];
+        jb.blob = acquire(im, layer, ue[u], nj, &from_file);
+        jb.nt = 0;
+        for (int t = 0; t < cpu::MAXT; ++t) { jb.nact[t] = nullptr; jb.out[t] = nullptr; }
+        for (int j = 0; j < NE; ++j)
+            if (ent_u[j] == u) {
+                jb.nact[jb.nt] = im.nact_n.data() + (size_t) (j / (int) K) * im.f.act_bytes;
+                jb.out[jb.nt] = im.parts_n.data() + (size_t) j * (size_t) H;
+                ++jb.nt;
+            }
+        ++nj;
+    }
+    if (nj > 0) {
+        const double c0 = now_ms();
+        im.pool->run_split_multi_native(im.f, im.jobs.data(), nj);
+        st.cpu_ms = now_ms() - c0;
+    }
+    ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) NE * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "d2h parts");
+    ck(cudaStreamSynchronize(gp.s), "layer sync");
+    const float* gpu_parts = (const float*) gp.h_parts;
+
+    // ---- per-token weighted sums, k in order ----
+    for (int t = 0; t < nt; ++t)
+        for (int64_t i = 0; i < H; ++i) {
+            double acc = 0;
+            for (int64_t k = 0; k < K; ++k) {
+                const int j = t * (int) K + (int) k;
+                const float* p = cls[ent_u[j]] == CPU ? im.parts_n.data() + (size_t) j * H : gpu_parts + (size_t) j * H;
+                acc += (double) w[j] * (double) p[(size_t) i];
+            }
+            out[(size_t) t * H + i] = (float) acc;
+        }
+
+    // ---- admission of the distinct misses (as gpu_run) ----
+    if (gp.cache && !im.cfg.no_cache) {
+        for (int u = 0; u < nu; ++u) {
+            if (cls[u] == HIT) continue;
+            const uint8_t* p = gp.arena.ptr(layer, ue[u]);
+            if (!p) continue;
+            const int32_t sl = gp.cache->admit(layer, ue[u]);
+            if (sl < 0) continue;
+            std::string e2;
+            if (!gp.cache->fill_slot_blocking(sl, p, e2, B)) {
+                std::fprintf(stderr, "ds4_moe: fill_slot: %s\n", e2.c_str());
+                std::abort();
+            }
+            ++im.admitted;
+        }
+    }
+    // stats per (token, expert) lookup, so hit rates stay comparable with single-token runs
+    for (int j = 0; j < NE; ++j) {
+        const int c = cls[ent_u[j]];
+        if (c == HIT) ++st.hits; else if (c == PCIE) ++st.pcie; else ++st.cpu;
+    }
+    st.prefetched_useful = npf;
+    st.wall_ms = now_ms() - t0;
+    im.st.add(st);
+    im.pf_n = 0;
+    return true;
+}
 #endif  // DS4_MOE_CUDA
 
 bool Ds4MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out) {
@@ -955,6 +1140,23 @@ bool Ds4MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const 
     if (im_->cfg.cpu_only) return cpu_run(*im_, layer, ids6, w6, x, out);
 #if defined(DS4_MOE_CUDA)
     return gpu_run(*im_, layer, ids6, w6, x, nullptr, out);
+#else
+    return false;
+#endif
+}
+
+bool Ds4MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out) {
+    if (!im_->inited || !im_->pool) return false;
+    if (!ids || !w || !x || !out || nt < 1 || nt > kMaxTok) return false;
+    if (layer < 0 || layer >= im_->g.n_layers) return false;
+    if (im_->cfg.cpu_only) {   // the CPU tier: token by token (no sharing; it is not the verify path)
+        const int64_t K = im_->g.top_k, H = im_->g.n_embd;
+        for (int t = 0; t < nt; ++t)
+            if (!cpu_run(*im_, layer, ids + t * K, w + t * K, x + (size_t) t * H, out + (size_t) t * H)) return false;
+        return true;
+    }
+#if defined(DS4_MOE_CUDA)
+    return gpu_run_n(*im_, layer, nt, ids, w, x, out);
 #else
     return false;
 #endif
@@ -1041,6 +1243,15 @@ int64_t Ds4MoeTier::arena_experts() const {
 #else
     return 0;
 #endif
+}
+
+bool Ds4MoeTier::resident(int64_t layer, int64_t expert) const {
+#if defined(DS4_MOE_CUDA)
+    if (im_ && im_->gpu && im_->gpu->cache) return im_->gpu->cache->slot_of(layer, expert) >= 0;
+#endif
+    (void) layer;
+    (void) expert;
+    return false;
 }
 
 double Ds4MoeTier::arena_gib() const {

@@ -48,7 +48,8 @@ struct Args {
     uint64_t seed = 1;
     std::vector<int> stop;
     bool quiet = false;
-    bool ppl = false;   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
+    bool ppl = false;
+    float route_bias = 0.0f;   // cache-aware routing: + this to the selection score of VRAM-resident experts   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
 };
 
 std::vector<int> parse_csv(const std::string& s) {
@@ -93,6 +94,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--dump-logits") a.dump_logits = next();
         else if (k == "--quiet") a.quiet = true;
         else if (k == "--ppl") a.ppl = true;
+        else if (k == "--route-bias") a.route_bias = (float) std::atof(next().c_str());
         else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (!a.ids_csv.empty() || !a.ids_file.empty());
@@ -185,7 +187,13 @@ int main(int argc, char** argv) {
     double t_ph[5] = {0, 0, 0, 0, 0};
     bool timing = false;
     // one token through every layer; returns false on any engine error
+    std::vector<float> rb((size_t) tier.geom().n_experts);
     auto step = [&](int tid, int pos) -> bool {
+        if (a.route_bias != 0.0f && !mc.cpu_only)
+            for (int l = 0; l < n_layer; ++l) {   // the residency the cache has NOW (admissions move it per token)
+                for (int64_t e = 0; e < (int64_t) rb.size(); ++e) rb[(size_t) e] = tier.resident(l, e) ? a.route_bias : 0.0f;
+                dense.set_route_bias(l, rb.data());
+            }
         if (!dense.begin_token(tid)) return false;
         for (int l = 0; l < n_layer; ++l) {
             double t0 = timing ? now_ms() : 0, t1;
