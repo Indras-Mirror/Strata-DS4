@@ -48,6 +48,7 @@ struct Args {
     uint64_t seed = 1;
     std::vector<int> stop;
     bool quiet = false;
+    bool ppl = false;   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
 };
 
 std::vector<int> parse_csv(const std::string& s) {
@@ -91,6 +92,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--stop") a.stop = parse_csv(next());
         else if (k == "--dump-logits") a.dump_logits = next();
         else if (k == "--quiet") a.quiet = true;
+        else if (k == "--ppl") a.ppl = true;
         else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (!a.ids_csv.empty() || !a.ids_file.empty());
@@ -178,21 +180,32 @@ int main(int argc, char** argv) {
     std::vector<float> w((size_t) top_k), routed((size_t) n_embd);
     std::mt19937_64 rng(a.seed);
 
+    // per-phase wall time (ms, summed over the decode): predict+prefetch, attention+router, experts, finish, head
+    double t_ph[5] = {0, 0, 0, 0, 0};
+    bool timing = false;
     // one token through every layer; returns false on any engine error
     auto step = [&](int tid, int pos) -> bool {
         if (!dense.begin_token(tid)) return false;
         for (int l = 0; l < n_layer; ++l) {
+            double t0 = timing ? now_ms() : 0, t1;
             if (!mc.cpu_only && mc.pf_b > 0 && dense.predict(l, pred_i.data(), kPredW)) {
                 int n = 0;
                 for (int i = 0; i < kPredW && pred_i[(size_t) i] >= 0; ++i) pred32[(size_t) n++] = pred_i[(size_t) i];
                 if (n > 0) tier.prefetch(l, pred32.data(), n);
             }
+            if (timing) { t1 = now_ms(); t_ph[0] += t1 - t0; t0 = t1; }
             const float* x = nullptr;
             ggml_tensor* x_dev = nullptr;
             if (!dense.attn_router(l, pos, tid, ids_i.data(), w.data(), &x, &x_dev)) return false;
+            if (timing) { t1 = now_ms(); t_ph[1] += t1 - t0; t0 = t1; }
             for (int k = 0; k < top_k; ++k) ids32[(size_t) k] = ids_i[(size_t) k];
-            if (!tier.run(l, ids32.data(), w.data(), x, routed.data())) return false;
+            if (!tier.run(l, ids32.data(), w.data(), x, routed.data())) {
+                std::fprintf(stderr, "ds4_generate: tier.run refused at layer %d (x %s)\n", l, x ? "set" : "NULL");
+                return false;
+            }
+            if (timing) { t1 = now_ms(); t_ph[2] += t1 - t0; t0 = t1; }
             if (!dense.finish_layer(l, routed.data())) return false;
+            if (timing) { t1 = now_ms(); t_ph[3] += t1 - t0; }
         }
         return true;
     };
@@ -200,12 +213,27 @@ int main(int argc, char** argv) {
     // ---- prefill (decode loop over the prompt)
     tier.reset_stats();
     const double t_pf0 = now_ms();
+    double nll = 0;
+    int n_scored = 0;
     for (size_t i = 0; i < prompt.size(); ++i) {
         if (!step(prompt[i], (int) i)) {
             std::fprintf(stderr, "ds4_generate: prefill failed at %zu: %s\n", i, dense.last_error().c_str());
             return 1;
         }
+        if (a.ppl && i + 1 < prompt.size()) {
+            const float* l = nullptr;
+            int nv = 0;
+            if (!dense.logits(&l, &nv)) return 1;
+            const float mx = *std::max_element(l, l + nv);
+            double z = 0;
+            for (int v = 0; v < nv; ++v) z += std::exp((double) (l[v] - mx));
+            nll += (std::log(z) + mx) - l[prompt[i + 1]];
+            ++n_scored;
+        }
     }
+    if (a.ppl && n_scored)
+        std::fprintf(stderr, "ppl: %d positions, mean NLL %.5f, perplexity %.4f\n", n_scored, nll / n_scored,
+                     std::exp(nll / n_scored));
     const double pf_ms = now_ms() - t_pf0;
     const ds4::Ds4MoeStats pf_stats = tier.stats();
 
@@ -216,8 +244,12 @@ int main(int argc, char** argv) {
     const float* lg = nullptr;
     int n_vocab = 0;
     const double t_dec0 = now_ms();
+    timing = true;
     for (; n_gen < a.n_predict; ++n_gen) {
-        if (!dense.logits(&lg, &n_vocab)) { std::fprintf(stderr, "ds4_generate: logits: %s\n", dense.last_error().c_str()); return 1; }
+        const double th0 = now_ms();
+        const bool lok = dense.logits(&lg, &n_vocab);
+        t_ph[4] += now_ms() - th0;
+        if (!lok) { std::fprintf(stderr, "ds4_generate: logits: %s\n", dense.last_error().c_str()); return 1; }
         if (n_gen == 0 && !a.dump_logits.empty()) {
             if (std::FILE* f = std::fopen(a.dump_logits.c_str(), "wb")) { std::fwrite(lg, 4, (size_t) n_vocab, f); std::fclose(f); }
         }
@@ -245,6 +277,9 @@ int main(int argc, char** argv) {
                  100.0 * (double) st.hits / look, (double) st.prefetched_useful / dec_steps,
                  (double) st.prefetch_issued / dec_steps, 100.0 * (double) st.cpu / look,
                  100.0 * (double) st.pcie / look, (long long) st.file_tier);
+    std::fprintf(stderr, "decode ms/token: predict+prefetch %.2f, attention+router %.2f, experts %.2f, finish %.2f, "
+                         "head %.2f\n", t_ph[0] / dec_steps, t_ph[1] / dec_steps, t_ph[2] / dec_steps,
+                 t_ph[3] / dec_steps, t_ph[4] / dec_steps);
     (void) pf_stats;
     tier.close();
     ggml_backend_free(be);

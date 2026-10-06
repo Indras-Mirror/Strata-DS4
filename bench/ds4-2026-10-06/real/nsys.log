@@ -1,0 +1,10 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 24080 MiB):
+  Device 0: NVIDIA GeForce RTX 4090, compute capability 8.9, VMM: yes, VRAM: 24080 MiB
+dense backend: CUDA0
+context cap 163 tokens
+tier: gpu, 2150 resident slots, arena 60.0 GiB (9102 experts), file tier 1826; load 136.7 s
+
+prefill: 75 tokens in 19.45 s = 3.86 tok/s (decode-loop prefill)
+decode : 24 tokens, 23 forward passes in 6.03 s = 3.81 tok/s
+experts/token: hit 68.9% (prefetched-useful 36.4/token of 57.5 issued), cpu 23.7%, pcie 7.4%, file tier 96
+decode ms/token: predict+prefetch 7.89, attention+router 174.09, experts 62.81, finish 16.16, head 0.91

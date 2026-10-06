@@ -307,7 +307,12 @@ struct B {
         return comb;
     }
     // deepseek4.cpp:287-312
+    // The fused hyper-connection ops (ggml_dsv4_hc_comb/pre/post, llama.cpp #25585): one kernel each instead of the
+    // Sinkhorn loop's ~140 tiny ops per call - on CUDA that loop alone was ~12k kernels/token.  DS4_HC_UNFUSED=1 keeps
+    // the op-by-op form (the original deepseek4.cpp graph) for A/B.
+    static bool unfused() { static const bool u = std::getenv("DS4_HC_UNFUSED") != nullptr; return u; }
     ggml_tensor * hc_mean(ggml_tensor * x, ggml_tensor * pre) const {
+        if (!unfused()) return ggml_dsv4_hc_pre(c, x, pre);
         const int64_t D = g->n_embd, hc = g->hc, nt = x->ne[2];
         ggml_tensor * acc = nullptr;
         for (int64_t h = 0; h < hc; ++h) {
@@ -341,14 +346,19 @@ struct B {
 
         ggml_tensor * scale_comb = v1(sc, 1, 2 * sizeof(float));
         ggml_tensor * base_comb  = v1(bs, hc * hc, (size_t) 2 * hc * 4);
-        *comb = v2(mixes, hc * hc, nt, mixes->nb[1], (size_t) 2 * hc * mixes->nb[0]);
-        *comb = hc_affine(*comb, scale_comb, base_comb);
-        *comb = ggml_reshape_3d(c, *comb, hc, hc, nt);
-        *comb = sinkhorn(*comb);
+        if (!unfused()) {
+            *comb = ggml_dsv4_hc_comb(c, mixes, sc, bs, (float) g->hc_eps, (int32_t) g->hc_sinkhorn_iters);
+        } else {
+            *comb = v2(mixes, hc * hc, nt, mixes->nb[1], (size_t) 2 * hc * mixes->nb[0]);
+            *comb = hc_affine(*comb, scale_comb, base_comb);
+            *comb = ggml_reshape_3d(c, *comb, hc, hc, nt);
+            *comb = sinkhorn(*comb);
+        }
         return hc_mean(x, pre);
     }
     // deepseek4.cpp:409-444
     ggml_tensor * hc_post(ggml_tensor * x, ggml_tensor * residual, ggml_tensor * post, ggml_tensor * comb) const {
+        if (!unfused()) return ggml_dsv4_hc_post(c, x, residual, post, comb);
         const int64_t D = g->n_embd, hc = g->hc, nt = x->ne[1];
         ggml_tensor * out = nullptr;
         for (int64_t dst = 0; dst < hc; ++dst) {
@@ -575,6 +585,16 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, Ds4Den
     }
 
     // ---- attention --------------------------------------------------------------------
+    // ggml-cuda has a flash-attn kernel for d_head 512 only when the key count is a multiple of FATTN_KQ_STRIDE
+    // (256) - llama.cpp pads its KV cache to that.  Off-CPU, pad with zero keys masked -inf: they get exactly zero
+    // weight.  The CPU path (the one verified bit-exact against ds4_ref) is left as it was.
+    if (!ggml_backend_is_cpu(im.backend)) {
+        const int64_t n_kv = k_all->ne[2], pad = (256 - n_kv % 256) % 256;
+        if (pad) {
+            k_all = ggml_pad(gc, k_all, 0, 0, (int) pad, 0);
+            mask = ggml_concat(gc, mask, ggml_cast(gc, b.fill_f32({ pad, 1 }, NEG_INF), GGML_TYPE_F16), 0);
+        }
+    }
     ggml_tensor * qp = ggml_permute(gc, q, 0, 2, 1, 3);
     ggml_tensor * kp = ggml_permute(gc, k_all, 0, 2, 1, 3);
     ggml_tensor * kf = ggml_cast(gc, kp, GGML_TYPE_F16);
@@ -849,7 +869,10 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
                     L.ist_kv = nt2(GGML_TYPE_F32, 2 * im.IDXK, 2 * L.ratio);
                     L.ist_sc = nt2(GGML_TYPE_F32, 2 * im.IDXK, 2 * L.ratio);
                 }
-                L.host_fn.resize((size_t) im.D);
+            }
+            // every layer (ratio-0 sliding-window layers too): ffn_norm is the expert tier's input
+            L.host_fn.resize((size_t) im.D);
+            if (cfg.gate_taps) {   // the gate's taps: ~10 MB of device->host copies per token, off by default
                 L.host_attn_raw.resize((size_t) (im.NH * im.DH));
                 L.host_attn.resize((size_t) im.D);
                 L.host_llast.resize((size_t) (im.D * im.HC));

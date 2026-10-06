@@ -36,6 +36,8 @@ struct Ds4DenseConfig {
     /// Do not load ffn_{gate,up,down}_exps (the routed-expert tier owns them): the real model on the GPU, where
     /// uploading them would ask for ~72 GiB.  `weight()` of one of them then aborts.
     bool           skip_routed_experts = false;
+    /// Keep host copies of attn_raw / attn_out / l_last per layer for tap_*() (test_ds4_dense); off = no copies.
+    bool           gate_taps = false;
 };
 
 /// One-token decode of the DS4 dense half.  Not thread-safe; one instance decodes one sequence.

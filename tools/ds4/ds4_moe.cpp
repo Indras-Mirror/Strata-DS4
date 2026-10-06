@@ -868,6 +868,24 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
                        cudaMemcpyDeviceToHost, gp.s), "d2h parts");
     ck(cudaStreamSynchronize(gp.s), "parts sync");
     const float* gpu_parts = (const float*) gp.h_parts;
+    // DS4_CHECK_GPU=1: every card-computed expert recomputed on the CPU from the arena's bytes (diagnostic, slow)
+    static const bool check_gpu = std::getenv("DS4_CHECK_GPU") != nullptr;
+    if (check_gpu) {
+        std::vector<float> ref((size_t) H);
+        for (int64_t k = 0; k < K; ++k) {
+            if (cpu_k[k]) continue;
+            const uint8_t* p = gp.arena.ptr(layer, ids6[k]);
+            if (!p) continue;
+            ds4_moe_cpu_expert(im.f, H, im.g.n_ff, p, gp.h_x, ref.data(), *im.pool);
+            double num = 0, den = 0;
+            const float* g = gpu_parts + (size_t) k * (size_t) H;
+            for (int64_t i = 0; i < H; ++i) { const double d = g[i] - ref[(size_t) i]; num += d * d; den += (double) ref[(size_t) i] * ref[(size_t) i]; }
+            bool is_pcie = false;
+            for (int j = 0; j < np; ++j) is_pcie = is_pcie || pcie_i[j] == k;
+            std::fprintf(stderr, "[chk] L%lld e%d %s rel %.3e\n", (long long) layer, ids6[k], is_pcie ? "pcie" : "hit ",
+                         std::sqrt(num / std::max(den, 1e-30)));
+        }
+    }
 
     // ---- the weighted sum.  Routing-indexed, so all three tiers write into one layout without a scatter ----
     // The pool's results are `im.parts` (host) and the card's are the readback above: the D2H is one bulk copy, so

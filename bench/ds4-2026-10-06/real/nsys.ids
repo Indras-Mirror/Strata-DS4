@@ -1,0 +1,30 @@
+memguard: scope ds4-guard-2427705 MemoryMax=80G swap=0 floor=4 GiB (avail 82 GiB)
+46900
+3701
+3682
+3080
+36035
+3682
+310
+14
+3701
+3682
+259
+14
+3701
+3682
+2342
+11
+680
+1354
+343
+74
+565
+259
+940
+2342
+Collecting data...
+Generating '/tmp/nsys-mal/nsys-report-cd1e.qdstrm'
+[1/1] [0%                          ] nsys-p64.nsys-rep[1/1] [0%                          ] nsys-p64.nsys-rep[1/1] [1%                          ] nsys-p64.nsys-rep[1/1] [2%                          ] nsys-p64.nsys-rep[1/1] [5%                          ] nsys-p64.nsys-rep[1/1] [6%                          ] nsys-p64.nsys-rep[1/1] [7%                          ] nsys-p64.nsys-rep[1/1] [8%                          ] nsys-p64.nsys-rep[1/1] [9%                          ] nsys-p64.nsys-rep[1/1] [10%                         ] nsys-p64.nsys-rep[1/1] [11%                         ] nsys-p64.nsys-rep[1/1] [12%                         ] nsys-p64.nsys-rep[1/1] [13%                         ] nsys-p64.nsys-rep[1/1] [14%                         ] nsys-p64.nsys-rep[1/1] [=15%                        ] nsys-p64.nsys-rep[1/1] [=16%                        ] nsys-p64.nsys-rep[1/1] [=17%                        ] nsys-p64.nsys-rep[1/1] [==18%                       ] nsys-p64.nsys-rep[1/1] [==19%                       ] nsys-p64.nsys-rep[1/1] [==20%                       ] nsys-p64.nsys-rep[1/1] [=======================93%  ] nsys-p64.nsys-rep[1/1] [=======================96%  ] nsys-p64.nsys-rep[1/1] [========================98% ] nsys-p64.nsys-rep[1/1] [========================100%] nsys-p64.nsys-rep[1/1] [========================100%] nsys-p64.nsys-rep
+Generated:
+	/home/mal/AI/Strata-DS4/bench/ds4-2026-10-06/real/nsys-p64.nsys-rep

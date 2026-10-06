@@ -177,6 +177,7 @@ int main(int argc, char ** argv) {
     }
     cfg.backend   = gpu;       // nullptr = CPU
     cfg.n_threads = 8;
+    cfg.gate_taps = true;
     std::printf("[gate] decoder backend: %s\n", gpu ? ggml_backend_name(gpu) : "CPU");
 
     Ds4Dense d;
