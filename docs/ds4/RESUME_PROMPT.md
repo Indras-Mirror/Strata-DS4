@@ -54,6 +54,12 @@ then `docs/ds4/ENGINE_DENSE.md` and `docs/ds4/ENGINE_MOE.md`. (Written 2026-10-0
    bench/ds4-2026-10-06/prefetch/run-config.sh $pf pf$pf` (exactness = identical greedy tokens pf0 vs pf1.4).
 5. Record every number in FINDINGS (new s13), commit, update memory note `strata-ds4-port`.
 
+## Backlog (after DeepSeek-V4 reaches a real tok/s number)
+- **MiMo-V2.6-Flash** (309B MoE, 256 experts top-8, same 4096x2048 expert shape as DS4): desk study in
+  `docs/mimo/MIMO_V26_FEASIBILITY.md`. Mal's interest: GSQ-RCO 3-bit (115.7 GB - spills ~8 GiB to NVMe here) and a
+  2-bit RCO uncensored (doesn't exist; Heretic rank-1 LoRA `MorinoNushi/MiMo-V2.6-Flash-RL-Uncensored-Heretic-LoRA-GGUF`
+  applies to any quant). First step: measure MiMo's routing skew; nothing big downloaded yet.
+
 ## Rules (non-negotiable)
 - **Every full-model load through `tools/ds4/memguard.sh`** (cap + swap off + 4 GiB watchdog + shared lock; refuses
   while ComfyUI is up). NEVER a CPU-only full-model run (froze the box 2026-10-06). One full-model process at a time.

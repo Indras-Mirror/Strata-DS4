@@ -185,3 +185,8 @@ Same measured gain mechanism, no new attention code, and it upstreams to every l
 `pfeifferj/DeepSeek-V4.1-Flash-GSQ-RCO-GGUF` (arch `deepseek41`, 552B backbone + 196B Engram, 415.8 GB) does not
 fit this PC (207 GB backbone vs ~104 GB RAM+VRAM). Its Engram tables are Strata's PLE idea (SSD rows per token),
 so a V4 port is the stepping stone for 256 GB+ machines.
+
+## 9. Later: MiMo-V2.6-Flash
+Same expert shape as DeepSeek-V4-Flash (4096 x 2048 x 3), 256 experts top-8, simpler attention (hybrid SWA/global).
+The expert tier transfers directly. Desk study, fit/speed estimates and uncensored options:
+`docs/mimo/MIMO_V26_FEASIBILITY.md` (2026-10-06).
