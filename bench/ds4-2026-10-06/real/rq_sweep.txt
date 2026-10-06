@@ -1,0 +1,4 @@
+q6_k slots 2350 rc=0 | ppl: 600 positions, mean NLL 2.35612, perplexity 10.5500 | decode : 128 tokens, 127 forward passes in 6.56 s = 19.35 tok/s
+decode ms/token: predict+prefetch 2.18, attention+router 21.51, experts 25.19, finish 1.10, head 0.57 | experts/token: hit 74.6% (pref
+q5_k slots 2450 rc=0 | ppl: 600 positions, mean NLL 2.36512, perplexity 10.6453 | decode : 128 tokens, 127 forward passes in 7.27 s = 17.46 tok/s
+decode ms/token: predict+prefetch 2.19, attention+router 20.44, experts 31.83, finish 1.33, head 0.50 | experts/token: hit 65.1% (pref

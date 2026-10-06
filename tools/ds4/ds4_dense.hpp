@@ -38,6 +38,9 @@ struct Ds4DenseConfig {
     bool           skip_routed_experts = false;
     /// Keep host copies of attn_raw / attn_out / l_last per layer for tap_*() (test_ds4_dense); off = no copies.
     bool           gate_taps = false;
+    /// Off-CPU only: requantize the big Q8_0 dense matrices (attn_q_b, attn_output_a/b, shared expert, output) to this
+    /// ggml type at load (e.g. GGML_TYPE_Q4_K) - ~3 GiB of VRAM back for the expert cache.  -1 = keep the file's types.
+    int            requant_type = -1;
 };
 
 /// One-token decode of the DS4 dense half.  Not thread-safe; one instance decodes one sequence.

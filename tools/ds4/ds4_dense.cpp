@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace strata;
@@ -65,7 +66,18 @@ bool is_routed_expert(const std::string & n) {
 
 // Off-CPU, `token_embd` stays on the host (begin_token looks the row up there: 1 GiB of VRAM the expert cache gets
 // instead) and, with `skip_experts`, the routed experts are not loaded at all.
-bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, bool skip_experts, std::string & err) {
+// --dense-requant: the big Q8_0 dense matrices, by name
+bool requant_target(const std::string & n) {
+    for (const char * s : { "attn_q_b.weight", "attn_output_a.weight", "attn_output_b.weight", "ffn_gate_shexp.weight",
+                            "ffn_up_shexp.weight", "ffn_down_shexp.weight" })
+        if (n.size() > std::strlen(s) && n.compare(n.size() - std::strlen(s), std::string::npos, s) == 0 &&
+            n.rfind("blk.", 0) == 0 && n.find("indexer") == std::string::npos)
+            return true;
+    return n == "output.weight";
+}
+
+bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, bool skip_experts, int requant,
+                  std::string & err) {
     ggml_init_params ip = { /*mem_size*/ 256ull * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
     w.ctx = ggml_init(ip);
     if (!w.ctx) { err = "ggml_init(weights) failed"; return false; }
@@ -111,7 +123,10 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, b
             if (!model.in_bounds(ti, s)) { err = ti.name + " out of bounds"; return false; }
             int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
             for (size_t d = 0; d < ti.shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) ti.shape[d];
-            ggml_tensor * t = ggml_new_tensor(w.ctx, (ggml_type) ti.type, (int) ti.shape.size(), ne);
+            ggml_type ty = (ggml_type) ti.type;
+            if (requant >= 0 && ty == GGML_TYPE_Q8_0 && requant_target(ti.name) && ne[0] % ggml_blck_size((ggml_type) requant) == 0)
+                ty = (ggml_type) requant;
+            ggml_tensor * t = ggml_new_tensor(w.ctx, ty, (int) ti.shape.size(), ne);
             if (!t) { err = "cannot create " + ti.name; return false; }
             ggml_set_name(t, ti.name.c_str());
             w.t[ti.name] = t;
@@ -124,7 +139,27 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, b
         for (const auto & ti : model.shard(s).tensors()) {
             if (skip(ti.name)) continue;
             ggml_tensor * t = w.t[ti.name];
-            ggml_backend_tensor_set(t, model.shard(s).tensor_data(ti), 0, ggml_nbytes(t));
+            if ((int) t->type == (int) ti.type) {
+                ggml_backend_tensor_set(t, model.shard(s).tensor_data(ti), 0, ggml_nbytes(t));
+                continue;
+            }
+            // requantize: rows dequantized with the file type's to_float, re-quantized to t->type, in parallel
+            const int64_t n0 = t->ne[0], nr = ggml_nrows(t);
+            const size_t src_row = ggml_row_size((ggml_type) ti.type, n0), dst_row = ggml_row_size(t->type, n0);
+            const uint8_t * src = model.shard(s).tensor_data(ti);
+            std::vector<uint8_t> dst((size_t) nr * dst_row);
+            const int nth = std::max(1u, std::thread::hardware_concurrency());
+            std::vector<std::thread> th;
+            for (int k = 0; k < nth; ++k)
+                th.emplace_back([&, k] {
+                    std::vector<float> f((size_t) n0);
+                    for (int64_t r = k; r < nr; r += nth) {
+                        ggml_get_type_traits((ggml_type) ti.type)->to_float(src + (size_t) r * src_row, f.data(), n0);
+                        ggml_quantize_chunk(t->type, f.data(), dst.data() + (size_t) r * dst_row, 0, 1, n0, nullptr);
+                    }
+                });
+            for (auto & x : th) x.join();
+            ggml_backend_tensor_set(t, dst.data(), 0, dst.size());
         }
     }
     return true;
@@ -810,7 +845,8 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
     if (im.model->size() == 0) { err = "cannot open " + model_path; return false; }
     if (!(err = ds4_read_geometry(*im.model, im.g)).empty()) return false;
     if (!(err = check_ds4_model(*im.model, im.g)).empty()) return false;
-    if (!load_weights(*im.model, im.backend, im.w, cfg.skip_routed_experts, err)) return false;
+    if (!load_weights(*im.model, im.backend, im.w, cfg.skip_routed_experts,
+                      ggml_backend_is_cpu(im.backend) ? -1 : cfg.requant_type, err)) return false;
     {
         size_t sh = 0;
         const TensorInfo * te = im.model->find("token_embd.weight", &sh);

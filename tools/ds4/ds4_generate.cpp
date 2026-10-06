@@ -49,7 +49,8 @@ struct Args {
     std::vector<int> stop;
     bool quiet = false;
     bool ppl = false;
-    float route_bias = 0.0f;   // cache-aware routing: + this to the selection score of VRAM-resident experts   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
+    float route_bias = 0.0f;
+    std::string dense_requant;   // q4_k | q5_k | q6_k: requantize the big Q8_0 dense matrices at load   // cache-aware routing: + this to the selection score of VRAM-resident experts   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
 };
 
 std::vector<int> parse_csv(const std::string& s) {
@@ -94,6 +95,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--dump-logits") a.dump_logits = next();
         else if (k == "--quiet") a.quiet = true;
         else if (k == "--ppl") a.ppl = true;
+        else if (k == "--dense-requant") a.dense_requant = next();
         else if (k == "--route-bias") a.route_bias = (float) std::atof(next().c_str());
         else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
     }
@@ -145,7 +147,12 @@ int main(int argc, char** argv) {
     Ds4DenseConfig dc;
     dc.backend = be;
     dc.n_threads = a.threads > 0 ? a.threads : 8;
-    dc.skip_routed_experts = true;   // the tier owns them (on the GPU backend they would be a 72 GiB upload)
+    dc.skip_routed_experts = true;
+    if (!a.dense_requant.empty()) {
+        const std::string q = a.dense_requant;
+        dc.requant_type = q == "q4_k" ? GGML_TYPE_Q4_K : q == "q5_k" ? GGML_TYPE_Q5_K : q == "q6_k" ? GGML_TYPE_Q6_K : -1;
+        if (dc.requant_type < 0) { std::fprintf(stderr, "ds4_generate: --dense-requant q4_k|q5_k|q6_k\n"); return 2; }
+    }   // the tier owns them (on the GPU backend they would be a 72 GiB upload)
     // the compressed-KV state is sized for the context actually used, not the model's context_length: the
     // smallest compress ratio is 4, so ctx/4 rows (+2 for the partial block) cover every layer
     const int64_t ctx = a.ctx > 0 ? a.ctx : (int64_t) prompt.size() + a.n_predict + 64;
