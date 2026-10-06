@@ -16,6 +16,7 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -187,7 +188,7 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
 
 template <int TY, int NT>
 void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, float* const* ff,
-             int r0, int r1) {
+             int r0, int r1, float lim) {
     const block_q8_K* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
     const int nb = n / QK_K;
@@ -195,7 +196,10 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const voi
     for (int r = r0; r < r1; ++r) {
         row_dot<TY, NT>(blob + (size_t) r * gu_row, nb, y, g);
         row_dot<TY, NT>(blob + up_off + (size_t) r * gu_row, nb, y, u);
-        for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
+        for (int t = 0; t < NT; ++t) {
+            const float gc = std::min(g[t], lim), uc = std::min(std::max(u[t], -lim), lim);   // lim = +inf: no-op
+            ff[t][r] = (gc / (1.f + std::exp(-gc))) * uc;
+        }
     }
 }
 
@@ -212,16 +216,16 @@ void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act,
 
 template <int TY>
 void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
-                float* const* ff, int r0, int r1) {
+                float* const* ff, int r0, int r1, float lim) {
     switch (nt) {
-        case 1: gu_rows<TY, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 2: gu_rows<TY, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 3: gu_rows<TY, 3>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 4: gu_rows<TY, 4>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 5: gu_rows<TY, 5>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 6: gu_rows<TY, 6>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 7: gu_rows<TY, 7>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        default: gu_rows<TY, 8>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 1: gu_rows<TY, 1>(blob, gu_row, up_off, n, act, ff, r0, r1, lim); break;
+        case 2: gu_rows<TY, 2>(blob, gu_row, up_off, n, act, ff, r0, r1, lim); break;
+        case 3: gu_rows<TY, 3>(blob, gu_row, up_off, n, act, ff, r0, r1, lim); break;
+        case 4: gu_rows<TY, 4>(blob, gu_row, up_off, n, act, ff, r0, r1, lim); break;
+        case 5: gu_rows<TY, 5>(blob, gu_row, up_off, n, act, ff, r0, r1, lim); break;
+        case 6: gu_rows<TY, 6>(blob, gu_row, up_off, n, act, ff, r0, r1, lim); break;
+        case 7: gu_rows<TY, 7>(blob, gu_row, up_off, n, act, ff, r0, r1, lim); break;
+        default: gu_rows<TY, 8>(blob, gu_row, up_off, n, act, ff, r0, r1, lim); break;
     }
 }
 
@@ -247,13 +251,13 @@ bool iq512_supported(int type) noexcept {
 }
 
 void iq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
-                   float* const* ff, int r0, int r1) {
+                   float* const* ff, int r0, int r1, float lim) {
     switch (type) {
-        case 16: gu_rows_nt<16>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 17: gu_rows_nt<17>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 18: gu_rows_nt<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 21: gu_rows_nt<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 22: gu_rows_nt<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 16: gu_rows_nt<16>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, lim); break;
+        case 17: gu_rows_nt<17>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, lim); break;
+        case 18: gu_rows_nt<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, lim); break;
+        case 21: gu_rows_nt<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, lim); break;
+        case 22: gu_rows_nt<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1, lim); break;
         default: break;
     }
 }

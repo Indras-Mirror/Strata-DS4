@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace strata::kernels {
 
@@ -45,6 +46,9 @@ struct NativeExpertLayout {
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob
+    // DeepSeek-V4's SwiGLU clamp (swiglu_clamp_exp): gate -> min(gate, lim), up -> clamp(up, -lim, lim) before
+    // silu(gate) * up.  +inf (native_expert_layout's default, every other model) = no clamp, the same bits as before.
+    float swiglu_limit = std::numeric_limits<float>::infinity();
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// Whether `native_expert_grouped` has kernels for this gate/up and down type pair at these dimensions, and the

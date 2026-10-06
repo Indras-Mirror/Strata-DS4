@@ -1,0 +1,44 @@
+== test_ds4_moe: the routed-expert tier vs dequant+F32 (limit 1.0e-03), CPU-only flavour ==
+
+-- arm 1: synthetic, 43 layers x 256 experts top-6, blob 6.75 MiB quantized by ggml
+   18 expert blobs built in 145.2 s
+   tier mode: cpu-only, 7 pool workers
+  synthetic L0: weighted sum vs dequant+F32                  rel 2.628e-07  ok
+  synthetic L0: single expert vs dequant+F32 (worst of 6)    rel 2.808e-07  ok
+                                                                  (pure-float, i.e. the 8-bit activation rounding: 2.029e-02)
+  synthetic L1: weighted sum vs dequant+F32                  rel 2.443e-07  ok
+  synthetic L1: single expert vs dequant+F32 (worst of 6)    rel 2.866e-07  ok
+                                                                  (pure-float, i.e. the 8-bit activation rounding: 1.945e-02)
+  synthetic L7: weighted sum vs dequant+F32                  rel 2.559e-07  ok
+  synthetic L7: single expert vs dequant+F32 (worst of 6)    rel 2.907e-07  ok
+                                                                  (pure-float, i.e. the 8-bit activation rounding: 2.080e-02)
+
+-- arm 2: real slices of the GGUF: 43 layers x 256 experts top-6, blob 6.75 MiB (12 slices touched)
+   L0: ffn_norm.weight RMS 0.2255 (the activation's scale)
+  real L0: weighted sum vs dequant+F32                       rel 2.273e-07  ok
+  real L0: single expert vs dequant+F32 (worst of 6)         rel 2.451e-07  ok
+                                                                  (pure-float, i.e. the 8-bit activation rounding: 1.936e-02)
+   L20: ffn_norm.weight RMS 0.4640 (the activation's scale)
+  real L20: weighted sum vs dequant+F32                      rel 2.572e-07  ok
+  real L20: single expert vs dequant+F32 (worst of 6)        rel 2.783e-07  ok
+                                                                  (pure-float, i.e. the 8-bit activation rounding: 1.839e-02)
+
+-- arm 2 again with the SwiGLU clamp forced to 1.00 (the GGUF's is 10.0)
+
+-- arm 2: real slices of the GGUF: 43 layers x 256 experts top-6, blob 6.75 MiB (12 slices touched)
+   L0: ffn_norm.weight RMS 0.2255 (the activation's scale)
+  real L0: weighted sum vs dequant+F32                       rel 2.291e-07  ok
+  real L0: single expert vs dequant+F32 (worst of 6)         rel 2.405e-07  ok
+                                                                  (pure-float, i.e. the 8-bit activation rounding: 1.782e-02)
+   L20: ffn_norm.weight RMS 0.4640 (the activation's scale)
+  real L20: weighted sum vs dequant+F32                      rel 2.179e-07  ok
+  real L20: single expert vs dequant+F32 (worst of 6)        rel 2.447e-07  ok
+                                                                  (pure-float, i.e. the 8-bit activation rounding: 1.384e-02)
+
+forced clamp 1.00: the reference clamped 3659 of 49152 pre-activations (7.44%)
+  forced clamp actually binds (share of clamped pre-activations > 5%) rel 7.444e-02  ok
+
+clamp probe (max pre-activation over every expert sampled above; the model's swiglu_clamp_exp is 10.0)
+  max |gate| 5.0571, max |up| 4.0342 -> the clamp is inactive on these activations
+
+test_ds4_moe: 15 checks, 0 failures, 0 arm errors

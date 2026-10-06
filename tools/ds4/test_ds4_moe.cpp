@@ -51,6 +51,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -78,7 +79,10 @@ namespace {
 
 constexpr double kLimit = 1e-3;        ///< the gate's relative-error limit
 constexpr double kWeightsScale = 1.5;  ///< deepseek4.expert_weights_scale, applied after the normalisation
-constexpr double kClampExp = 10.0;     ///< deepseek4.swiglu_clamp_exp: the limit the native kernels do NOT apply
+constexpr double kClampExp = 10.0;     ///< deepseek4.swiglu_clamp_exp (the kernels apply it: NativeFmt::swiglu_limit)
+/// The forced-clamp arms rerun arm 2/3 with this limit so the clamp binds on a large share of the elements and the
+/// kernels' clamp path is checked against the reference's (at 10.0 it binds on ~0 elements of real activations).
+constexpr float kForcedClamp = 1.0f;
 const char* kDefaultGguf = "/media/mal/NVME1TB/Models/DeepSeek-V4-Flash-Q2-0731.gguf";
 
 int g_fail = 0, g_checks = 0;
@@ -86,11 +90,27 @@ int g_fail = 0, g_checks = 0;
 /// The largest pre-activation one expert produced on one activation: the clamp probe's raw number.
 struct Probe {
     float gate_abs = 0, up_abs = 0;
+    int64_t bound = 0, total = 0;   ///< pre-activations the reference clamped (gate > lim or |up| > lim) / seen
     void merge(const Probe& o) {
         gate_abs = std::max(gate_abs, o.gate_abs);
         up_abs = std::max(up_abs, o.up_abs);
+        bound += o.bound;
+        total += o.total;
     }
 };
+
+/// The model's SwiGLU with its clamp (ds4_ref.cpp / llama.cpp DEEPSEEK4): gate -> min(gate, lim), up -> clamp(up,
+/// -lim, lim), then silu(gate) * up.  Counts the clamped elements into `probe`.
+void swiglu_ref(const float* g, const float* u, float* h, int64_t n, float lim, Probe* probe) {
+    for (int64_t j = 0; j < n; ++j) {
+        const float gc = std::min(g[j], lim), uc = std::min(std::max(u[j], -lim), lim);
+        if (probe) {
+            probe->bound += (g[j] > lim) + (std::fabs(u[j]) > lim);
+            probe->total += 2;
+        }
+        h[j] = (gc / (1.0f + std::exp(-gc))) * uc;
+    }
+}
 
 /// The clamp probe over every expert every arm sampled.
 Probe probe_total;
@@ -200,7 +220,7 @@ void ref_expert(const cpu::NativeFmt& f, const uint8_t* blob, const float* x, fl
             probe->up_abs = std::max(probe->up_abs, std::fabs(u[(size_t) j]));
         }
     }
-    for (int64_t j = 0; j < FF; ++j) h[(size_t) j] = (g[(size_t) j] / (1.0f + std::exp(-g[(size_t) j]))) * u[(size_t) j];
+    swiglu_ref(g.data(), u.data(), h.data(), FF, f.swiglu_limit, probe);
     if (engine_activation) {
         cpu::native_quant_h(f, h.data(), hq.data());
         deq_q8_k(hq.data(), FF, hd.data());
@@ -355,7 +375,7 @@ int arm_synthetic(int sets) {
 
 // ================================ arm 2: real GGUF slices ================================
 
-int arm_real(const std::string& gguf, int sets, bool require_gguf) {
+int arm_real(const std::string& gguf, int sets, bool require_gguf, float lim_override = 0.0f) {
     FILE* p = std::fopen(gguf.c_str(), "rb");
     const bool present = p != nullptr;
     if (p) std::fclose(p);
@@ -369,6 +389,10 @@ int arm_real(const std::string& gguf, int sets, bool require_gguf) {
     if (!strata::ds4::ds4_moe_geom_from_gguf(gguf, g, err)) {
         std::printf("real: geom: %s\n", err.c_str());
         return 1;
+    }
+    if (lim_override > 0.0f) {
+        g.swiglu_limit = lim_override;
+        std::printf("\n-- arm 2 again with the SwiGLU clamp forced to %.2f (the GGUF's is %.1f)\n", lim_override, kClampExp);
     }
     cpu::NativeFmt f;
     if (!strata::ds4::ds4_moe_blob_layout(g, f, err)) {
@@ -473,8 +497,7 @@ void ref_expert_gpu(const cpu::NativeFmt& f, const uint8_t* blob, const float* x
             probe->up_abs = std::max(probe->up_abs, std::fabs(u[(size_t) j]));
         }
     }
-    for (int64_t j = 0; j < FF; ++j)
-        h[(size_t) j] = (g[(size_t) j] / (1.0f + std::exp(-g[(size_t) j]))) * u[(size_t) j];
+    swiglu_ref(g.data(), u.data(), h.data(), FF, f.swiglu_limit, probe);
     deq_q8_1(h.data(), FF, hq.data());
     matvec(w.D.data(), H, FF, hq.data(), out);
 }
@@ -483,7 +506,7 @@ void ref_expert_gpu(const cpu::NativeFmt& f, const uint8_t* blob, const float* x
 /// from (a resident VRAM slot, the prefetch staging, the PCIe DMA from the pinned arena, and the blob source
 /// itself) against the same dequant+F32 reference, and then all four at once in one layer's weighted sum.
 constexpr int kArena = 24;   ///< real expert slices the arena holds (24 of 6.75 MiB = 162 MiB)
-int arm_gpu(const std::string& gguf, int sets) {
+int arm_gpu(const std::string& gguf, int sets, float lim_override = 0.0f) {
     std::printf("\n-- arm 3: the GPU's four sources (VRAM slot / prefetch staging / PCIe DMA / file tier) vs the "
                 "same dequant+F32 reference\n");
     std::string err;
@@ -491,6 +514,10 @@ int arm_gpu(const std::string& gguf, int sets) {
     if (!strata::ds4::ds4_moe_geom_from_gguf(gguf, g, err)) {
         std::printf("gpu: %s\n", err.c_str());
         return 1;
+    }
+    if (lim_override > 0.0f) {
+        g.swiglu_limit = lim_override;
+        std::printf("   (arm 3 again with the SwiGLU clamp forced to %.2f)\n", lim_override);
     }
     cpu::NativeFmt f;
     if (!strata::ds4::ds4_moe_blob_layout(g, f, err)) {
@@ -585,6 +612,16 @@ int arm_gpu(const std::string& gguf, int sets) {
         if (cpu_ref) ref_expert(f, blob.data(), x.data(), ref.data(), &probe_total, true);
         else ref_expert_gpu(f, blob.data(), x.data(), ref.data(), &probe_total);
         const double r = rel(out.data(), ref.data(), H);
+        if (std::isfinite(f.swiglu_limit)) {
+            // how far the UNCLAMPED answer is from the clamped reference: a missing or wrong clamp in the kernels
+            // would put the tier about this far off, so `r` far below it shows the clamp is applied
+            cpu::NativeFmt fu = f;
+            fu.swiglu_limit = std::numeric_limits<float>::infinity();
+            std::vector<float> ref_u((size_t) H);
+            if (cpu_ref) ref_expert(fu, blob.data(), x.data(), ref_u.data(), nullptr, true);
+            else ref_expert_gpu(fu, blob.data(), x.data(), ref_u.data(), nullptr);
+            std::printf("  %-20s       unclamped answer vs clamped reference: rel %.3e (tier: %.3e)\n", "", rel(ref_u.data(), ref.data(), H), r);
+        }
         const Ds4MoeStats& st = tier.stats();
         const bool ok = r < kLimit && st.hits == h && st.prefetched_useful == p && st.pcie == pc && st.cpu == c &&
                         st.file_tier == ft;
@@ -914,15 +951,27 @@ int main(int argc, char** argv) {
 #if defined(DS4_MOE_CUDA)
     if (a.gpu) rc |= arm_gpu(a.gguf, a.sets);
 #endif
+    const Probe at_model_limit = probe_total;
+    // the clamp path itself: the same real arms with a limit that binds on a large share of the elements
+    probe_total = Probe{};
+    if (!a.no_real) rc |= arm_real(a.gguf, a.sets, a.require_gguf, kForcedClamp);
+#if defined(DS4_MOE_CUDA)
+    if (a.gpu) rc |= arm_gpu(a.gguf, a.sets, kForcedClamp);
+#endif
+    if (!a.no_real || a.gpu) {
+        const double frac = probe_total.total ? (double) probe_total.bound / (double) probe_total.total : 0.0;
+        std::printf("\nforced clamp %.2f: the reference clamped %lld of %lld pre-activations (%.2f%%)\n", kForcedClamp,
+                    (long long) probe_total.bound, (long long) probe_total.total, 100.0 * frac);
+        check(frac > 0.05, "forced clamp actually binds (share of clamped pre-activations > 5%)", frac);
+    }
+    probe_total = at_model_limit;
 
     std::printf("\nclamp probe (max pre-activation over every expert sampled above; the model's "
                 "swiglu_clamp_exp is %.1f)\n  max |gate| %.4f, max |up| %.4f -> %s\n", kClampExp,
                 probe_total.gate_abs, probe_total.up_abs,
                 (probe_total.gate_abs < kClampExp && probe_total.up_abs < kClampExp)
-                    ? "the clamp is INACTIVE on these activations (unclamped == clamped, so the tier's output "
-                      "is the model's)"
-                    : "the clamp WOULD bind: the native kernels do not apply it (see ds4_moe.hpp) and the tier "
-                      "reproduces them");
+                    ? "the clamp is inactive on these activations"
+                    : "the clamp binds on these activations (the kernels apply it, as the reference does)");
 
     std::printf("\ntest_ds4_moe: %d checks, %d failures, %d arm errors\n", g_checks, g_fail, rc);
     return (g_fail || rc) ? 1 : 0;

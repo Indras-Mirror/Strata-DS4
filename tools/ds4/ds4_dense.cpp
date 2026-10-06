@@ -59,7 +59,13 @@ struct WStore {
     }
 };
 
-bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, std::string & err) {
+bool is_routed_expert(const std::string & n) {
+    return n.size() > 12 && n.compare(n.size() - 12, 12, "_exps.weight") == 0;
+}
+
+// Off-CPU, `token_embd` stays on the host (begin_token looks the row up there: 1 GiB of VRAM the expert cache gets
+// instead) and, with `skip_experts`, the routed experts are not loaded at all.
+bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, bool skip_experts, std::string & err) {
     ggml_init_params ip = { /*mem_size*/ 256ull * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
     w.ctx = ggml_init(ip);
     if (!w.ctx) { err = "ggml_init(weights) failed"; return false; }
@@ -96,8 +102,12 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, s
     }
 
     // non-CPU: create the tensor set, allocate one backend buffer for it, upload the payloads
+    auto skip = [&](const std::string & n) {
+        return n == "token_embd.weight" || (skip_experts && is_routed_expert(n));
+    };
     for (size_t s = 0; s < model.size(); ++s) {
         for (const auto & ti : model.shard(s).tensors()) {
+            if (skip(ti.name)) continue;
             if (!model.in_bounds(ti, s)) { err = ti.name + " out of bounds"; return false; }
             int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
             for (size_t d = 0; d < ti.shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) ti.shape[d];
@@ -112,6 +122,7 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, s
     w.bufs.push_back(buf);
     for (size_t s = 0; s < model.size(); ++s) {
         for (const auto & ti : model.shard(s).tensors()) {
+            if (skip(ti.name)) continue;
             ggml_tensor * t = w.t[ti.name];
             ggml_backend_tensor_set(t, model.shard(s).tensor_data(ti), 0, ggml_nbytes(t));
         }
@@ -154,6 +165,11 @@ struct Ds4Dense::Impl {
     ggml_tensor * x_state    = nullptr;   // [D, hc]  layer input / output state
     ggml_tensor * routed_sum = nullptr;   // [D]      routed-expert sum fed to finish_layer
     ggml_tensor * i_tid      = nullptr;   // I32[1]
+    ggml_tensor * i_emb      = nullptr;   // F32[D]   embd[tid], looked up on the host (begin_token)
+    const uint8_t * embd_data = nullptr;  // token_embd on the GGUF mmap
+    int           embd_type  = -1;
+    size_t        embd_row   = 0;         // bytes per row
+    std::vector<float> host_emb;
     ggml_tensor * i_pos      = nullptr;   // I32[1]
     ggml_tensor * rot        = nullptr;   // [idx_k, idx_k] F32 Walsh-Hadamard (lightning indexer)
     ggml_tensor * logits_t   = nullptr;   // [V, 1]   head graph output
@@ -164,6 +180,7 @@ struct Ds4Dense::Impl {
         ggml_tensor * vis = nullptr;      // F32 [cap, 1] 0 visible / -inf hidden
         ggml_tensor * out_ids = nullptr;  // I32 [NUSED, 1]
         ggml_tensor * out_wts = nullptr;  // F32 [1, NUSED, 1]
+        ggml_tensor * dbg_isc = nullptr;  // F32 [cap, 1] indexer scores + visibility (DS4_DBG_INDEXER=1)
         ggml_cgraph * gf = nullptr;
         ggml_gallocr_t allo = nullptr;
     };
@@ -513,6 +530,8 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, Ds4Den
             var.vis = ggml_new_tensor_2d(gc, GGML_TYPE_F32, cap, 1);
             ggml_set_input(var.vis);
             sc = ggml_add(gc, sc, var.vis);
+            var.dbg_isc = sc;
+            ggml_set_output(sc);
 
             // mask = -inf everywhere, 0 at the top-k rows, then ANDed with visibility
             const int64_t ntk = std::min<int64_t>(cap, im.IDXTOPK);
@@ -697,9 +716,7 @@ static ggml_cgraph * build_init(Ds4Dense::Impl & im) {
     ggml_context * gc = im.gctx;
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
-    ggml_tensor * emb = ggml_get_rows(gc, im.w.get("token_embd.weight"), im.i_tid);
-    emb = ggml_cast(gc, emb, GGML_TYPE_F32);
-    ggml_tensor * x = ggml_reshape_3d(gc, emb, D, 1, 1);
+    ggml_tensor * x = ggml_reshape_3d(gc, im.i_emb, D, 1, 1);   // embd[tid], from the host (begin_token)
     x = ggml_repeat_4d(gc, x, D, HC, 1, 1);
     ggml_build_forward_expand(gf, ggml_cpy(gc, ggml_reshape_2d(gc, x, D, HC), im.x_state));
     return gf;
@@ -751,7 +768,18 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
     if (im.model->size() == 0) { err = "cannot open " + model_path; return false; }
     if (!(err = ds4_read_geometry(*im.model, im.g)).empty()) return false;
     if (!(err = check_ds4_model(*im.model, im.g)).empty()) return false;
-    if (!load_weights(*im.model, im.backend, im.w, err)) return false;
+    if (!load_weights(*im.model, im.backend, im.w, cfg.skip_routed_experts, err)) return false;
+    {
+        size_t sh = 0;
+        const TensorInfo * te = im.model->find("token_embd.weight", &sh);
+        if (!te) { err = "no token_embd.weight"; return false; }
+        im.embd_data = im.model->shard(sh).tensor_data(*te);
+        im.embd_type = (int) te->type;
+        im.embd_row  = ggml_row_size((ggml_type) te->type, (int64_t) te->shape.at(0));
+        if (!ggml_get_type_traits((ggml_type) te->type)->to_float && te->type != GGML_TYPE_F32) {
+            err = "token_embd type has no to_float"; return false;
+        }
+    }
 
     const Ds4Geometry & g = im.g;
     im.D = g.n_embd; im.HC = g.hc; im.DH = g.d_head; im.DHR = g.d_rope; im.NH = g.n_head;
@@ -778,6 +806,7 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
         im.x_state    = nt2(GGML_TYPE_F32, im.D, im.HC);
         im.routed_sum = nt1(GGML_TYPE_F32, im.D);
         im.i_tid      = nt1(GGML_TYPE_I32, 1);
+        im.i_emb      = nt1(GGML_TYPE_F32, im.D);
         im.i_pos      = nt1(GGML_TYPE_I32, 1);
 
         im.ly.resize((size_t) nl);
@@ -897,6 +926,14 @@ bool Ds4Dense::begin_token(int tid) {
     if (!ggml_gallocr_alloc_graph(im.allo_init, im.gf_init)) { im.err = "gallocr(init) failed"; return false; }
     const int32_t t = tid;
     ggml_backend_tensor_set(im.i_tid, &t, 0, sizeof t);
+    // embd[tid] on the host, exactly what get_rows + cast computes (F16 -> F32 is exact; quantized rows dequantize
+    // with the same to_float)
+    if (tid < 0 || tid >= im.g.vocab_size) { im.err = "token id out of range"; return false; }
+    im.host_emb.resize((size_t) im.D);
+    const uint8_t * row = im.embd_data + (size_t) tid * im.embd_row;
+    if (im.embd_type == GGML_TYPE_F32) std::memcpy(im.host_emb.data(), row, (size_t) im.D * 4);
+    else ggml_get_type_traits((ggml_type) im.embd_type)->to_float(row, im.host_emb.data(), im.D);
+    ggml_backend_tensor_set(im.i_emb, im.host_emb.data(), 0, (size_t) im.D * 4);
     if (ggml_backend_graph_compute(im.backend, im.gf_init) != GGML_STATUS_SUCCESS) {
         im.err = "init graph compute failed";
         return false;
@@ -1007,6 +1044,14 @@ bool Ds4Dense::attn_router(int il, int pos, int tid, int * routed_ids, float * r
         return false;
     }
 
+    static const bool dbg_idx = std::getenv("DS4_DBG_INDEXER") != nullptr;
+    if (dbg_idx && var->dbg_isc) {
+        std::vector<float> v((size_t) var->cap);
+        ggml_backend_tensor_get(var->dbg_isc, v.data(), 0, v.size() * 4);
+        std::fprintf(stderr, "[idx] L%d pos %d:", il, pos);
+        for (float x : v) if (std::isfinite(x)) std::fprintf(stderr, " %.6g", x);
+        std::fprintf(stderr, "\n");
+    }
     // ---- router outputs + hand-offs -----------------------------------------------------
     {
         std::vector<int32_t> ids((size_t) im.NUSED);

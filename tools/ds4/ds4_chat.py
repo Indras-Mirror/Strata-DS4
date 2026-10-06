@@ -60,7 +60,7 @@ def main():
     ap.add_argument("--thinking", action="store_true")
     ap.add_argument("--temp", type=float, default=0.0)
     ap.add_argument("--model", default=MODEL)
-    ap.add_argument("--bin", default=str(REPO / "build-ds4-cuda/ds4_generate"))
+    ap.add_argument("--bin", default=str(REPO / "build-ds4-gpu/ds4_generate"))
     ap.add_argument("--cap", default="80")
     ap.add_argument("--need", default="82")
     ap.add_argument("--print-ids", action="store_true")

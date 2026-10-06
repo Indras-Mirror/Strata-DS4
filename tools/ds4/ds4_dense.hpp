@@ -32,7 +32,10 @@
 struct Ds4DenseConfig {
     ggml_backend_t backend   = nullptr;
     int            n_threads = 8;
-    int64_t        comp_cap_max = 0;
+    int64_t        comp_cap_max = 0;           ///< compressed-KV rows per layer (0 = context_length / ratio)
+    /// Do not load ffn_{gate,up,down}_exps (the routed-expert tier owns them): the real model on the GPU, where
+    /// uploading them would ask for ~72 GiB.  `weight()` of one of them then aborts.
+    bool           skip_routed_experts = false;
 };
 
 /// One-token decode of the DS4 dense half.  Not thread-safe; one instance decodes one sequence.

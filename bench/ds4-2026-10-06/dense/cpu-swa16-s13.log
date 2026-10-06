@@ -1,0 +1,27 @@
+[gate] decoder backend: CPU
+[gate] model=bench/ds4-2026-10-06/dense/mini-ds4-swa16.gguf D=256 hc=4 heads=2 d_head=64 V=64 swa=16 layers=2
+[gate] tokens=40  paths: raw wrap=yes  csa blocks@last=10  hca blocks@last=0  indexer top_k=8
+[gate] WARNING: the chosen token count does not exercise every path
+[gate] "/home/mal/AI/Strata-DS4/./build-ds4/ds4_ref" -m "bench/ds4-2026-10-06/dense/mini-ds4-swa16.gguf" --tokens "bench/ds4-2026-10-06/dense/cpu-swa16-s13/tokens.i32" --out "bench/ds4-2026-10-06/dense/cpu-swa16-s13/ref-allpos" --all-pos -t 8 2>&1 | tee "bench/ds4-2026-10-06/dense/cpu-swa16-s13/ref.log"
+[ds4_ref] note: input comp_mask_f16 was not placed in the graph, skipped
+[ds4_ref] model=bench/ds4-2026-10-06/dense/mini-ds4-swa16.gguf tokens=40 threads=8 all_pos=1 max_layer=1048576
+[ds4_ref] geometry D=256 L=2 hc=4 experts=256 top2 d_h=64 rope=16 groups=2
+[ds4_ref] bound 68 tensors zero-copy from 1 shard(s)
+[ds4_ref] blocks: csa(4)=10 hca(128)=0
+[ds4_ref] layer 1/2 done (ratio=4)
+[ds4_ref] layer 2/2 done (ratio=128)
+[ds4_ref] wrote 26 tensors to bench/ds4-2026-10-06/dense/cpu-swa16-s13/ref-allpos
+
+[gate] per-layer, last position 39, cosine vs ds4_ref --all-pos
+  layer ratio  attn_raw     attn_out     ffn_norm     l_last      
+  0     4      1.0000000    1.0000000    1.0000000    1.0000000   
+  1     128    1.0000000    1.0000000    1.0000000    1.0000000   
+
+[gate] per-token logits cosine, all 40 positions, vs ds4_ref --all-pos
+  worst position 12: cos 1.00000000   (gate >= 0.99999), 0 positions below the gate
+  logits top-1 last position: Ds4Dense 13 vs ds4_ref 13 -> identical
+
+[gate] predictor (prefetch hint) recall@16 on the true routed ids, non-hash layers
+  layer 1  1.000
+
+[gate] PASS (0 failed check(s))

@@ -15,7 +15,7 @@
 // The prompt is fed through the same one-token path (prefill = decode loop for now; Phase 5 owns batched prefill).
 //
 // Load the real model ONLY through tools/ds4/memguard.sh (it froze the box once without it):
-//   bash tools/ds4/memguard.sh 80 82 -- build-ds4-cuda/ds4_generate -m <gguf> --ids ... -n 64
+//   bash tools/ds4/memguard.sh 80 82 -- build-ds4-gpu/ds4_generate -m <gguf> --ids ... -n 64
 #include "ds4_dense.hpp"
 #include "ds4_moe.hpp"
 
@@ -43,6 +43,7 @@ struct Args {
     int64_t slots = 2150;
     double pcie = 0.25, pf_b = 1.43, arena_gib = 60.0;
     int threads = 0;
+    int64_t ctx = 0;   // context cap for the compressed-KV state (0 = prompt + n_predict + 64)
     float temp = 0.0f;
     uint64_t seed = 1;
     std::vector<int> stop;
@@ -65,7 +66,7 @@ void usage() {
     std::fprintf(stderr,
         "usage: ds4_generate -m model.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend cuda|cpu]\n"
         "       [--experts gpu|cpu] [--slots 2150] [--pcie 0.25] [--pf-b 1.43] [--profile ds4routes.bin]\n"
-        "       [--arena-gib 60] [--threads N] [--temp 0] [--seed 1] [--stop id,id] [--dump-logits f.f32] [--quiet]\n");
+        "       [--arena-gib 60] [--threads N] [--ctx N] [--temp 0] [--seed 1] [--stop id,id] [--dump-logits f.f32] [--quiet]\n");
 }
 
 bool parse(int argc, char** argv, Args& a) {
@@ -84,6 +85,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--profile") a.profile = next();
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
         else if (k == "--threads") a.threads = std::atoi(next().c_str());
+        else if (k == "--ctx") a.ctx = std::atoll(next().c_str());
         else if (k == "--temp") a.temp = (float) std::atof(next().c_str());
         else if (k == "--seed") a.seed = (uint64_t) std::atoll(next().c_str());
         else if (k == "--stop") a.stop = parse_csv(next());
@@ -139,6 +141,12 @@ int main(int argc, char** argv) {
     Ds4DenseConfig dc;
     dc.backend = be;
     dc.n_threads = a.threads > 0 ? a.threads : 8;
+    dc.skip_routed_experts = true;   // the tier owns them (on the GPU backend they would be a 72 GiB upload)
+    // the compressed-KV state is sized for the context actually used, not the model's context_length: the
+    // smallest compress ratio is 4, so ctx/4 rows (+2 for the partial block) cover every layer
+    const int64_t ctx = a.ctx > 0 ? a.ctx : (int64_t) prompt.size() + a.n_predict + 64;
+    dc.comp_cap_max = ctx / 4 + 2;
+    std::fprintf(stderr, "context cap %lld tokens\n", (long long) ctx);
     std::string err;
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds4_generate: dense init: %s\n", err.c_str()); return 1; }
 

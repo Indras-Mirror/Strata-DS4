@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 namespace strata::kernels::cpu {
@@ -34,6 +35,9 @@ struct NativeFmt {
     size_t up_off = 0, down_off = 0;    ///< inside the blob
     size_t bytes = 0;                   ///< the whole blob
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
+    /// DeepSeek-V4's SwiGLU clamp (`swiglu_clamp_exp`): gate -> min(gate, lim), up -> clamp(up, -lim, lim) before
+    /// silu(gate) * up.  +inf (the default, every other model) = no clamp, bit-identical to the unclamped kernels.
+    float swiglu_limit = std::numeric_limits<float>::infinity();
 };
 
 /// Whether this build has the ggml-cpu path.

@@ -1,0 +1,40 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 24080 MiB):
+  Device 0: NVIDIA GeForce RTX 4090, compute capability 8.9, VMM: yes, VRAM: 24080 MiB
+[gate] decoder backend: CUDA0
+[gate] model=bench/ds4-2026-10-06/dense/mini-ds4-swa16.gguf D=256 hc=4 heads=2 d_head=64 V=64 swa=16 layers=2
+[gate] tokens=8  paths: raw wrap=NO  csa blocks@last=2  hca blocks@last=0  indexer top_k=8
+[gate] WARNING: the chosen token count does not exercise every path
+[gate] "/home/mal/AI/Strata-DS4/./build-ds4-gpu/ds4_ref" -m "bench/ds4-2026-10-06/dense/mini-ds4-swa16.gguf" --tokens "bench/ds4-2026-10-06/dense/gpu-swa16-8/tokens.i32" --out "bench/ds4-2026-10-06/dense/gpu-swa16-8/ref-allpos" --all-pos -t 8 2>&1 | tee "bench/ds4-2026-10-06/dense/gpu-swa16-8/ref.log"
+[ds4_ref] model=bench/ds4-2026-10-06/dense/mini-ds4-swa16.gguf tokens=8 threads=8 all_pos=1 max_layer=1048576
+[ds4_ref] geometry D=256 L=2 hc=4 experts=256 top2 d_h=64 rope=16 groups=2
+[ds4_ref] bound 68 tensors zero-copy from 1 shard(s)
+[ds4_ref] blocks: csa(4)=2 hca(128)=0
+[ds4_ref] layer 1/2 done (ratio=4)
+[ds4_ref] layer 2/2 done (ratio=128)
+[ds4_ref] wrote 26 tensors to bench/ds4-2026-10-06/dense/gpu-swa16-8/ref-allpos
+
+[gate] per-layer, last position 7, cosine vs ds4_ref --all-pos
+  layer ratio  attn_raw     attn_out     ffn_norm     l_last      
+  0     4      0.9999998    0.9999747    0.9999963    0.9999952   
+      ^ attn_out FAIL
+  1     128    0.9999958    0.9999433    0.9999684    0.9999658   
+      ^ attn_out FAIL
+      ^ ffn_norm FAIL
+      ^ l_last FAIL
+
+[gate] per-token logits cosine, all 8 positions, vs ds4_ref --all-pos
+  pos 0: cos 0.99995324 FAIL
+  pos 1: cos 0.99991521 FAIL
+  pos 2: cos 0.99994673 FAIL
+  pos 3: cos 0.99995409 FAIL
+  pos 4: cos 0.99995418 FAIL
+  pos 5: cos 0.99987405 FAIL
+  pos 6: cos 0.99996524 FAIL
+  pos 7: cos 0.99993754 FAIL
+  worst position 5: cos 0.99987405   (gate >= 0.99999), 8 positions below the gate
+  logits top-1 last position: Ds4Dense 39 vs ds4_ref 39 -> identical
+
+[gate] predictor (prefetch hint) recall@16 on the true routed ids, non-hash layers
+  layer 1  1.000
+
+[gate] FAIL (12 failed check(s))

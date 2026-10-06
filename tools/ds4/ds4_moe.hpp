@@ -32,17 +32,13 @@
 // It is tested by `tools/ds4/test_ds4_moe.cpp` against a dequant+F32 reference (weights through ggml's
 // `to_float`), CPU-only, at rel < 1e-3 per layer and per expert.
 //
-// THE SWIGLU CLAMP, stated once because it is the one way this tier is not the model.  DeepSeek-V4's graph clamps
-// the expert gate/up pre-activations to `swiglu_clamp_exp` (10.0) before the SwiGLU (docs/ds4/DSV4_ARCH_SPEC.md;
-// `tools/ds4/ds4_ref.cpp:933-936`, mirroring llama.cpp's DEEPSEEK4 branch).  The native expert kernels this tier
-// is built on DO NOT: `native_gu_rows` computes `silu(gate . a) * (up . a)` with no limit
-// (`include/strata/kernels/cpu/native_expert.hpp:49`), and the CUDA grouped kernel's device code is
-// `g / (1 + __expf(-g)) * up` with no limit either (`src/kernels/cuda/iq_kernels.cu:1190,1412,2474`).  Both
-// existing parity gates therefore also use unclamped references and pass (Phase 2 `ds4_expert_parity`: 3.0e-5;
-// `moe_replay --correctness`: 3.18e-7).  This tier reproduces the kernels exactly.  Moving the clamp into the
-// tier would need a second, unfused gate/up path on both backends; `test_ds4_moe` instead MEASURES whether the
-// limit binds at all on the sampled experts and prints the number, so the choice is made on evidence (see
-// docs/ds4/ENGINE_MOE.md).
+// THE SWIGLU CLAMP.  DeepSeek-V4's graph clamps the expert pre-activations before the SwiGLU - gate -> min(gate, L),
+// up -> clamp(up, -L, L), L = `swiglu_clamp_exp` = 10.0 (`tools/ds4/ds4_ref.cpp`, mirroring llama.cpp's DEEPSEEK4
+// branch).  The native expert kernels apply it through `NativeFmt::swiglu_limit` (CPU: `native_gu_rows` and the
+// AVX2/AVX-512 multi-token kernels) and `NativeExpertLayout::swiglu_limit` (CUDA: the grouped kernels' SwiGLU
+// passes); `ds4_moe_geom_from_gguf` reads L into `Ds4MoeGeom::swiglu_limit` and the tier passes it to both.  Every
+// other model leaves the limit at +inf, which is the unclamped arithmetic bit for bit.  On real activations L
+// binds rarely (FINDINGS s13), so `test_ds4_moe` also reruns its real arms with L forced to 1.0 to check the path.
 #pragma once
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -54,6 +50,7 @@
 #include <cstdio>
 #include <map>
 #include <memory>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -75,6 +72,9 @@ struct Ds4MoeGeom {
     int64_t top_k = 6;          ///< experts routed per token
     int gu_type = 16;           ///< GGML_TYPE_IQ2_XXS (gate and up)
     int d_type = 10;            ///< GGML_TYPE_Q2_K (down)
+    /// `deepseek4.swiglu_clamp_exp` (10.0 on every layer of the 0731 GGUF; one value - the tier has one format):
+    /// gate -> min(gate, lim), up -> clamp(up, -lim, lim) before the SwiGLU.  +inf = no clamp.
+    float swiglu_limit = std::numeric_limits<float>::infinity();
 };
 
 /// Reads `n_embd / n_ff / n_layers / n_experts / top_k` from the GGUF's `deepseek4.*` metadata, and the two
@@ -259,7 +259,7 @@ private:
 /// kernels.  Exposed because the gate needs the single-expert number as well as the weighted sum, and because it
 /// is the only part of the CPU path that is worth testing on its own.
 ///
-/// NOTE (see the file header): unclamped SwiGLU, exactly as `native_gu_rows` computes it.
+/// The SwiGLU is clamped per `f.swiglu_limit` (see the file header).
 bool ds4_moe_cpu_expert(const cpu::NativeFmt& f, int64_t n_embd, int64_t n_ff, const uint8_t* blob,
                         const float* x, float* out, cpu::ExpertPool& pool);
 

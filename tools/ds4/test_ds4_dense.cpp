@@ -3,7 +3,7 @@
 // INVARIANT: token-by-token decode through Ds4Dense (+ a plain reference routed-expert computation, ggml
 // mul_mat_id, right here in the test) reproduces ds4_ref's full-sequence forward on the same tokens.
 //
-//   test_ds4_dense <mini.gguf> [--tokens N] [--work DIR] [--ref-dir DIR] [--ref-bin PATH]
+//   test_ds4_dense <mini.gguf> [--tokens N] [--work DIR] [--ref-dir DIR] [--ref-bin PATH] [--cuda]
 //
 // It writes a deterministic token file, runs `ds4_ref --all-pos` into <work>/ref-allpos, decodes the same
 // tokens one at a time, and checks:
@@ -12,12 +12,14 @@
 //   * logits: top-1 identical at the last position and cosine >= 0.99999
 //   * per-token logits cosine for ALL positions, all >= 0.99999
 //
-// CPU only, by construction: it only ever creates a CPU backend (the safety rules for this machine forbid
-// GPU runs; the CUDA backend path is compile-only, see tools/ds4/cmake/ds4_dense.cmake).
+// The decoder runs on the CPU backend by default; --cuda puts Ds4Dense (and the test-side expert reference) on
+// ggml's GPU backend (needs a tree built with -DSTRATA_GGML_CUDA=ON, i.e. build-ds4-gpu). ds4_ref, the oracle,
+// always runs on the CPU.
 
 #include "ds4_dense.hpp"
 
 #include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "ggml-cpu.h"
 
 #include <algorithm>
@@ -136,6 +138,7 @@ int main(int argc, char ** argv) {
     setvbuf(stderr, nullptr, _IONBF, 0);
     std::string model, work = "bench/ds4-2026-10-06/dense", refbin, refdir;
     int nt_tokens = 0;
+    bool use_cuda = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -148,15 +151,16 @@ int main(int argc, char ** argv) {
         else if (a == "--work")     work = next();
         else if (a == "--ref-dir")  refdir = next();
         else if (a == "--ref-bin")  refbin = next();
+        else if (a == "--cuda")     use_cuda = true;
         else if (a == "-h" || a == "--help") {
-            std::printf("usage: test_ds4_dense <mini.gguf> [--tokens N] [--work DIR] [--ref-dir DIR] [--ref-bin PATH]\n");
+            std::printf("usage: test_ds4_dense <mini.gguf> [--tokens N] [--work DIR] [--ref-dir DIR] [--ref-bin PATH] [--cuda]\n");
             return 0;
         }
         else if (a[0] != '-' && model.empty()) model = a;   // positional: test_ds4_dense <mini.gguf>
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 1; }
     }
     if (model.empty()) {
-        std::fprintf(stderr, "usage: test_ds4_dense <mini.gguf> [--tokens N] [--work DIR] [--ref-dir DIR] [--ref-bin PATH]\n");
+        std::fprintf(stderr, "usage: test_ds4_dense <mini.gguf> [--tokens N] [--work DIR] [--ref-dir DIR] [--ref-bin PATH] [--cuda]\n");
         return 1;
     }
     if (refbin.empty()) {
@@ -166,8 +170,14 @@ int main(int argc, char ** argv) {
 
     std::string err;
     Ds4DenseConfig cfg;
-    cfg.backend   = nullptr;   // CPU only, always
+    ggml_backend_t gpu = nullptr;
+    if (use_cuda) {
+        gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+        if (!gpu) { std::fprintf(stderr, "[gate] --cuda: no GPU backend in this build (use build-ds4-gpu)\n"); return 2; }
+    }
+    cfg.backend   = gpu;       // nullptr = CPU
     cfg.n_threads = 8;
+    std::printf("[gate] decoder backend: %s\n", gpu ? ggml_backend_name(gpu) : "CPU");
 
     Ds4Dense d;
     if (!d.init(model, cfg, err)) { std::fprintf(stderr, "[gate] init failed: %s\n", err.c_str()); return 1; }

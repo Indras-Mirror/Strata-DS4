@@ -23,6 +23,8 @@
 #include <thread>
 #include <utility>
 
+#include "strata/artifact/ds4_geometry.hpp"
+
 #if defined(DS4_MOE_CUDA)
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/pinned.hpp"
@@ -265,6 +267,7 @@ bool ds4_moe_blob_layout(const Ds4MoeGeom& g, cpu::NativeFmt& f, std::string& er
               std::to_string(g.n_embd) + "/" + std::to_string(g.n_ff) + ": " + e;
         return false;
     }
+    f.swiglu_limit = g.swiglu_limit;
     return true;
 }
 
@@ -301,6 +304,17 @@ bool ds4_moe_geom_from_gguf(const std::string& gguf, Ds4MoeGeom& g, std::string&
                 return false;
             }
             (r == 2 ? g.d_type : g.gu_type) = (int) ti->type;
+        }
+        // the SwiGLU clamp: one limit for the whole tier (it has one NativeFmt / layout), so every layer must agree
+        std::vector<double> lim;
+        const std::string le = strata::ds4_key_f64_arr(f, "deepseek4.swiglu_clamp_exp", lim);
+        if (le.empty() && !lim.empty()) {
+            for (double x : lim)
+                if (x != lim[0]) {
+                    err = "deepseek4.swiglu_clamp_exp differs between layers; the tier supports one limit";
+                    return false;
+                }
+            if (lim[0] > 0.0) g.swiglu_limit = (float) lim[0];   // <= 0 means "no clamp" in llama.cpp
         }
     } catch (const std::exception& e) {
         err = e.what();
@@ -436,6 +450,7 @@ bool Ds4MoeTier::init(const Ds4MoeGeom& geom, Ds4BlobSource* blobs, const Ds4Moe
     gp.arena.n_layers = geom.n_layers;
     gp.arena.n_experts = geom.n_experts;
     gp.gl = strata::kernels::native_expert_layout(geom.gu_type, geom.d_type, geom.n_embd, geom.n_ff);
+    gp.gl.swiglu_limit = geom.swiglu_limit;
     if (!strata::kernels::native_expert_supported(geom.gu_type, geom.d_type, geom.n_embd, geom.n_ff)) {
         err = "native_expert_grouped has no kernel for these types at this geometry";
         return false;
