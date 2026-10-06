@@ -5,47 +5,59 @@ Paste everything below the line into a fresh Claude Code session started in `~/A
 ---
 
 We're porting the Strata inference engine to DeepSeek-V4-Flash so it decodes faster than llama.cpp on my RTX 4090 +
-Ryzen 7 5700X + 90 GB DDR4. Use /conductor. **Status table: `docs/ds4/FINDINGS.md` s8. Read s9, s11, s12 first.**
-(Last session: 2026-10-06, ended cleanly - no workers, no GPU jobs, nothing in flight.)
+Ryzen 7 5700X + 90 GB DDR4. **Work solo - do NOT use /conductor or dispatch workers** (they burned too many tokens);
+I'll tell you when the GPU is free (I run ComfyUI). Status table: `docs/ds4/FINDINGS.md` s8; read s9, s11, s12 first,
+then `docs/ds4/ENGINE_DENSE.md` and `docs/ds4/ENGINE_MOE.md`. (Written 2026-10-06 17:20; nothing in flight.)
 
-## Where it stands (2026-10-06)
-- **Phase 3 DONE** (`cb6af7b`): gate = p600/p3000 logits (top1 1.0, KL < 0.01); per-tensor cosine is a diagnostic
-  (`compare_golden.py --tensors-diag`) - the residual was proven to be CPU-vs-CUDA flash-attn noise x Q8 activation
-  rounding (`tools/ds4/check_act_quant.py`, s9). Small coherency check (`4725894`): ds4_ref and llama.cpp give the same
-  next-token top-5 on all three prompts.
-- **Phase 4b speed verdict: GO in the replay** (s11, s12). Real layer order alone = 18.7 tok/s (kill line 19.6) -
-  the PCIe split can't help because CPU + PCIe share DDR4 (both at once = 29.9 GB/s total, `bw_contend.cu`).
-  **Predicted expert prefetch** (layer l's router on the pre-attention state, ~63% recall@6; 1.43 experts/layer DMA'd
-  under the dense work) measured **20.57 tok/s at 2150 slots** (the real VRAM budget) vs llama.cpp 16.34.
-  SPEED ONLY: random activations, attention is a timed stand-in. No real generation yet.
-- **Engine build started, NOT verified** - three conductor workers were stopped mid-slice (Mal left for work):
-  - `ds4-dense` + `ds4-moe` WIP saved on branch **`ds4-engine-wip`** (`e0b1aa4`, 3233 lines: ds4_dense.{hpp,cpp},
-    ds4_moe.{hpp,cpp}, tests, tools/ds4/cmake/*.cmake). Unknown whether it builds or passes. Test outputs from the
-    dense worker are untracked in `bench/ds4-2026-10-06/dense/` (35 MB).
-  - `llama-prefetch` (track "a": `--moe-prefetch N` in llama.cpp's expert cache) WIP on branch **`ds4-moe-prefetch`**
-    in worktree **`~/AI/llama.cpp-ds4-prefetch`** (`583f5d173`, 1129 lines). Unverified.
-  - Packets (the full specs + gates): `~/.quetza-data/conductor/packets/{ds4-dense,ds4-moe,llama-prefetch}.md`
-    (+ `_ds4_rules.md` appended). The CMake hooks are already on deepseek4 (`6de177d`, OPTIONAL includes of
-    `tools/ds4/cmake/ds4_{dense,moe,engine}.cmake`).
+## Where it stands
+- Phase 3 DONE (reference forward `tools/ds4/ds4_ref.cpp` matches llama.cpp logits; coherency check `4725894`).
+- Speed verdict GO in the replay: predicted expert prefetch = **20.57 tok/s** at 2150 slots vs llama.cpp 16.34
+  (FINDINGS s12; speed only, random activations, attention a timed stand-in).
+- **The real engine is written and CPU-verified, never run on the GPU, never generated text:**
+  - `6eda16d` **Ds4Dense** (`tools/ds4/ds4_dense.{hpp,cpp}`): one-token decode of attention/compressor/indexer/router/
+    shared expert + the expert predictor. CPU mini gate PASS, every cosine 1.00000000 (`DS4_SWA=16` variant, 40
+    tokens, and the stock mini at 63 tokens). The 160-token stock-mini FAIL is a reference-side ggml-cpu flash-attn
+    artifact (not query-count invariant above 64 queries), documented in the report/ENGINE_DENSE.md.
+  - `71c265c` **Ds4MoeTier** (`tools/ds4/ds4_moe.{hpp,cpp}`): VRAM cache + prefetch + CPU pool + PCIe split as a
+    library. CPU gate PASS (rel 2.3e-7 vs dequant+F32 on real expert slices; I re-ran it).
+  - `565c6cc` **ds4_generate** (`tools/ds4/ds4_generate.cpp`, `cmake/ds4_engine.cmake`) + **ds4_chat.py** (tokenizer +
+    the official DeepSeek-V4-Flash-0731 Jinja template, verified to render/round-trip). Written by me, NOT BUILT yet.
+  - llama.cpp track: worktree `~/AI/llama.cpp-ds4-prefetch`, branch `ds4-moe-prefetch` (`38330da56`):
+    `--moe-prefetch N` built (llama-server/bench), CPU unit test 156 checks 0 failures (I re-ran it). Predicts from the
+    PREVIOUS layer's router input (graph split per layer via cb_eval). Bench harness committed `b04de46`
+    (`bench/ds4-2026-10-06/prefetch/run-config.sh` + `probe.py`).
 
-## Next
-1. Re-dispatch the three slices with a **resume addendum**: "start from the WIP on branch ds4-engine-wip /
-   ds4-moe-prefetch; first make it build, then drive to the packet's gate". Use NEW slice names (e.g. `ds4-dense-2`) -
-   see memory `qc-redispatch-footguns`. For ds4-dense/ds4-moe: either cherry-pick the WIP files into the working
-   tree first (`git checkout ds4-engine-wip -- <their files>`), or have them work on the wip branch in a worktree.
-2. Then a glue slice `ds4-engine` (owns `tools/ds4/cmake/ds4_engine.cmake`): tokenizer + Ds4Dense + Ds4MoeTier +
-   prefetch -> `ds4_generate` CLI.
-3. **GPU steps only when Mal says the GPU is free** (he runs ComfyUI): engine logits gate vs llama.cpp goldens
-   (p600/p3000), a real generation coherence check (greedy paragraphs vs llama.cpp), then decode tok/s for real;
-   llama.cpp `--moe-prefetch 1.4` bench + exactness check (command in `docs/ds4-moe-prefetch.md` of that worktree).
+## Blockers found (fix first)
+1. **`build-ds4-cuda` has `GGML_CUDA=OFF`** - its ggml has no CUDA backend, so Ds4Dense can't run on the GPU there.
+   Configure a separate tree: `cmake -S . -B build-ds4-gpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON
+   -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_GGML_DIR=third_party/llama.cpp` (check the flags against
+   build-ds4-cuda's CMakeCache), then build `test_ds4_dense ds4_ref test_ds4_moe_gpu ds4_generate`.
+2. `test_ds4_dense` hard-codes a CPU backend: add `--cuda` (ggml_backend_init_by_type GPU), keep ds4_ref on CPU.
+3. **SwiGLU clamp - likely a real correctness bug.** DS4 clamps expert `up` to +-10 and `gate` to <= 10 before SwiGLU;
+   Strata's native kernels (CPU `native_gu_rows`, CUDA grouped kernel `src/kernels/cuda/iq_kernels.cu`) don't clamp.
+   `tools/ds4/check_clamp_real.py` (real activations from `bench/ds4-2026-10-06/hidden-probe/h.bin` + the routed
+   experts) reached **10.088 at layer 11** before I stopped it (partial log `bench/ds4-2026-10-06/clamp_real.txt`).
+   It measures |x| for both, so fix it to the real rule (gate only from above), run all 43 layers, and if it binds,
+   add the clamp to both kernels + re-run Phase 2 parity (`ds4_expert_parity`) and `test_ds4_moe`.
+
+## Next, in order (GPU steps only when I say it's free)
+1. Blockers 1-3 (CPU work, can start now).
+2. GPU, smallest first: `test_ds4_dense --cuda` mini gate (same thresholds) -> `test_ds4_moe_gpu --gpu` ->
+   `bash tools/ds4/memguard.sh 64 62 -- build-ds4-gpu/test_ds4_moe_gpu --timing --routes
+   bench/ds4-2026-10-06/hidden-probe/routes.bin --pred bench/ds4-2026-10-06/hidden-probe/pred.bin --profile
+   bench/ds4-2026-10-05/route-probe/ds4routes.bin` (expect ~s12's numbers).
+3. **Real engine:** `ds4_generate` on the real model (through memguard, cap 80 / need 82): first the logits gate -
+   feed p600's tokens (`bench/ds4-2026-10-05/goldens/p600/tokens.i32`) with `--ids-file ... -n 1 --dump-logits`, compare
+   top-1/KL with the golden `result_output`; then coherence: `python3 tools/ds4/ds4_chat.py --raw "def fibonacci(n):"
+   -n 64 --bin build-ds4-gpu/ds4_generate` and a chat prompt; greedy text vs llama.cpp on identical ids; then tok/s.
+4. llama.cpp prefetch bench: for pf in 0 1.0 1.4 2.0: `bash tools/ds4/memguard.sh 80 82 -- bash
+   bench/ds4-2026-10-06/prefetch/run-config.sh $pf pf$pf` (exactness = identical greedy tokens pf0 vs pf1.4).
+5. Record every number in FINDINGS (new s13), commit, update memory note `strata-ds4-port`.
 
 ## Rules (non-negotiable)
-- Never develop in `~/AI/Strata` (production). Work in `~/AI/Strata-DS4` (+ the llama.cpp-ds4-prefetch worktree).
-- **Every big run through `tools/ds4/memguard.sh`** (MemoryMax cap, swap off, 4 GiB watchdog, refuses while ComfyUI
-  is up unless `MEMGUARD_ALLOW_COMFY=1` with Mal's OK). On 2026-10-06 a CPU-only full-model llama.cpp run
-  (`-ngl 0 --load-mode none`, ~81 GB anon) + ComfyUI froze the box - **never do CPU-only full-model runs**.
-- One full-model process at a time; flock `~/.quetza-data/conductor/ds4-gpu.lock`.
-- Measure before concluding; correctness gates before speed claims; record numbers in FINDINGS.md and commit.
-- Don't weaken gates. Ask before pushing to GitHub. Keep tools/results in the repo, not /tmp.
-- `bench/ds4-2026-10-06/hidden-probe/h.bin` (1.4 GB hidden-state dump, untracked) is only needed to re-derive
-  `pred.bin`/`routes.bin` (committed) - safe to delete.
+- **Every full-model load through `tools/ds4/memguard.sh`** (cap + swap off + 4 GiB watchdog + shared lock; refuses
+  while ComfyUI is up). NEVER a CPU-only full-model run (froze the box 2026-10-06). One full-model process at a time.
+- Never develop in `~/AI/Strata` (production). Don't push. Don't weaken gates. Measure before concluding.
+- Never `pgrep -f`/`pkill -f` a pattern that's in your own command line (it self-matches).
+- Untracked, deletable: `bench/ds4-2026-10-06/hidden-probe/h.bin` (1.4 GB; needed by check_clamp_real.py - keep until
+  blocker 3 is done), `bench/ds4-2026-10-05/{goldens-probe*,ref-probe*,ref}`.
