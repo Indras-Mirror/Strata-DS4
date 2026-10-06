@@ -1,6 +1,6 @@
 # MiMo-V2.6-Flash in Strata - start prompt for a second session (written 2026-10-07)
 
-Paste everything below the line into a fresh Claude Code session started in `~/AI` (NOT in `~/AI/Strata-DS4`).
+Paste everything below the line into a fresh Claude Code session started in **`~/AI/Strata-MiMo`**.
 
 ---
 
@@ -9,10 +9,15 @@ on my RTX 4090 24 GB + Ryzen 7 5700X (8c, AVX2 only, no AVX-512) + 90 GB DDR4. A
 DeepSeek-V4-Flash port in `~/AI/Strata-DS4` at the same time - **do not edit files there**. Work solo (no /conductor,
 no worker dispatch - they burn tokens). Measure before concluding; correctness before speed; say what was NOT tested.
 
-## Setup (do this first)
-1. Create your own worktree from the DS4 branch (it has the reusable expert tier, CUDA build fixes, clamp, memguard):
-   `cd ~/AI/Strata-DS4 && git worktree add ~/AI/Strata-MiMo -b mimo deepseek4` - then work ONLY in `~/AI/Strata-MiMo`.
-   Don't push; commit your own paths only.
+## Setup
+1. Your folder is **`~/AI/Strata-MiMo`**: a git worktree on branch `mimo`, created from the DS4 branch (it has the
+   reusable expert tier, CUDA build fixes, SwiGLU clamp option, memguard). Work ONLY there; `~/AI/Strata-DS4` (branch
+   `deepseek4`) is the other session's. Commit your own paths only. **Don't push** - when MiMo works, it gets published
+   the way DS4 was: a public repo `Indras-Mirror/Strata-MiMo` (DS4 is at https://github.com/Indras-Mirror/Strata-DS4).
+   Before any publish: no third-party or private text in the tree (DS4 had to strip two corpus files from its history).
+   Shared kernels (`src/kernels/`, `include/strata/kernels/`): only backward-compatible additions (new formats, opt-in
+   parameters defaulting to old behaviour) so DS4, MiMo and Qwen can be merged into one Strata later; if you must
+   change a shared kernel's behaviour, stop and ask me.
 2. Build tree: `cmake -S . -B build-mimo-gpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON
    -DSTRATA_GGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp` (STRATA_GGML_CUDA
    also turns on GGML_CUDA_GRAPHS - without graphs, decode is launch-bound). ggml-cuda takes ~10 min to compile.
