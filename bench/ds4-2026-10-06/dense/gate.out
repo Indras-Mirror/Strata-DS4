@@ -1,0 +1,35 @@
+[gate] model=bench/ds4-2026-10-06/dense/mini-ds4.gguf D=256 hc=4 heads=2 d_head=64 V=64 swa=128 layers=2
+[gate] tokens=160  paths: raw wrap=yes  csa blocks@last=40  hca blocks@last=1  indexer top_k=8
+[gate] reusing reference dump bench/ds4-2026-10-06/dense/ref-allpos
+
+[gate] per-layer, last position 159, cosine vs ds4_ref --all-pos
+  layer ratio  attn_raw     attn_out     ffn_norm     l_last      
+  0     4      0.5901007    0.9999796    0.9999844    0.9997761   
+      ^ attn_csa_lid FAIL
+      ^ attn_out FAIL
+      ^ ffn_norm FAIL
+      ^ l_last FAIL
+  1     128    0.9594389    0.9996418    0.9997962    0.9993234   
+      ^ attn_hca FAIL
+      ^ attn_out FAIL
+      ^ ffn_norm FAIL
+      ^ l_last FAIL
+
+[gate] per-token logits cosine, all 160 positions, vs ds4_ref --all-pos
+  pos 0: cos 0.99989598 FAIL
+  pos 1: cos 0.99988437 FAIL
+  pos 2: cos 0.99939496 FAIL
+  pos 3: cos 0.99992151 FAIL
+  pos 4: cos 0.99994234 FAIL
+  pos 5: cos 0.99978502 FAIL
+  pos 6: cos 0.99969408 FAIL
+  pos 7: cos 0.99662842 FAIL
+  pos 8: cos 0.99940667 FAIL
+  pos 9: cos 0.99875213 FAIL
+  worst position 61: cos 0.75466706   (gate >= 0.99999), 160 positions below the gate
+  logits top-1 last position: Ds4Dense 26 vs ds4_ref 26 -> identical
+
+[gate] predictor (prefetch hint) recall@16 on the true routed ids, non-hash layers
+  layer 1  0.809
+
+[gate] FAIL (168 failed check(s))

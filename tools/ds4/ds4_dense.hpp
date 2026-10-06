@@ -1,0 +1,96 @@
+// tools/ds4/ds4_dense.hpp - DeepSeek-V4 (`deepseek4`) single-token DECODE of the dense (non-expert) half.
+//
+// Phase 4b of the Strata DS4 engine: one new token per call, at position `pos`, against persistent decode
+// state (raw sliding-window ring, CSA/HCA compressor rings + compressed K caches, lightning-indexer cache).
+// The routed-expert tier is NOT here (slice ds4-moe); this class hands out the ffn_norm activation the
+// experts consume and takes back their weighted sum in `finish_layer`.
+//
+//   begin_token(tid)                     -> hc_init, the layer-0 input state
+//   predict(l, top_ids, n_top)           -> prefetch hint: the layer's router on rms_norm(hc_attn_pre)*ffn_norm.w
+//   attn_router(l, pos, tid, ...)        -> attention (raw + visible compressed + indexer top-k), MoE router
+//                                           ids/weights, the shared expert, and ffn_norm as host f32 + device ptr
+//   finish_layer(l, routed_sum)          -> shared expert + routed sum, hc_post -> next layer state
+//   logits(...)                          -> hc_head, output_norm, output
+//
+// The invariant (and the gate in test_ds4_dense.cpp): token-by-token decode through Ds4Dense plus a plain
+// reference routed-expert computation reproduces ds4_ref's full-sequence forward on the same tokens.
+//
+// State layout, the fixed-shape graph variants and the API are documented in docs/ds4/ENGINE_DENSE.md.
+#pragma once
+
+#include "ggml.h"
+#include "ggml-backend.h"
+
+#include "strata/artifact/ds4_geometry.hpp"
+
+#include <memory>
+#include <string>
+
+/// Construction parameters.  `backend` selects the compute backend (CPU or CUDA - the same code path);
+/// NULL means "create and own a CPU backend".  `comp_cap_max` bounds the compressed-row capacity per layer
+/// (0 = `deepseek4.context_length / ratio`, the model's own maximum).
+struct Ds4DenseConfig {
+    ggml_backend_t backend   = nullptr;
+    int            n_threads = 8;
+    int64_t        comp_cap_max = 0;
+};
+
+/// One-token decode of the DS4 dense half.  Not thread-safe; one instance decodes one sequence.
+class Ds4Dense {
+public:
+    struct Impl;   // opaque, defined in the .cpp (public so the file-local graph builders can see it)
+
+    Ds4Dense();
+    ~Ds4Dense();
+
+    Ds4Dense(const Ds4Dense &)            = delete;
+    Ds4Dense & operator=(const Ds4Dense &) = delete;
+
+    /// Open the GGUF (metadata + tensor map, zero-copy weight bindings), allocate the persistent decode
+    /// state and build the per-layer graphs.  Returns false and fills `err` on failure.
+    bool init(const std::string & model_path, const Ds4DenseConfig & cfg, std::string & err);
+
+    const strata::Ds4Geometry & geom()     const;
+    int64_t                     n_layer()  const;
+    ggml_backend_t              backend()  const;
+    /// Borrowed weight tensor (zero-copy on the CPU backend).  Aborts on an unknown name.
+    ggml_tensor *               weight(const std::string & name) const;
+
+    /// Load the embedding for `tid` into the layer-0 input state (hc_init).  Also records the token id for
+    /// the hash-routed layers.  Call once per token, before `predict(0, ...)`.
+    bool begin_token(int tid);
+
+    /// Expert-prefetch predictor ("A" in tools/ds4/predict_experts.py): the layer's router applied to
+    /// rms_norm(hc_attn_pre_l) * ffn_norm.weight_l.  Hash layers (l < hash_layer_count) return their exact
+    /// tid2eid ids in the first n_expert_used slots.  `top_ids` holds `n_top` entries (n_top <= 16);
+    /// unused slots are set to -1.  A hint only: it does not change the decode result.
+    bool predict(int il, int * top_ids, int n_top);
+
+    /// Attention for layer `il` at position `pos` + the layer's MoE router + the shared expert.
+    /// `routed_ids`/`routed_w` must hold n_expert_used entries; `routed_w` is the final normalised,
+    /// x weights_scale weight as llama.cpp/ds4_ref use it.  `ffn_norm_host` points at the [n_embd] f32
+    /// activation the routed experts consume (`ffn_norm_dev` is the same tensor on the backend).
+    bool attn_router(int il, int pos, int tid,
+                     int * routed_ids, float * routed_w,
+                     const float ** ffn_norm_host, ggml_tensor ** ffn_norm_dev);
+
+    /// Add the routed-expert sum (n_embd f32, host) to the shared expert held from `attn_router` and run the
+    /// ffn hyper-connection into the next layer state.
+    bool finish_layer(int il, const float * routed_sum);
+
+    /// Head for the current state: hc_head -> output_norm -> output.  Valid after the last layer's
+    /// `finish_layer`.  `*out` is a borrowed [n_vocab] f32 host buffer.
+    bool logits(const float ** out, int * n_vocab);
+
+    /// Diagnostics for the gate, all as computed on the last `attn_router`/`finish_layer` call (host copies):
+    /// the flash-attn output before the output LoRA [n_head*d_head], the attention output after it [n_embd],
+    /// and l_last [n_embd*hc].  NULL when unavailable.
+    const float * tap_attn_raw(int il) const;
+    const float * tap_attn_out(int il) const;
+    const float * tap_l_last  (int il) const;
+
+    const std::string & last_error() const;
+
+private:
+    std::unique_ptr<Impl> p_;
+};

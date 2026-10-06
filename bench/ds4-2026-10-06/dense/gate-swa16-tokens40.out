@@ -1,0 +1,14 @@
+
+[gate] per-layer, last position 39, cosine vs ds4_ref --all-pos
+  layer ratio  attn_raw     attn_out     ffn_norm     l_last      
+  0     4      1.0000000    1.0000000    1.0000000    1.0000000   
+  1     128    1.0000000    1.0000000    1.0000000    1.0000000   
+
+[gate] per-token logits cosine, all 40 positions, vs ds4_ref --all-pos
+  worst position 12: cos 1.00000000   (gate >= 0.99999), 0 positions below the gate
+  logits top-1 last position: Ds4Dense 13 vs ds4_ref 13 -> identical
+
+[gate] predictor (prefetch hint) recall@16 on the true routed ids, non-hash layers
+  layer 1  1.000
+
+[gate] PASS (0 failed check(s))

@@ -1,0 +1,14 @@
+  pos 4: cos 0.99991498 FAIL
+  pos 5: cos 0.99991488 FAIL
+  pos 6: cos 0.99994348 FAIL
+  pos 7: cos 0.99991682 FAIL
+  pos 8: cos 0.99994304 FAIL
+  pos 9: cos 0.99995184 FAIL
+  pos 10: cos 0.99994493 FAIL
+  worst position 19: cos 0.99987271   (gate >= 0.99999), 159 positions below the gate
+  logits top-1 last position: Ds4Dense 55 vs ds4_ref 55 -> identical
+
+[gate] predictor (prefetch hint) recall@16 on the true routed ids, non-hash layers
+  layer 1  1.000
+
+[gate] FAIL (161 failed check(s))
