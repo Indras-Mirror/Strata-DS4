@@ -33,6 +33,10 @@ namespace {
 constexpr float NEG_INF  = -INFINITY;
 constexpr float SENTINEL = -1.0e30f;   // "compressor state row not written yet" score: exp() underflows to 0
 
+// Tokens one verify pass carries (the main token + up to 3 drafts).  Every ring is this many - 1 slots longer than
+// its gather window, so a later token of a pass never overwrites a row an earlier token of the same pass reads.
+constexpr int64_t kNtMax = 4;
+
 int64_t next_pow2(int64_t v) {
     int64_t p = 1;
     while (p < v) p <<= 1;
@@ -204,6 +208,7 @@ struct Ds4Dense::Impl {
     }
 
     int64_t D = 0, HC = 0, DH = 0, DHR = 0, NH = 0, OG = 0, OL = 0, OGD = 0, NHPG = 0, RQ = 0, SWA = 0;
+    int64_t RAW = 0;   // raw window ring storage = SWA + kNtMax - 1
     int64_t IDXH = 0, IDXK = 0, IDXTOPK = 0;
     int64_t NEXP = 0, NUSED = 0, NFF = 0, NSHEXP = 0;
 
@@ -233,6 +238,7 @@ struct Ds4Dense::Impl {
         int64_t ratio = 0;
         bool    csa = false;
         int64_t ring = 0, sdim = 0, comp_max = 0;
+        int64_t ring_sz = 0;              // compressor state ring storage = ring + kNtMax - 1
 
         ggml_tensor * raw = nullptr;      // [DH, SWA]              raw sliding-window K (=V, post-RoPE)
         ggml_tensor * comp = nullptr;     // [DH, comp_max]         compressed K (post-RoPE)
@@ -862,7 +868,7 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
     const Ds4Geometry & g = im.g;
     im.D = g.n_embd; im.HC = g.hc; im.DH = g.d_head; im.DHR = g.d_rope; im.NH = g.n_head;
     im.OG = g.o_groups; im.OL = g.o_lora; im.OGD = g.o_group_dim(); im.NHPG = g.n_head / g.o_groups;
-    im.RQ = g.r_q; im.SWA = g.n_swa;
+    im.RQ = g.r_q; im.SWA = g.n_swa; im.RAW = g.n_swa + kNtMax - 1;
     im.IDXH = g.indexer_n_head; im.IDXK = g.indexer_key_dim; im.IDXTOPK = g.indexer_top_k;
     im.NEXP = g.n_expert; im.NUSED = g.n_expert_used; im.NFF = g.n_ff; im.NSHEXP = g.n_expert_shared;
 
@@ -905,11 +911,12 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
             if (L.ratio != 0 && L.ratio != 4 && L.ratio != 128) { err = "unsupported compress ratio"; return false; }
             any_csa = any_csa || L.csa;
             L.ring = L.csa ? 2 * L.ratio : L.ratio;
+            L.ring_sz = L.ring + kNtMax - 1;
             L.sdim = L.csa ? 2 * im.DH : im.DH;
             const int64_t by_ctx = L.ratio != 0 ? std::max<int64_t>(1, g.context_length / L.ratio) : 0;
             L.comp_max = cfg.comp_cap_max > 0 ? std::min<int64_t>(cfg.comp_cap_max, by_ctx) : by_ctx;
 
-            L.raw     = nt2(GGML_TYPE_F32, im.DH, im.SWA);
+            L.raw     = nt2(GGML_TYPE_F32, im.DH, im.RAW);
             L.hap     = nt2(GGML_TYPE_F32, im.D, im.HC);
             L.post_f  = nt1(GGML_TYPE_F32, im.HC);
             L.comb_f  = nt2(GGML_TYPE_F32, im.HC, im.HC);
@@ -934,12 +941,12 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
 
             if (L.ratio != 0) {
                 L.comp  = nt2(GGML_TYPE_F32, im.DH, L.comp_max);
-                L.st_kv = nt2(GGML_TYPE_F32, L.sdim, L.ring);
-                L.st_sc = nt2(GGML_TYPE_F32, L.sdim, L.ring);
+                L.st_kv = nt2(GGML_TYPE_F32, L.sdim, L.ring_sz);
+                L.st_sc = nt2(GGML_TYPE_F32, L.sdim, L.ring_sz);
                 if (L.csa) {
                     L.icomp  = nt2(GGML_TYPE_F32, im.IDXK, L.comp_max);
-                    L.ist_kv = nt2(GGML_TYPE_F32, 2 * im.IDXK, 2 * L.ratio);
-                    L.ist_sc = nt2(GGML_TYPE_F32, 2 * im.IDXK, 2 * L.ratio);
+                    L.ist_kv = nt2(GGML_TYPE_F32, 2 * im.IDXK, L.ring_sz);   // CSA: ring == 2 * ratio
+                    L.ist_sc = nt2(GGML_TYPE_F32, 2 * im.IDXK, L.ring_sz);
                 }
             }
             // every layer (ratio-0 sliding-window layers too): ffn_norm is the expert tier's input
@@ -1008,10 +1015,10 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
         std::vector<float> sent;
         for (Impl::Layer & L : im.ly) {
             if (L.ratio == 0) continue;
-            sent.assign((size_t) (L.sdim * L.ring), SENTINEL);
+            sent.assign((size_t) (L.sdim * L.ring_sz), SENTINEL);
             ggml_backend_tensor_set(L.st_sc, sent.data(), 0, sent.size() * 4);
             if (L.csa) {
-                sent.assign((size_t) (2 * im.IDXK * 2 * L.ratio), SENTINEL);
+                sent.assign((size_t) (2 * im.IDXK * L.ring_sz), SENTINEL);
                 ggml_backend_tensor_set(L.ist_sc, sent.data(), 0, sent.size() * 4);
             }
         }
@@ -1149,13 +1156,13 @@ bool Ds4Dense::attn_router(int il, int pos, int tid, int * routed_ids, float * r
         auto put = [&](ggml_tensor * t, const void * src, size_t n) {
             std::memcpy(im.in_host.data() + ((const uint8_t *) t->data - im.in_base), src, n);
         };
-        const int32_t p32 = pos, s32 = (int32_t) (pos % im.SWA);
+        const int32_t p32 = pos, s32 = (int32_t) (pos % im.RAW);
         put(im.i_pos, &p32, sizeof p32);
         std::vector<int32_t> idx((size_t) im.SWA);
         std::vector<ggml_fp16_t> msk((size_t) im.SWA);
         for (int64_t i = 0; i < im.SWA; ++i) {
             const int64_t tok = (int64_t) pos - im.SWA + 1 + i;
-            idx[(size_t) i] = (int32_t) (((tok % im.SWA) + im.SWA) % im.SWA);
+            idx[(size_t) i] = (int32_t) (((tok % im.RAW) + im.RAW) % im.RAW);
             msk[(size_t) i] = ggml_fp32_to_fp16(tok >= 0 ? 0.0f : NEG_INF);
         }
         std::vector<int32_t> sidx;
@@ -1172,7 +1179,7 @@ bool Ds4Dense::attn_router(int il, int pos, int tid, int * routed_ids, float * r
             const int32_t sp = (int32_t) (pos % Ly.ratio);      // compressor `ape` row
             const int32_t cpp = (int32_t) (Ly.ratio * bl);      // block start, for the compressed-key RoPE
             const int32_t sc = (int32_t) bl;                    // block slot in the compressed caches
-            const int32_t ss = (int32_t) (pos % Ly.ring);       // token slot in the compressor state ring
+            const int32_t ss = (int32_t) (pos % Ly.ring_sz);    // token slot in the compressor state ring
             put(Ly.i_state_pos, &sp, sizeof sp);
             put(Ly.i_comp_pos, &cpp, sizeof cpp);
             put(Ly.i_slot_comp, &sc, sizeof sc);
@@ -1180,7 +1187,7 @@ bool Ds4Dense::attn_router(int il, int pos, int tid, int * routed_ids, float * r
             sidx.resize((size_t) Ly.ring);
             for (int64_t i = 0; i < Ly.ring; ++i) {
                 const int64_t tok = (int64_t) pos - Ly.ring + 1 + i;
-                sidx[(size_t) i] = (int32_t) (((tok % Ly.ring) + Ly.ring) % Ly.ring);
+                sidx[(size_t) i] = (int32_t) (((tok % Ly.ring_sz) + Ly.ring_sz) % Ly.ring_sz);
             }
             put(Ly.i_idx_state, sidx.data(), sidx.size() * 4);
             vis.assign((size_t) cp_, NEG_INF);
