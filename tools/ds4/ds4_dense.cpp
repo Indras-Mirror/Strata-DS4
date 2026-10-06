@@ -144,6 +144,16 @@ struct Ds4Dense::Impl {
 
     WStore          w;
     ggml_context *  sctx = nullptr;     // persistent decode state
+    // Per-step inputs and per-layer router outputs live at fixed offsets in two small buffers so a token costs ONE
+    // upload of every layer's inputs and one readback per layer (was ~11 tensor_set + 3 tensor_get per layer, each a
+    // stream sync on CUDA: 1283 copies + 905 syncs per token measured by nsys).
+    ggml_context *  ictx = nullptr;
+    ggml_backend_buffer_t ibuf = nullptr, obuf = nullptr;
+    ggml_tensor *   i_span = nullptr;   // I8 over the whole input buffer
+    std::vector<uint8_t> in_host;       // its host mirror
+    uint8_t *       in_base = nullptr;  // device base of ibuf (offsets are t->data - in_base)
+    int             in_pos = -1;        // the position whose inputs are uploaded
+    int             cur_tid = -1;       // the token id in i_tid
     ggml_backend_buffer_t sbuf = nullptr;
     ggml_context *  gctx = nullptr;     // graph node structs (data comes from the gallocrs)
     std::string     err;
@@ -224,6 +234,11 @@ struct Ds4Dense::Impl {
         ggml_gallocr_t allo_finish = nullptr;
         std::vector<float> host_fn, host_attn_raw, host_attn, host_llast;
         bool have_attn = false, have_finish = false;
+        ggml_tensor * vis_full = nullptr; // F32 [comp_max]   compressed-row visibility (graphs view [cap])
+        ggml_tensor * o_ids = nullptr;    // I32 [NUSED]      router ids    } one contiguous block with fn,
+        ggml_tensor * o_wts = nullptr;    // F32 [NUSED]      router weights} read back by one tensor_get
+        ggml_tensor * o_span = nullptr;   // I8 over [fn | ids | wts]
+        std::vector<uint8_t> host_out;
     };
     std::vector<Layer> ly;
 
@@ -241,6 +256,9 @@ struct Ds4Dense::Impl {
         if (allo_init) ggml_gallocr_free(allo_init);
         if (allo_head) ggml_gallocr_free(allo_head);
         if (sbuf) ggml_backend_buffer_free(sbuf);
+        if (ibuf) ggml_backend_buffer_free(ibuf);
+        if (obuf) ggml_backend_buffer_free(obuf);
+        if (ictx) ggml_free(ictx);
         if (sctx) ggml_free(sctx);
         if (gctx) ggml_free(gctx);
         if (own_backend && backend) ggml_backend_free(backend);
@@ -537,8 +555,7 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, Ds4Den
             sc = ggml_cont(gc, ggml_permute(gc, sc, 2, 1, 0, 3));           // [cap, 1, 1]
             sc = ggml_reshape_2d(gc, sc, cap, 1);
 
-            var.vis = ggml_new_tensor_2d(gc, GGML_TYPE_F32, cap, 1);
-            ggml_set_input(var.vis);
+            var.vis = ggml_view_2d(gc, L.vis_full, cap, 1, (size_t) cap * sizeof(float), 0);
             sc = ggml_add(gc, sc, var.vis);
             var.dbg_isc = sc;
             ggml_set_output(sc);
@@ -573,8 +590,7 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, Ds4Den
             comp_k = b.rope_at(cc, L.i_comp_pos, DHR, DH - DHR, n_ctx, crb,
                                freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
 
-            var.vis = ggml_new_tensor_2d(gc, GGML_TYPE_F32, cap, 1);
-            ggml_set_input(var.vis);
+            var.vis = ggml_view_2d(gc, L.vis_full, cap, 1, (size_t) cap * sizeof(float), 0);
             cmask = ggml_cast(gc, var.vis, GGML_TYPE_F16);
         }
 
@@ -669,6 +685,8 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, Ds4Den
     for (ggml_tensor * t : { c_fn, c_hap, c_pf, c_cf, c_sh, c_ar, c_at }) ggml_build_forward_expand(gf, t);
     ggml_build_forward_expand(gf, selected);
     ggml_build_forward_expand(gf, wts);
+    ggml_build_forward_expand(gf, ggml_cpy(gc, ggml_reshape_1d(gc, selected, im.NUSED), L.o_ids));
+    ggml_build_forward_expand(gf, ggml_cpy(gc, ggml_reshape_1d(gc, wts, im.NUSED), L.o_wts));
 
     var.gf = gf;
     var.out_ids = selected;
@@ -822,12 +840,22 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
 
         auto nt2 = [&](ggml_type ty, int64_t n0, int64_t n1) { return ggml_new_tensor_2d(im.sctx, ty, n0, n1); };
         auto nt1 = [&](ggml_type ty, int64_t n0) { return ggml_new_tensor_1d(im.sctx, ty, n0); };
+        ggml_init_params ipi = { /*mem_size*/ 16ull * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
+        im.ictx = ggml_init(ipi);
+        if (!im.ictx) { err = "ggml_init(inputs) failed"; return false; }
+        std::vector<ggml_tensor *> in_list;                    // placed back to back in ibuf
+        auto in1 = [&](ggml_type ty, int64_t n0) {
+            ggml_tensor * t = ggml_new_tensor_1d(im.ictx, ty, n0);
+            in_list.push_back(t);
+            return t;
+        };
+        auto on1 = [&](ggml_type ty, int64_t n0) { return ggml_new_tensor_1d(im.ictx, ty, n0); };
 
         im.x_state    = nt2(GGML_TYPE_F32, im.D, im.HC);
         im.routed_sum = nt1(GGML_TYPE_F32, im.D);
         im.i_tid      = nt1(GGML_TYPE_I32, 1);
         im.i_emb      = nt1(GGML_TYPE_F32, im.D);
-        im.i_pos      = nt1(GGML_TYPE_I32, 1);
+        im.i_pos      = in1(GGML_TYPE_I32, 1);
 
         im.ly.resize((size_t) nl);
         for (int64_t il = 0; il < nl; ++il) {
@@ -846,19 +874,22 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
             L.post_f  = nt1(GGML_TYPE_F32, im.HC);
             L.comb_f  = nt2(GGML_TYPE_F32, im.HC, im.HC);
             L.shexp   = nt1(GGML_TYPE_F32, im.D);
-            L.fn      = nt1(GGML_TYPE_F32, im.D);
+            L.fn      = on1(GGML_TYPE_F32, im.D);
+            L.o_ids   = on1(GGML_TYPE_I32, im.NUSED);
+            L.o_wts   = on1(GGML_TYPE_F32, im.NUSED);
             L.t_attn_raw = nt1(GGML_TYPE_F32, im.NH * im.DH);
             L.t_attn  = nt1(GGML_TYPE_F32, im.D);
             L.t_llast = nt2(GGML_TYPE_F32, im.D, im.HC);
 
-            L.i_slot_raw  = nt1(GGML_TYPE_I32, 1);
-            L.i_idx_raw   = nt1(GGML_TYPE_I32, im.SWA);
-            L.i_mask_raw  = nt1(GGML_TYPE_F16, im.SWA);
-            L.i_slot_comp = nt1(GGML_TYPE_I32, 1);
-            L.i_slot_state = nt1(GGML_TYPE_I32, 1);
-            L.i_comp_pos  = nt1(GGML_TYPE_I32, 1);
-            L.i_state_pos = nt1(GGML_TYPE_I32, 1);
-            L.i_idx_state = nt1(GGML_TYPE_I32, L.ring);
+            L.i_slot_raw  = in1(GGML_TYPE_I32, 1);
+            L.i_idx_raw   = in1(GGML_TYPE_I32, im.SWA);
+            L.i_mask_raw  = in1(GGML_TYPE_F16, im.SWA);
+            L.i_slot_comp = in1(GGML_TYPE_I32, 1);
+            L.i_slot_state = in1(GGML_TYPE_I32, 1);
+            L.i_comp_pos  = in1(GGML_TYPE_I32, 1);
+            L.i_state_pos = in1(GGML_TYPE_I32, 1);
+            L.i_idx_state = in1(GGML_TYPE_I32, std::max<int64_t>(1, L.ring));
+            if (L.ratio != 0) L.vis_full = in1(GGML_TYPE_F32, L.comp_max);
 
             if (L.ratio != 0) {
                 L.comp  = nt2(GGML_TYPE_F32, im.DH, L.comp_max);
@@ -883,6 +914,53 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
         im.sbuf = ggml_backend_alloc_ctx_tensors_from_buft(im.sctx, ggml_backend_get_default_buffer_type(im.backend));
         if (!im.sbuf) { err = "cannot allocate the persistent decode state"; return false; }
         ggml_backend_buffer_clear(im.sbuf, 0);
+
+        // ---- the input span and the per-layer output blocks: tensors placed at fixed offsets ----
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(im.backend);
+        const size_t al = std::max<size_t>(64, ggml_backend_buft_get_alignment(buft));
+        auto up = [&](size_t n) { return (n + al - 1) / al * al; };
+        size_t in_bytes = 0;
+        for (ggml_tensor * t : in_list) in_bytes += up(ggml_nbytes(t));
+        im.ibuf = ggml_backend_buft_alloc_buffer(buft, in_bytes + al);
+        if (!im.ibuf) { err = "cannot allocate the input span"; return false; }
+        im.in_base = (uint8_t *) ggml_backend_buffer_get_base(im.ibuf);
+        {
+            size_t off = 0;
+            for (ggml_tensor * t : in_list) {
+                if (ggml_backend_tensor_alloc(im.ibuf, t, im.in_base + off) != GGML_STATUS_SUCCESS) {
+                    err = "cannot place an input tensor"; return false;
+                }
+                off += up(ggml_nbytes(t));
+            }
+            im.i_span = ggml_new_tensor_1d(im.ictx, GGML_TYPE_I8, (int64_t) in_bytes);
+            if (ggml_backend_tensor_alloc(im.ibuf, im.i_span, im.in_base) != GGML_STATUS_SUCCESS) {
+                err = "cannot place the input span"; return false;
+            }
+            im.in_host.assign(in_bytes, 0);
+        }
+        size_t out_bytes = 0;
+        const size_t blk = up(ggml_row_size(GGML_TYPE_F32, im.D)) + up(4 * im.NUSED) + up(4 * im.NUSED);
+        out_bytes = blk * (size_t) nl;
+        im.obuf = ggml_backend_buft_alloc_buffer(buft, out_bytes + al);
+        if (!im.obuf) { err = "cannot allocate the router output blocks"; return false; }
+        {
+            uint8_t * ob = (uint8_t *) ggml_backend_buffer_get_base(im.obuf);
+            for (int64_t il = 0; il < nl; ++il) {
+                Impl::Layer & L = im.ly[(size_t) il];
+                uint8_t * b0 = ob + (size_t) il * blk;
+                const size_t o1 = up(ggml_nbytes(L.fn)), o2 = o1 + up(ggml_nbytes(L.o_ids));
+                if (ggml_backend_tensor_alloc(im.obuf, L.fn, b0) != GGML_STATUS_SUCCESS ||
+                    ggml_backend_tensor_alloc(im.obuf, L.o_ids, b0 + o1) != GGML_STATUS_SUCCESS ||
+                    ggml_backend_tensor_alloc(im.obuf, L.o_wts, b0 + o2) != GGML_STATUS_SUCCESS) {
+                    err = "cannot place a router output block"; return false;
+                }
+                L.o_span = ggml_new_tensor_1d(im.ictx, GGML_TYPE_I8, (int64_t) (o2 + ggml_nbytes(L.o_wts)));
+                if (ggml_backend_tensor_alloc(im.obuf, L.o_span, b0) != GGML_STATUS_SUCCESS) {
+                    err = "cannot place a router output span"; return false;
+                }
+                L.host_out.assign((size_t) ggml_nbytes(L.o_span), 0);
+            }
+        }
 
         // compressor score rings start at SENTINEL: a token that was never written gets weight 0, exactly
         // like ds4_ref's zero/-inf row appended for the first block's missing previous half
@@ -949,6 +1027,7 @@ bool Ds4Dense::begin_token(int tid) {
     if (!ggml_gallocr_alloc_graph(im.allo_init, im.gf_init)) { im.err = "gallocr(init) failed"; return false; }
     const int32_t t = tid;
     ggml_backend_tensor_set(im.i_tid, &t, 0, sizeof t);
+    im.cur_tid = tid;
     // embd[tid] on the host, exactly what get_rows + cast computes (F16 -> F32 is exact; quantized rows dequantize
     // with the same to_float)
     if (tid < 0 || tid >= im.g.vocab_size) { im.err = "token id out of range"; return false; }
@@ -1019,16 +1098,18 @@ bool Ds4Dense::attn_router(int il, int pos, int tid, int * routed_ids, float * r
     }
     if (!ggml_gallocr_alloc_graph(var->allo, var->gf)) { im.err = "gallocr(attn) failed"; return false; }
 
-    // ---- per-step inputs (after alloc: gallocr owns the `vis` buffer) -------------------
-    {
+    // ---- per-step inputs: every layer's, for this position, in ONE upload per token ------------
+    if (tid >= 0 && tid != im.cur_tid) {
+        const int32_t t32 = tid;
+        ggml_backend_tensor_set(im.i_tid, &t32, 0, sizeof t32);
+        im.cur_tid = tid;
+    }
+    if (pos != im.in_pos) {
+        auto put = [&](ggml_tensor * t, const void * src, size_t n) {
+            std::memcpy(im.in_host.data() + ((const uint8_t *) t->data - im.in_base), src, n);
+        };
         const int32_t p32 = pos, s32 = (int32_t) (pos % im.SWA);
-        ggml_backend_tensor_set(im.i_pos, &p32, 0, sizeof p32);
-        if (tid >= 0) {
-            const int32_t t32 = tid;
-            ggml_backend_tensor_set(im.i_tid, &t32, 0, sizeof t32);
-        }
-        ggml_backend_tensor_set(L.i_slot_raw, &s32, 0, sizeof s32);
-
+        put(im.i_pos, &p32, sizeof p32);
         std::vector<int32_t> idx((size_t) im.SWA);
         std::vector<ggml_fp16_t> msk((size_t) im.SWA);
         for (int64_t i = 0; i < im.SWA; ++i) {
@@ -1036,30 +1117,37 @@ bool Ds4Dense::attn_router(int il, int pos, int tid, int * routed_ids, float * r
             idx[(size_t) i] = (int32_t) (((tok % im.SWA) + im.SWA) % im.SWA);
             msk[(size_t) i] = ggml_fp32_to_fp16(tok >= 0 ? 0.0f : NEG_INF);
         }
-        ggml_backend_tensor_set(L.i_idx_raw, idx.data(), 0, idx.size() * 4);
-        ggml_backend_tensor_set(L.i_mask_raw, msk.data(), 0, msk.size() * 2);
-
-        if (L.ratio != 0) {
-            const int32_t sp = (int32_t) (pos % L.ratio);      // compressor `ape` row
-            const int32_t cp = (int32_t) (L.ratio * b);        // block start, for the compressed-key RoPE
-            const int32_t sc = (int32_t) b;                    // block slot in the compressed caches
-            const int32_t ss = (int32_t) (pos % L.ring);       // token slot in the compressor state ring
-            ggml_backend_tensor_set(L.i_state_pos, &sp, 0, sizeof sp);
-            ggml_backend_tensor_set(L.i_comp_pos, &cp, 0, sizeof cp);
-            ggml_backend_tensor_set(L.i_slot_comp, &sc, 0, sizeof sc);
-            ggml_backend_tensor_set(L.i_slot_state, &ss, 0, sizeof ss);
-
-            std::vector<int32_t> sidx((size_t) L.ring);
-            for (int64_t i = 0; i < L.ring; ++i) {
-                const int64_t tok = (int64_t) pos - L.ring + 1 + i;
-                sidx[(size_t) i] = (int32_t) (((tok % L.ring) + L.ring) % L.ring);
+        std::vector<int32_t> sidx;
+        std::vector<float> vis;
+        for (Impl::Layer & Ly : im.ly) {
+            put(Ly.i_slot_raw, &s32, sizeof s32);
+            put(Ly.i_idx_raw, idx.data(), idx.size() * 4);
+            put(Ly.i_mask_raw, msk.data(), msk.size() * 2);
+            if (Ly.ratio == 0) continue;
+            const int64_t bl = pos / Ly.ratio;
+            if (bl >= Ly.comp_max) continue;   // attn_router refuses this layer below
+            const int64_t cp_ = std::min<int64_t>(Ly.comp_max, next_pow2(bl + 1));
+            const int64_t nv = (pos + 1) / Ly.ratio;
+            const int32_t sp = (int32_t) (pos % Ly.ratio);      // compressor `ape` row
+            const int32_t cpp = (int32_t) (Ly.ratio * bl);      // block start, for the compressed-key RoPE
+            const int32_t sc = (int32_t) bl;                    // block slot in the compressed caches
+            const int32_t ss = (int32_t) (pos % Ly.ring);       // token slot in the compressor state ring
+            put(Ly.i_state_pos, &sp, sizeof sp);
+            put(Ly.i_comp_pos, &cpp, sizeof cpp);
+            put(Ly.i_slot_comp, &sc, sizeof sc);
+            put(Ly.i_slot_state, &ss, sizeof ss);
+            sidx.resize((size_t) Ly.ring);
+            for (int64_t i = 0; i < Ly.ring; ++i) {
+                const int64_t tok = (int64_t) pos - Ly.ring + 1 + i;
+                sidx[(size_t) i] = (int32_t) (((tok % Ly.ring) + Ly.ring) % Ly.ring);
             }
-            ggml_backend_tensor_set(L.i_idx_state, sidx.data(), 0, sidx.size() * 4);
-
-            std::vector<float> vis((size_t) cap, NEG_INF);
-            for (int64_t i = 0; i < n_vis && i < cap; ++i) vis[(size_t) i] = 0.0f;
-            ggml_backend_tensor_set(var->vis, vis.data(), 0, vis.size() * 4);
+            put(Ly.i_idx_state, sidx.data(), sidx.size() * 4);
+            vis.assign((size_t) cp_, NEG_INF);
+            for (int64_t i = 0; i < nv && i < cp_; ++i) vis[(size_t) i] = 0.0f;
+            put(Ly.vis_full, vis.data(), vis.size() * 4);
         }
+        ggml_backend_tensor_set(im.i_span, im.in_host.data(), 0, im.in_host.size());
+        im.in_pos = pos;
     }
 
     if (ggml_backend_graph_compute(im.backend, var->gf) != GGML_STATUS_SUCCESS) {
@@ -1077,14 +1165,13 @@ bool Ds4Dense::attn_router(int il, int pos, int tid, int * routed_ids, float * r
     }
     // ---- router outputs + hand-offs -----------------------------------------------------
     {
-        std::vector<int32_t> ids((size_t) im.NUSED);
-        ggml_backend_tensor_get(var->out_ids, ids.data(), 0, ids.size() * 4);
-        for (int64_t i = 0; i < im.NUSED; ++i) routed_ids[i] = ids[(size_t) i];
-        std::vector<float> wv((size_t) im.NUSED);
-        ggml_backend_tensor_get(var->out_wts, wv.data(), 0, wv.size() * 4);
-        for (int64_t i = 0; i < im.NUSED; ++i) routed_w[i] = wv[(size_t) i];
+        ggml_backend_tensor_get(L.o_span, L.host_out.data(), 0, L.host_out.size());   // [fn | ids | wts]
+        const uint8_t * b0 = (const uint8_t *) L.fn->data;
+        const int32_t * ids = (const int32_t *) (L.host_out.data() + ((const uint8_t *) L.o_ids->data - b0));
+        const float * wv = (const float *) (L.host_out.data() + ((const uint8_t *) L.o_wts->data - b0));
+        for (int64_t i = 0; i < im.NUSED; ++i) { routed_ids[i] = ids[i]; routed_w[i] = wv[i]; }
+        std::memcpy(L.host_fn.data(), L.host_out.data(), (size_t) im.D * 4);
     }
-    if (!L.host_fn.empty()) ggml_backend_tensor_get(L.fn, L.host_fn.data(), 0, L.host_fn.size() * 4);
     if (!L.host_attn_raw.empty()) ggml_backend_tensor_get(L.t_attn_raw, L.host_attn_raw.data(), 0, L.host_attn_raw.size() * 4);
     if (!L.host_attn.empty()) ggml_backend_tensor_get(L.t_attn, L.host_attn.data(), 0, L.host_attn.size() * 4);
 
