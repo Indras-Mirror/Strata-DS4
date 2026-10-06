@@ -1222,6 +1222,31 @@ bool Ds4Dense::attn_router(int il, int pos, int tid, int * routed_ids, float * r
     return true;
 }
 
+bool Ds4Dense::reserve_graphs() {
+    Impl & im = *p_;
+    for (int il = 0; il < (int) im.ly.size(); ++il) {
+        Impl::Layer & L = im.ly[(size_t) il];
+        std::vector<int64_t> caps;
+        if (L.ratio == 0) caps.push_back(0);
+        else {
+            for (int64_t c = 1; c < L.comp_max; c *= 2) caps.push_back(c);
+            caps.push_back(L.comp_max);
+        }
+        for (int64_t cap : caps) {
+            Impl::Var * var = nullptr;
+            for (Impl::Var & v : L.vars)
+                if (v.cap == cap) { var = &v; break; }
+            if (!var) { build_attn(im, il, cap, L); var = &L.vars.back(); }
+            if (!ggml_gallocr_reserve(var->allo, var->gf)) { im.err = "reserve: attention graph"; return false; }
+        }
+        if (L.gf_predict && !ggml_gallocr_reserve(L.allo_predict, L.gf_predict)) { im.err = "reserve: predict"; return false; }
+        if (L.gf_finish && !ggml_gallocr_reserve(L.allo_finish, L.gf_finish)) { im.err = "reserve: finish"; return false; }
+    }
+    if (im.gf_init && !ggml_gallocr_reserve(im.allo_init, im.gf_init)) { im.err = "reserve: init"; return false; }
+    if (im.gf_head && !ggml_gallocr_reserve(im.allo_head, im.gf_head)) { im.err = "reserve: head"; return false; }
+    return true;
+}
+
 void Ds4Dense::set_route_bias(int il, const float * bias) {
     Impl & im = *p_;
     if (il < 0 || il >= (int) im.ly.size() || !im.ly[(size_t) il].rbias) return;

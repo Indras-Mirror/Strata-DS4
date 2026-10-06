@@ -40,7 +40,8 @@ struct Args {
     int n_predict = 64;
     std::string backend = "cuda";   // dense half
     std::string experts = "gpu";    // routed tier: gpu (cache + prefetch + CPU/PCIe) | cpu (pool only)
-    int64_t slots = 2150;
+    int64_t slots = 2150;   // <= 0: auto (free VRAM after the dense half, minus --vram-margin)
+    double vram_margin_gib = 0.9;
     double pcie = 0.25, pf_b = 1.43, arena_gib = 60.0;
     int threads = 0;
     int64_t ctx = 0;   // context cap for the compressed-KV state (0 = prompt + n_predict + 64)
@@ -82,7 +83,8 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "-n" || k == "--n-predict") a.n_predict = std::atoi(next().c_str());
         else if (k == "--backend") a.backend = next();
         else if (k == "--experts") a.experts = next();
-        else if (k == "--slots") a.slots = std::atoll(next().c_str());
+        else if (k == "--slots") { const std::string v = next(); a.slots = v == "auto" ? 0 : std::atoll(v.c_str()); }
+        else if (k == "--vram-margin") a.vram_margin_gib = std::atof(next().c_str());
         else if (k == "--pcie") a.pcie = std::atof(next().c_str());
         else if (k == "--pf-b") a.pf_b = std::atof(next().c_str());
         else if (k == "--profile") a.profile = next();
@@ -160,6 +162,15 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "context cap %lld tokens\n", (long long) ctx);
     std::string err;
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds4_generate: dense init: %s\n", err.c_str()); return 1; }
+    if (!dense.reserve_graphs()) { std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str()); return 1; }
+    if (a.slots <= 0) {
+        size_t fr = 0, tot = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot);
+        const double blob = 6.75 * 1048576.0;   // one DS4 expert (IQ2_XXS gate/up + Q2_K down)
+        a.slots = std::max<int64_t>(0, (int64_t) (((double) fr - a.vram_margin_gib * 1073741824.0) / blob));
+        std::fprintf(stderr, "slots auto: %.2f GiB free after the dense half -> %lld slots (margin %.2f GiB)\n",
+                     fr / 1073741824.0, (long long) a.slots, a.vram_margin_gib);
+    }
 
     // ---- routed-expert tier
     namespace ds4 = strata::ds4;

@@ -96,6 +96,9 @@ public:
     /// Cache-aware routing: `bias` (n_expert floats) is added to layer `il`'s expert SELECTION score (not to the mixing
     /// weights) from the next attention graph on.  Zeros = the model's routing.  Hash layers ignore it.
     void set_route_bias(int il, const float * bias);
+    /// Build and allocate every attention-graph variant up to the context cap (and the per-layer predict/finish graphs)
+    /// now, so the VRAM they need is taken at load - not when the context first reaches a new capacity mid-run.
+    bool reserve_graphs();
     const float * tap_attn_raw(int il) const;
     const float * tap_attn_out(int il) const;
     const float * tap_l_last  (int il) const;
