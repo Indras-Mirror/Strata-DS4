@@ -15,7 +15,8 @@
 //
 // --multi PATTERN then decodes the same tokens again on a second instance in multi-token passes (Ds4Dense::*_n),
 // pass sizes cycling through PATTERN, and checks every position's logits against the one-token decode: the
-// multi-token graph must reproduce one-token decoding (max |diff| / max |logit| <= 1e-5, top-1 identical).
+// multi-token graph must reproduce one-token decoding (max |diff| / max |logit| <= 1e-5, top-1 identical).  With
+// --cuda, whose kernels change with the column count, it must instead be as close to ds4_ref as the one-token decode.
 // --dump-logits writes the one-token decode's logits (all positions, f32) for bit-exactness checks across builds.
 //
 // The decoder runs on the CPU backend by default; --cuda puts Ds4Dense (and the test-side expert reference) on
@@ -452,8 +453,27 @@ int main(int argc, char ** argv) {
         std::printf("  bit-identical positions %lld/%lld; worst max|diff|/max|logit| %.3g at position %lld; worst cos %.10f; "
                     "top-1 differs at %lld positions\n", (long long) n_exact, (long long) nt, worst_rel, (long long) wr_t,
                     worst_cos, (long long) n_top_diff);
-        if (worst_rel > 1e-5) { std::printf("  ^ multi-token FAIL (gate 1e-5)\n"); fails++; }
-        if (n_top_diff) { std::printf("  ^ multi-token top-1 FAIL\n"); fails++; }
+        // the noise floor: both decodes against the CPU oracle (ds4_ref), and the first positions' differences
+        double ws = 2, wm = 2;
+        for (int64_t t = 0; t < nt; ++t) {
+            ws = std::min(ws, cosine(my_logits[(size_t) t].data(), r_logits + (size_t) t * V, (size_t) V));
+            wm = std::min(wm, cosine(ml[(size_t) t].data(), r_logits + (size_t) t * V, (size_t) V));
+        }
+        std::printf("  vs ds4_ref: one-token worst cos %.10f, multi-token worst cos %.10f\n", ws, wm);
+        std::printf("  rel diff by position:");
+        for (int64_t t = 0; t < std::min<int64_t>(nt, 12); ++t) {
+            const float * a = ml[(size_t) t].data(), * r = my_logits[(size_t) t].data();
+            double md = 0, mx = 0;
+            for (int64_t v = 0; v < V; ++v) { md = std::max(md, (double) std::fabs(a[v] - r[v])); mx = std::max(mx, (double) std::fabs(r[v])); }
+            std::printf(" %lld:%.2g", (long long) t, md / (mx + 1e-30));
+        }
+        std::printf("\n");
+        if (!use_cuda) {   // CPU: the kernels do not depend on the column count - the passes must reproduce it
+            if (worst_rel > 1e-5) { std::printf("  ^ multi-token FAIL (gate 1e-5)\n"); fails++; }
+            if (n_top_diff) { std::printf("  ^ multi-token top-1 FAIL\n"); fails++; }
+        } else {           // CUDA picks other kernels for n > 1 columns: gate on the oracle, not bit equality
+            if (wm < ws - 1e-4) { std::printf("  ^ multi-token FAIL: further from ds4_ref than one-token decoding\n"); fails++; }
+        }
     }
 
     std::printf("\n[gate] %s (%d failed check(s))\n", fails == 0 ? "PASS" : "FAIL", fails);

@@ -30,8 +30,15 @@ generation, 128 tokens after a 75-token prompt; quality = perplexity over a 600-
 | --- | ---: | ---: |
 | llama.cpp, best config (`-ngl 99 -cmoe --moe-expert-cache 40 -fa on`) | 16.3 tok/s | - |
 | **Strata-DS4**, file weights as shipped | **17.0 tok/s** | 10.49 |
-| **Strata-DS4**, `--dense-requant q6_k --slots auto` (recommended) | **19.1-19.4 tok/s** | 10.55 |
+| **Strata-DS4**, `--dense-requant q6_k --slots auto` | **16.8-17.3 tok/s** | 10.47-10.64 |
+| **Strata-DS4**, `--dense-requant q6_k --slots auto --route-bias 0.05` (recommended) | **19.1 tok/s** | 10.77 |
+| Strata-DS4, `--dense-requant q6_k --slots 2350` (at the VRAM edge, may OOM mid-run) | 19.35 tok/s | 10.55 |
 | Strata-DS4, + `--route-bias 0.2` (lossy, see below) | 22.0 tok/s | 11.50 |
+
+Perplexity moves by up to ~0.2 between identical runs: which experts the CPU and which the GPU computes depends on
+timing, and the two paths round differently (q8_1 vs Q8_K activations). The VRAM expert cache is worth a lot here:
+`--slots auto` keeps ~2230 slots (headroom for every attention-graph variant) against 2350 hand-set, and the hit rate
+drops from ~75% to ~68%.
 
 The first token's logits match llama.cpp's (same top-1; KL 0.03-0.10, which is the difference between the GPU's and
 the CPU's 8-bit activation rounding - perplexity is the same whichever path computes the experts). Prompt processing
