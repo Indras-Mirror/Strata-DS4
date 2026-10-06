@@ -54,11 +54,16 @@ then `docs/ds4/ENGINE_DENSE.md` and `docs/ds4/ENGINE_MOE.md`. (Written 2026-10-0
    bench/ds4-2026-10-06/prefetch/run-config.sh $pf pf$pf` (exactness = identical greedy tokens pf0 vs pf1.4).
 5. Record every number in FINDINGS (new s13), commit, update memory note `strata-ds4-port`.
 
-## Backlog (after DeepSeek-V4 reaches a real tok/s number)
-- **MiMo-V2.6-Flash** (309B MoE, 256 experts top-8, same 4096x2048 expert shape as DS4): desk study in
-  `docs/mimo/MIMO_V26_FEASIBILITY.md`. Mal's interest: GSQ-RCO 3-bit (115.7 GB - spills ~8 GiB to NVMe here) and a
-  2-bit RCO uncensored (doesn't exist; Heretic rank-1 LoRA `MorinoNushi/MiMo-V2.6-Flash-RL-Uncensored-Heretic-LoRA-GGUF`
-  applies to any quant). First step: measure MiMo's routing skew; nothing big downloaded yet.
+## Next workload after DeepSeek-V4: MiMo-V2.6-Flash in Strata (Mal confirmed 2026-10-06)
+- Plan/estimates: `docs/mimo/MIMO_V26_FEASIBILITY.md`. Same 4096x2048 expert shape as DS4 (Ds4MoeTier reusable, top-8),
+  simpler attention (hybrid SWA/global), 256 experts x 47 layers.
+- **Files** (downloading overnight via `"/media/mal/SSD NVME/Models/MiMo-V2.6-Flash-RL-GSQ-RCO/fetch.sh"`, check its
+  `fetch.log` for `ALL VERIFIED OK`): GSQ-RCO 3-bit GGUF (115.7 GB) + Heretic rank-1 uncensor LoRA (70 MB).
+- Order: (1) llama.cpp baseline: 3-bit `-cmoe` +/- `--lora` under memguard (it does NOT fit RAM+VRAM: ~8 GiB pages
+  from NVMe; mmap, not --load-mode none); (2) route-probe MiMo's routing skew (route_probe.cpp generalised to K=8);
+  (3) Strata port: mimo2 dense half (like Ds4Dense), Q3_K + MXFP4 expert kernels (CPU AVX2 + CUDA), a "VRAM-only
+  resident" arena mode, LoRA support in the expert tier if the Heretic LoRA touches expert tensors; (4) consider a
+  ~2.3 bpw build (fits fully; est. 16-20 tok/s) if the 3-bit spill hurts.
 
 ## Rules (non-negotiable)
 - **Every full-model load through `tools/ds4/memguard.sh`** (cap + swap off + 4 GiB watchdog + shared lock; refuses
