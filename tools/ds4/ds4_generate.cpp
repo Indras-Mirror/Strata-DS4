@@ -1,0 +1,244 @@
+// tools/ds4/ds4_generate.cpp - the Strata DeepSeek-V4 decode engine end to end: Ds4Dense (attention + router +
+// shared expert, on the CUDA or CPU ggml backend) + Ds4MoeTier (routed experts: VRAM cache, predicted prefetch,
+// CPU pool, PCIe share) + greedy/temperature sampling.  Token ids in, token ids out (one per line on stdout,
+// flushed as they are produced); text <-> ids is tools/ds4/ds4_chat.py's job (the tokenizer is Python, as in serve/).
+//
+//   ds4_generate -m model.gguf --ids 1,2,3 -n 64 [--backend cuda|cpu] [--experts gpu|cpu]
+//                [--slots 2150] [--pcie 0.25] [--pf-b 1.43] [--profile ds4routes.bin] [--arena-gib 60]
+//                [--threads 7] [--temp 0] [--seed 1] [--stop 1,2] [--dump-logits f.f32]
+//
+// Per token, per layer (the order FINDINGS s11/s12 measured):
+//     predict(l) -> tier.prefetch(l)   the prefetch DMAs start before layer l's attention
+//     attn_router(l)                   attention + router + shared expert (the DMAs overlap it)
+//     tier.run(l)                      routed experts: hits + prefetched on the GPU, misses CPU/PCIe
+//     finish_layer(l)                  shared + routed, hc_post
+// The prompt is fed through the same one-token path (prefill = decode loop for now; Phase 5 owns batched prefill).
+//
+// Load the real model ONLY through tools/ds4/memguard.sh (it froze the box once without it):
+//   bash tools/ds4/memguard.sh 80 82 -- build-ds4-cuda/ds4_generate -m <gguf> --ids ... -n 64
+#include "ds4_dense.hpp"
+#include "ds4_moe.hpp"
+
+#include "ggml.h"
+#include "ggml-backend.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <random>
+#include <string>
+#include <vector>
+
+namespace {
+
+struct Args {
+    std::string model, ids_csv, ids_file, profile, dump_logits;
+    int n_predict = 64;
+    std::string backend = "cuda";   // dense half
+    std::string experts = "gpu";    // routed tier: gpu (cache + prefetch + CPU/PCIe) | cpu (pool only)
+    int64_t slots = 2150;
+    double pcie = 0.25, pf_b = 1.43, arena_gib = 60.0;
+    int threads = 0;
+    float temp = 0.0f;
+    uint64_t seed = 1;
+    std::vector<int> stop;
+    bool quiet = false;
+};
+
+std::vector<int> parse_csv(const std::string& s) {
+    std::vector<int> v;
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t j = s.find(',', i);
+        if (j == std::string::npos) j = s.size();
+        if (j > i) v.push_back(std::atoi(s.substr(i, j - i).c_str()));
+        i = j + 1;
+    }
+    return v;
+}
+
+void usage() {
+    std::fprintf(stderr,
+        "usage: ds4_generate -m model.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend cuda|cpu]\n"
+        "       [--experts gpu|cpu] [--slots 2150] [--pcie 0.25] [--pf-b 1.43] [--profile ds4routes.bin]\n"
+        "       [--arena-gib 60] [--threads N] [--temp 0] [--seed 1] [--stop id,id] [--dump-logits f.f32] [--quiet]\n");
+}
+
+bool parse(int argc, char** argv, Args& a) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string k = argv[i];
+        auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : std::string(); };
+        if (k == "-m" || k == "--model") a.model = next();
+        else if (k == "--ids") a.ids_csv = next();
+        else if (k == "--ids-file") a.ids_file = next();
+        else if (k == "-n" || k == "--n-predict") a.n_predict = std::atoi(next().c_str());
+        else if (k == "--backend") a.backend = next();
+        else if (k == "--experts") a.experts = next();
+        else if (k == "--slots") a.slots = std::atoll(next().c_str());
+        else if (k == "--pcie") a.pcie = std::atof(next().c_str());
+        else if (k == "--pf-b") a.pf_b = std::atof(next().c_str());
+        else if (k == "--profile") a.profile = next();
+        else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
+        else if (k == "--threads") a.threads = std::atoi(next().c_str());
+        else if (k == "--temp") a.temp = (float) std::atof(next().c_str());
+        else if (k == "--seed") a.seed = (uint64_t) std::atoll(next().c_str());
+        else if (k == "--stop") a.stop = parse_csv(next());
+        else if (k == "--dump-logits") a.dump_logits = next();
+        else if (k == "--quiet") a.quiet = true;
+        else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
+    }
+    return !a.model.empty() && (!a.ids_csv.empty() || !a.ids_file.empty());
+}
+
+double now_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+int sample(const float* logits, int n_vocab, float temp, std::mt19937_64& rng) {
+    if (temp <= 0.0f) return (int) (std::max_element(logits, logits + n_vocab) - logits);
+    const float mx = *std::max_element(logits, logits + n_vocab);
+    std::vector<double> p((size_t) n_vocab);
+    double z = 0;
+    for (int i = 0; i < n_vocab; ++i) z += (p[(size_t) i] = std::exp((double) (logits[i] - mx) / temp));
+    std::uniform_real_distribution<double> u(0.0, z);
+    double r = u(rng);
+    for (int i = 0; i < n_vocab; ++i) if ((r -= p[(size_t) i]) <= 0) return i;
+    return n_vocab - 1;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    Args a;
+    if (!parse(argc, argv, a)) { usage(); return 2; }
+
+    std::vector<int> prompt = a.ids_csv.empty() ? std::vector<int>() : parse_csv(a.ids_csv);
+    if (!a.ids_file.empty()) {
+        std::ifstream f(a.ids_file, std::ios::binary | std::ios::ate);
+        if (!f) { std::fprintf(stderr, "ds4_generate: cannot open %s\n", a.ids_file.c_str()); return 2; }
+        const size_t n = (size_t) f.tellg() / 4;
+        f.seekg(0);
+        prompt.resize(n);
+        f.read((char*) prompt.data(), (std::streamsize) (n * 4));
+    }
+    if (prompt.empty()) { std::fprintf(stderr, "ds4_generate: empty prompt\n"); return 2; }
+
+    // ---- dense half on the chosen backend
+    ggml_backend_t be = nullptr;
+    if (a.backend == "cuda") be = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    else be = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!be) { std::fprintf(stderr, "ds4_generate: no %s backend in this build\n", a.backend.c_str()); return 2; }
+    std::fprintf(stderr, "dense backend: %s\n", ggml_backend_name(be));
+
+    const double t_load0 = now_ms();
+    Ds4Dense dense;
+    Ds4DenseConfig dc;
+    dc.backend = be;
+    dc.n_threads = a.threads > 0 ? a.threads : 8;
+    std::string err;
+    if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds4_generate: dense init: %s\n", err.c_str()); return 1; }
+
+    // ---- routed-expert tier
+    namespace ds4 = strata::ds4;
+    ds4::Ds4MoeTier tier;
+    ds4::Ds4MoeConfig mc;
+    mc.slots = a.slots;
+    mc.pcie_frac = a.pcie;
+    mc.pf_b = a.pf_b;
+    mc.threads = a.threads;
+    mc.arena_gib = a.arena_gib;
+    mc.cpu_only = a.experts == "cpu";
+    if (!tier.init(a.model, mc, err)) { std::fprintf(stderr, "ds4_generate: tier init: %s\n", err.c_str()); return 1; }
+    if (!a.profile.empty() && !mc.cpu_only && !tier.seed_from_routes(a.profile, err)) {
+        std::fprintf(stderr, "ds4_generate: profile: %s\n", err.c_str());
+        return 1;
+    }
+    std::fprintf(stderr, "tier: %s, %lld resident slots, arena %.1f GiB (%lld experts), file tier %lld; load %.1f s\n",
+                 tier.mode(), (long long) tier.resident(), tier.arena_gib(), (long long) tier.arena_experts(),
+                 (long long) tier.file_tier(), (now_ms() - t_load0) / 1000.0);
+
+    const int n_layer = (int) dense.n_layer();
+    const int top_k = (int) tier.geom().top_k;
+    const int kPredW = ds4::Ds4MoeConfig::kPredW;
+    const int64_t n_embd = tier.geom().n_embd;
+    std::vector<int> ids_i((size_t) top_k), pred_i((size_t) kPredW);
+    std::vector<int32_t> ids32((size_t) top_k), pred32((size_t) kPredW);
+    std::vector<float> w((size_t) top_k), routed((size_t) n_embd);
+    std::mt19937_64 rng(a.seed);
+
+    // one token through every layer; returns false on any engine error
+    auto step = [&](int tid, int pos) -> bool {
+        if (!dense.begin_token(tid)) return false;
+        for (int l = 0; l < n_layer; ++l) {
+            if (!mc.cpu_only && mc.pf_b > 0 && dense.predict(l, pred_i.data(), kPredW)) {
+                int n = 0;
+                for (int i = 0; i < kPredW && pred_i[(size_t) i] >= 0; ++i) pred32[(size_t) n++] = pred_i[(size_t) i];
+                if (n > 0) tier.prefetch(l, pred32.data(), n);
+            }
+            const float* x = nullptr;
+            ggml_tensor* x_dev = nullptr;
+            if (!dense.attn_router(l, pos, tid, ids_i.data(), w.data(), &x, &x_dev)) return false;
+            for (int k = 0; k < top_k; ++k) ids32[(size_t) k] = ids_i[(size_t) k];
+            if (!tier.run(l, ids32.data(), w.data(), x, routed.data())) return false;
+            if (!dense.finish_layer(l, routed.data())) return false;
+        }
+        return true;
+    };
+
+    // ---- prefill (decode loop over the prompt)
+    tier.reset_stats();
+    const double t_pf0 = now_ms();
+    for (size_t i = 0; i < prompt.size(); ++i) {
+        if (!step(prompt[i], (int) i)) {
+            std::fprintf(stderr, "ds4_generate: prefill failed at %zu: %s\n", i, dense.last_error().c_str());
+            return 1;
+        }
+    }
+    const double pf_ms = now_ms() - t_pf0;
+    const ds4::Ds4MoeStats pf_stats = tier.stats();
+
+    // ---- decode
+    tier.reset_stats();
+    int pos = (int) prompt.size();
+    int n_gen = 0;
+    const float* lg = nullptr;
+    int n_vocab = 0;
+    const double t_dec0 = now_ms();
+    for (; n_gen < a.n_predict; ++n_gen) {
+        if (!dense.logits(&lg, &n_vocab)) { std::fprintf(stderr, "ds4_generate: logits: %s\n", dense.last_error().c_str()); return 1; }
+        if (n_gen == 0 && !a.dump_logits.empty()) {
+            if (std::FILE* f = std::fopen(a.dump_logits.c_str(), "wb")) { std::fwrite(lg, 4, (size_t) n_vocab, f); std::fclose(f); }
+        }
+        const int tok = sample(lg, n_vocab, a.temp, rng);
+        std::printf("%d\n", tok);
+        std::fflush(stdout);
+        if (std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end()) { ++n_gen; break; }
+        if (n_gen + 1 == a.n_predict) { ++n_gen; break; }   // the last token needs no forward pass
+        if (!step(tok, pos++)) {
+            std::fprintf(stderr, "ds4_generate: decode failed at pos %d: %s\n", pos - 1, dense.last_error().c_str());
+            return 1;
+        }
+    }
+    const double dec_ms = now_ms() - t_dec0;
+    const ds4::Ds4MoeStats st = tier.stats();
+    const int dec_steps = std::max(1, n_gen - 1);   // forward passes actually run during decode
+
+    std::fprintf(stderr, "\nprefill: %zu tokens in %.2f s = %.2f tok/s (decode-loop prefill)\n", prompt.size(),
+                 pf_ms / 1000.0, 1000.0 * (double) prompt.size() / pf_ms);
+    std::fprintf(stderr, "decode : %d tokens, %d forward passes in %.2f s = %.2f tok/s\n", n_gen, dec_steps,
+                 dec_ms / 1000.0, 1000.0 * dec_steps / dec_ms);
+    const double look = (double) std::max<int64_t>(1, st.lookups());
+    std::fprintf(stderr, "experts/token: hit %.1f%% (prefetched-useful %.1f/token of %.1f issued), cpu %.1f%%, "
+                         "pcie %.1f%%, file tier %lld\n",
+                 100.0 * (double) st.hits / look, (double) st.prefetched_useful / dec_steps,
+                 (double) st.prefetch_issued / dec_steps, 100.0 * (double) st.cpu / look,
+                 100.0 * (double) st.pcie / look, (long long) st.file_tier);
+    (void) pf_stats;
+    tier.close();
+    ggml_backend_free(be);
+    return 0;
+}

@@ -1,0 +1,17 @@
+# tools/ds4/cmake/ds4_engine.cmake - the end-to-end DS4 decode engine (Ds4Dense + Ds4MoeTier + sampling).
+# include()d (OPTIONAL) at the end of the root CMakeLists.txt, after ds4_dense.cmake / ds4_moe.cmake.
+#   build-ds4-cuda: ds4_generate      (dense on the CUDA backend, the full expert tier)
+#   build-ds4     : ds4_generate_cpu  (CPU backend + the CPU-only tier; for the mini model and machines w/o a GPU)
+set(_ds4_engine_inc ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4)
+if(TARGET ds4_dense AND TARGET ds4_moe_cuda)
+  add_executable(ds4_generate ${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/ds4_generate.cpp)
+  target_include_directories(ds4_generate PRIVATE ${_ds4_engine_inc})
+  target_link_libraries(ds4_generate PRIVATE ds4_dense ds4_moe_cuda ggml ggml-base)
+  if(TARGET ggml-cuda)
+    target_link_libraries(ds4_generate PRIVATE ggml-cuda)
+  endif()
+elseif(TARGET ds4_dense AND TARGET ds4_moe_cpu)
+  add_executable(ds4_generate_cpu ${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/ds4_generate.cpp)
+  target_include_directories(ds4_generate_cpu PRIVATE ${_ds4_engine_inc})
+  target_link_libraries(ds4_generate_cpu PRIVATE ds4_dense ds4_moe_cpu ggml ggml-cpu ggml-base)
+endif()
