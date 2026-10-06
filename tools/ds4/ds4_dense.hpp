@@ -12,6 +12,11 @@
 //   finish_layer(l, routed_sum)          -> shared expert + routed sum, hc_post -> next layer state
 //   logits(...)                          -> hc_head, output_norm, output
 //
+// Multi-token passes (speculative verify): the *_n calls run n <= max_tokens() consecutive positions pos0..pos0+n-1
+// through the same steps in one graph per step; each token attends exactly what it would one token at a time (the
+// raw window and compressed blocks up to its own position, including blocks completed earlier in the pass).
+// All decode state is position-indexed, so a rejected draft is undone by decoding its position again.
+//
 // The invariant (and the gate in test_ds4_dense.cpp): token-by-token decode through Ds4Dense plus a plain
 // reference routed-expert computation reproduces ds4_ref's full-sequence forward on the same tokens.
 //
@@ -60,6 +65,7 @@ public:
 
     const strata::Ds4Geometry & geom()     const;
     int64_t                     n_layer()  const;
+    int                         max_tokens() const;   ///< tokens a multi-token pass may carry
     ggml_backend_t              backend()  const;
     /// Borrowed weight tensor (zero-copy on the CPU backend).  Aborts on an unknown name.
     ggml_tensor *               weight(const std::string & name) const;
@@ -67,6 +73,8 @@ public:
     /// Load the embedding for `tid` into the layer-0 input state (hc_init).  Also records the token id for
     /// the hash-routed layers.  Call once per token, before `predict(0, ...)`.
     bool begin_token(int tid);
+    /// begin_token for a pass of `n` tokens (consecutive positions).  predict() then hints for tokens[0].
+    bool begin_tokens(const int * tids, int n);
 
     /// Expert-prefetch predictor ("A" in tools/ds4/predict_experts.py): the layer's router applied to
     /// rms_norm(hc_attn_pre_l) * ffn_norm.weight_l.  Hash layers (l < hash_layer_count) return their exact
@@ -81,24 +89,32 @@ public:
     bool attn_router(int il, int pos, int tid,
                      int * routed_ids, float * routed_w,
                      const float ** ffn_norm_host, ggml_tensor ** ffn_norm_dev);
+    /// attn_router for the pass begun by begin_tokens(tids, n), positions pos0..pos0+n-1.  `routed_ids`/`routed_w`
+    /// hold n * n_expert_used entries (token-major); `*ffn_norm_host` points at n * n_embd floats (token-major).
+    bool attn_router_n(int il, int pos0, int n, int * routed_ids, float * routed_w, const float ** ffn_norm_host);
 
     /// Add the routed-expert sum (n_embd f32, host) to the shared expert held from `attn_router` and run the
     /// ffn hyper-connection into the next layer state.
     bool finish_layer(int il, const float * routed_sum);
+    /// finish_layer for an n-token pass: `routed_sum` is n * n_embd floats (token-major).
+    bool finish_layer_n(int il, int n, const float * routed_sum);
 
     /// Head for the current state: hc_head -> output_norm -> output.  Valid after the last layer's
     /// `finish_layer`.  `*out` is a borrowed [n_vocab] f32 host buffer.
     bool logits(const float ** out, int * n_vocab);
+    /// Head for every token of an n-token pass: `*out` is n * n_vocab floats (token-major).
+    bool logits_n(int n, const float ** out, int * n_vocab);
 
     /// Diagnostics for the gate, all as computed on the last `attn_router`/`finish_layer` call (host copies):
     /// the flash-attn output before the output LoRA [n_head*d_head], the attention output after it [n_embd],
-    /// and l_last [n_embd*hc].  NULL when unavailable.
+    /// and l_last [n_embd*hc], of the last token of the pass.  NULL when unavailable.
     /// Cache-aware routing: `bias` (n_expert floats) is added to layer `il`'s expert SELECTION score (not to the mixing
     /// weights) from the next attention graph on.  Zeros = the model's routing.  Hash layers ignore it.
     void set_route_bias(int il, const float * bias);
     /// Build and allocate every attention-graph variant up to the context cap (and the per-layer predict/finish graphs)
     /// now, so the VRAM they need is taken at load - not when the context first reaches a new capacity mid-run.
-    bool reserve_graphs();
+    /// `n_max` > 1 also reserves the multi-token variants up to that pass size.
+    bool reserve_graphs(int n_max = 1);
     const float * tap_attn_raw(int il) const;
     const float * tap_attn_out(int il) const;
     const float * tap_l_last  (int il) const;

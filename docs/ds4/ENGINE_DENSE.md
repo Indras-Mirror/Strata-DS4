@@ -24,6 +24,7 @@ ggml-cuda capture the decode graphs as CUDA graphs.
 | `finish_layer(il, routed_sum)` | `ffn_out = shexp + routed_sum`, then `hc_post` -> the next layer state |
 | `logits(&out, &n_vocab)` | `hc_head` -> `output_norm` -> `output` |
 | `tap_attn_raw/attn_out/l_last(il)` | host copies for the gate (pre output-LoRA attention, post-LoRA attention, `l_last`) |
+| `begin_tokens / attn_router_n / finish_layer_n / logits_n` | the same steps for a **pass of n <= `max_tokens()` (4) consecutive positions** (speculative verify); arrays are token-major, the single-token calls are these with n = 1 |
 
 `predict` is a hint only: it does not change the decode result.  `attn_router`'s `routed_w` is already
 normalised, `x weights_scale`, the way llama.cpp and `ds4_ref` use it.
@@ -55,6 +56,30 @@ Per layer `l`, ratio `r = compress_ratios[l]`, `csa = (r == 4)`:
 
 `comp_max = context_length / r` (or the `comp_cap_max` override).
 
+## Multi-token passes (verify)
+
+A pass of n tokens at positions `pos0 .. pos0+n-1` runs the same per-layer steps as one token, in one graph per step.
+Every per-token tensor (`x_state`, `routed_sum`, `hap`, `post_f`, `comb_f`, `shexp`, the taps, the input leaves) has a
+`kNtMax = 4` axis; the graphs for n view its first n columns, so the n = 1 graphs compute exactly what they did before
+(the single-token logits are byte-identical to the pre-change build on both mini fixtures).
+
+* **raw window**: one gather of the union window (`SWA + n - 1` keys, oldest -> newest) and a per-query mask
+  `[n_kv, n]` (query t sees `[pos_t - SWA + 1, pos_t]`); one flash-attn for all n queries.
+* **compressor rings**: every token's state is written (one `set_rows`) before any token gathers its own `ring` slots
+  (`i_idx_state` is `[ring, n]`, flattened: ggml's `get_rows` does not broadcast a 2-D index).  The rings are
+  `kNtMax - 1` slots longer than the gather window, so a later token never overwrites a slot an earlier one reads.
+* **compressed caches**: each token writes its block's row; a block completed by token t is visible (per-query
+  visibility `[cap, n]`) to tokens > t, never to earlier ones.  Two tokens of a pass in the same block would both
+  write that row and `set_rows` does not order duplicate indices, so the earlier one writes to a spare row
+  (`comp_max`, never visible) - only the block-completing write is ever attended.
+* **indexer**: scores, top-k and the mask are per query (`set_rows` broadcasts the `[ntk, n]` top-k indices over
+  the query axis).
+* router, shared expert, hyper-connections and head take n columns; router outputs are per-token blocks
+  `[fn | ids | wts]`, one readback per layer per pass.
+
+Rollback after a rejected draft is free: all of this state is position-indexed and rewritten when the position is
+decoded again.
+
 ## Graphs
 
 `init`, `head`, `predict` and `finish` are one graph each per layer; attention is built **per capacity**
@@ -67,7 +92,8 @@ it had bound - one shared allocator therefore leaves every other graph's tensors
 memory as soon as one graph grows.  Per-graph arenas also give each decode graph the stable, dedicated
 buffer CUDA graph capture needs.
 
-Per-step values arrive through input leaves (`i_pos`, `i_tid`, `i_slot_raw`, `i_idx_raw`, `i_mask_raw`,
+Attention variants are keyed by `(cap, n)`; init/head/finish are built per n on first use (`reserve_graphs(n_max)`
+allocates all of them up front).  Per-step values arrive through input leaves (`i_pos`, `i_tid`, `i_slot_raw`, `i_idx_raw`, `i_mask_raw`,
 `i_slot_state`, `i_slot_comp`, `i_comp_pos`, `i_state_pos`, `i_idx_state`, the per-variant `vis`), so the
 graphs themselves never change shape.
 
@@ -107,6 +133,12 @@ and the ratio-128 HCA block only become reachable at `>= 128` tokens, i.e. insid
 The ratio-128 HCA *visible* block is the one path left un-gated: it only becomes visible at position
 127, so its value (compressed-key rope/norm, softmax over the 128 state rows) is exercised with
 `cap = 1` but output-masked, and is validated by construction (shared code with the CSA path) only.
+
+Multi-token gate (`--multi 2,3,1,4`: a second instance decodes the same tokens in passes cycling through those sizes,
+compared with the one-token decode at every position): **bit-identical at all 40 / 63 positions on swa16 / tame**,
+passes of 1, 2, 3 and 4 tokens.  The gate was mutation-tested: leaking a later token's block visibility, dropping the
+raw window's per-query upper bound, or removing the spare compressed row each fail it.  Not yet run: the `--cuda`
+variant (n > 1 flash-attn with d_head 512 on ggml-cuda, strided I32 copies).
 
 ## Backend / CUDA tree
 

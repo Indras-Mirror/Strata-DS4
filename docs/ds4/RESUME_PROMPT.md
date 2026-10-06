@@ -34,15 +34,13 @@ the stock fixture the indexer top-k ties at exact zeros break differently on CUD
 ## In progress: multi-token verify + the MTP draft head
 1. DONE (`97ae1b9`): rings sized for multi-token passes (raw window storage SWA+3, state rings ring+3); n=1 unchanged
    (CPU mini gate bit-exact).
-2. NEXT: the n-token attention graph in `tools/ds4/ds4_dense.cpp` - design:
-   - per-step inputs and persistent hand-offs (`x_state`, `routed_sum`, per-layer `hap/post_f/comb_f/shexp/fn`,
-     router outputs) get an n axis (kNtMax = 4); graph variants keyed by (cap, n); `reserve_graphs` covers n=1,2;
-   - raw keys gathered oldest->newest over the union window (SWA+n-1 keys) with a per-query mask [n_kv, n] (n=1 =
-     today's graph exactly); one flash_attn for all n queries;
-   - compressor/indexer state updates unrolled per token, comp-row writes chained (a block completed by token 0 is
-     visible to token 1, never the reverse); indexer scores/top-k/mask batched per query;
-   - projections, fused hc ops, router, shared expert, head all take n columns.
-   Gate: CPU mini - a 2-token pass must match two 1-token passes (~1e-6); n=1 still bit-exact vs ds4_ref.
+2. DONE (CPU): the n-token attention graph - `Ds4Dense::begin_tokens / attn_router_n / finish_layer_n / logits_n`
+   (n <= 4; docs/ds4/ENGINE_DENSE.md "Multi-token passes").  CPU gate `--multi 2,3,1,4`: bit-identical to one-token
+   decoding at every position on both mini fixtures; n=1 logits byte-identical to the pre-change build; mutation-tested.
+   **Still to run on the GPU** (when free): `build-ds4-gpu/test_ds4_dense <fixture> --cuda --multi 2,3,1,4` (n>1
+   flash-attn at d_head 512 on CUDA, strided I32 copies), then ds4_generate unchanged-speed check (state grew a little).
+   Follow-up: the per-pass input upload carries `vis` as comp_max*4 floats per compressed layer (~0.35 ms/token at 32K
+   context) - build visibility on the device from i_pos if long contexts matter.
 3. Then the MTP head as a 44th layer: `/media/mal/NVME1TB/Models/DS4-MTP/DeepSeek-V4-Flash-MTP-bf16.gguf` (philpax,
    sha verified). Layer 43 is a ratio-0 sliding-window layer: inputs h_t (main final hc streams, before the head) and
    embd(t+1) -> hnorm/enorm -> concat -> nextn.eh_proj -> normal DS4 layer (own SWA KV) -> hc_head ->

@@ -4,6 +4,7 @@
 // mul_mat_id, right here in the test) reproduces ds4_ref's full-sequence forward on the same tokens.
 //
 //   test_ds4_dense <mini.gguf> [--tokens N] [--work DIR] [--ref-dir DIR] [--ref-bin PATH] [--cuda]
+//                  [--multi 2,3,1,4] [--dump-logits FILE]
 //
 // It writes a deterministic token file, runs `ds4_ref --all-pos` into <work>/ref-allpos, decodes the same
 // tokens one at a time, and checks:
@@ -11,6 +12,11 @@
 //     attn_csa_lid / attn_hca), on attn_out, on ffn_norm and on l_last (hc streams)
 //   * logits: top-1 identical at the last position and cosine >= 0.99999
 //   * per-token logits cosine for ALL positions, all >= 0.99999
+//
+// --multi PATTERN then decodes the same tokens again on a second instance in multi-token passes (Ds4Dense::*_n),
+// pass sizes cycling through PATTERN, and checks every position's logits against the one-token decode: the
+// multi-token graph must reproduce one-token decoding (max |diff| / max |logit| <= 1e-5, top-1 identical).
+// --dump-logits writes the one-token decode's logits (all positions, f32) for bit-exactness checks across builds.
 //
 // The decoder runs on the CPU backend by default; --cuda puts Ds4Dense (and the test-side expert reference) on
 // ggml's GPU backend (needs a tree built with -DSTRATA_GGML_CUDA=ON, i.e. build-ds4-gpu). ds4_ref, the oracle,
@@ -139,6 +145,7 @@ int main(int argc, char ** argv) {
     std::string model, work = "bench/ds4-2026-10-06/dense", refbin, refdir;
     int nt_tokens = 0;
     bool use_cuda = false;
+    std::string multi, dump_logits;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -152,6 +159,8 @@ int main(int argc, char ** argv) {
         else if (a == "--ref-dir")  refdir = next();
         else if (a == "--ref-bin")  refbin = next();
         else if (a == "--cuda")     use_cuda = true;
+        else if (a == "--multi")    multi = next();
+        else if (a == "--dump-logits") dump_logits = next();
         else if (a == "-h" || a == "--help") {
             std::printf("usage: test_ds4_dense <mini.gguf> [--tokens N] [--work DIR] [--ref-dir DIR] [--ref-bin PATH] [--cuda]\n");
             return 0;
@@ -315,6 +324,12 @@ int main(int argc, char ** argv) {
         my_logits[(size_t) t].assign(lg, lg + nv);
     }
 
+    if (!dump_logits.empty()) {
+        std::ofstream out(dump_logits, std::ios::binary);
+        for (const auto & v : my_logits) out.write((const char *) v.data(), (std::streamoff) v.size() * 4);
+        std::printf("[gate] one-token logits written to %s\n", dump_logits.c_str());
+    }
+
     // ---- comparison --------------------------------------------------------------------
     int fails = 0;
     std::printf("\n[gate] per-layer, last position %lld, cosine vs ds4_ref --all-pos\n", (long long) t_last);
@@ -371,6 +386,74 @@ int main(int argc, char ** argv) {
         if (il < (int) g.hash_layer_count || pred_tot[(size_t) il] == 0) continue;
         std::printf("  layer %-2lld %.3f\n", (long long) il,
                     (double) pred_hits[(size_t) il] / (double) pred_tot[(size_t) il]);
+    }
+
+    // ---- multi-token passes vs the one-token decode ---------------------------------------
+    if (!multi.empty()) {
+        std::vector<int> pat;
+        for (size_t i = 0; i < multi.size();) {
+            const size_t j = multi.find(',', i);
+            pat.push_back(std::atoi(multi.substr(i, j == std::string::npos ? std::string::npos : j - i).c_str()));
+            if (j == std::string::npos) break;
+            i = j + 1;
+        }
+        Ds4Dense d2;
+        if (!d2.init(model, cfg, err)) { std::fprintf(stderr, "[gate] multi init failed: %s\n", err.c_str()); return 1; }
+        for (int p : pat)
+            if (p < 1 || p > d2.max_tokens()) { std::fprintf(stderr, "[gate] --multi: sizes 1..%d\n", d2.max_tokens()); return 1; }
+        const int64_t K = g.n_expert_used;
+        std::vector<std::vector<float>> ml((size_t) nt);
+        std::vector<int> mids((size_t) (K * d2.max_tokens()));
+        std::vector<float> mw((size_t) (K * d2.max_tokens())), rs((size_t) (D * d2.max_tokens()));
+        std::vector<int> sizes_seen(d2.max_tokens() + 1, 0);
+        int64_t t0 = 0;
+        for (size_t pi = 0; t0 < nt; ++pi) {
+            const int n = (int) std::min<int64_t>(pat[pi % pat.size()], nt - t0);
+            sizes_seen[(size_t) n]++;
+            if (!d2.begin_tokens(tokens.data() + t0, n)) { std::fprintf(stderr, "[gate] begin_tokens: %s\n", d2.last_error().c_str()); return 1; }
+            for (int64_t il = 0; il < nl; ++il) {
+                const float * fn = nullptr;
+                if (!d2.attn_router_n((int) il, (int) t0, n, mids.data(), mw.data(), &fn)) {
+                    std::fprintf(stderr, "[gate] attn_router_n(l=%lld,pos0=%lld,n=%d): %s\n", (long long) il,
+                                 (long long) t0, n, d2.last_error().c_str());
+                    return 1;
+                }
+                for (int t = 0; t < n; ++t) {
+                    const float * rsum = nullptr;
+                    if (!moe[(size_t) il].run(fn + (size_t) t * D, mids.data() + t * K, mw.data() + t * K, &rsum)) {
+                        std::fprintf(stderr, "[gate] MoE reference run failed\n");
+                        return 1;
+                    }
+                    std::copy(rsum, rsum + D, rs.begin() + (size_t) t * D);
+                }
+                if (!d2.finish_layer_n((int) il, n, rs.data())) { std::fprintf(stderr, "[gate] finish_layer_n: %s\n", d2.last_error().c_str()); return 1; }
+            }
+            const float * lg = nullptr;
+            int nv = 0;
+            if (!d2.logits_n(n, &lg, &nv)) { std::fprintf(stderr, "[gate] logits_n: %s\n", d2.last_error().c_str()); return 1; }
+            for (int t = 0; t < n; ++t) ml[(size_t) (t0 + t)].assign(lg + (size_t) t * nv, lg + (size_t) (t + 1) * nv);
+            t0 += n;
+        }
+        std::printf("\n[gate] multi-token passes (pattern %s; passes by size:", multi.c_str());
+        for (int n = 1; n <= d2.max_tokens(); ++n) std::printf(" %d:%d", n, sizes_seen[(size_t) n]);
+        std::printf(") vs the one-token decode\n");
+        double worst_rel = 0, worst_cos = 2;
+        int64_t wr_t = -1, n_top_diff = 0, n_exact = 0;
+        for (int64_t t = 0; t < nt; ++t) {
+            const float * a = ml[(size_t) t].data(), * r = my_logits[(size_t) t].data();
+            double md = 0, mx = 0;
+            for (int64_t v = 0; v < V; ++v) { md = std::max(md, (double) std::fabs(a[v] - r[v])); mx = std::max(mx, (double) std::fabs(r[v])); }
+            const double rel = md / (mx + 1e-30);
+            if (rel > worst_rel) { worst_rel = rel; wr_t = t; }
+            if (md == 0) n_exact++;
+            worst_cos = std::min(worst_cos, cosine(a, r, (size_t) V));
+            if (argmax(a, V) != argmax(r, V)) n_top_diff++;
+        }
+        std::printf("  bit-identical positions %lld/%lld; worst max|diff|/max|logit| %.3g at position %lld; worst cos %.10f; "
+                    "top-1 differs at %lld positions\n", (long long) n_exact, (long long) nt, worst_rel, (long long) wr_t,
+                    worst_cos, (long long) n_top_diff);
+        if (worst_rel > 1e-5) { std::printf("  ^ multi-token FAIL (gate 1e-5)\n"); fails++; }
+        if (n_top_diff) { std::printf("  ^ multi-token top-1 FAIL\n"); fails++; }
     }
 
     std::printf("\n[gate] %s (%d failed check(s))\n", fails == 0 ? "PASS" : "FAIL", fails);
