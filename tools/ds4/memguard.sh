@@ -29,6 +29,9 @@ if [ "$a" -lt "$NEED" ]; then
     exit 3
 fi
 
+# a ggml abort attaches gdb for a backtrace - on a 75 GB process that ate the last free RAM (2026-10-07, after a
+# CUDA OOM); the error message is enough
+export GGML_NO_BACKTRACE="${GGML_NO_BACKTRACE:-1}"
 unit="ds4-guard-$$"
 echo "memguard: scope $unit MemoryMax=${MAX}G swap=0 floor=${FLOOR} GiB (avail ${a} GiB)"
 flock "$LOCK" systemd-run --user --scope -q --unit="$unit" -p MemoryMax="${MAX}G" -p MemorySwapMax=0 "$@" &

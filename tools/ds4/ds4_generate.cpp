@@ -19,6 +19,10 @@
 //
 // --mtp FILE (the MTP head's GGUF) drafts with it alongside plain decoding and reports the acceptance rate - the
 // output is unchanged (step 1 of speculative decoding: measure before building the verify loop).
+// --mtp FILE --verify: speculative decoding, greedy only.  Each pass runs [token, MTP draft] through the trunk as one
+// 2-token pass (experts of the two tokens read once, Ds4MoeTier::run_multi); the draft is kept when it equals the
+// trunk's argmax, which also yields the next token for free.  A rejected draft's position is simply decoded again
+// (all state is position-indexed).  Same tokens as plain greedy decoding, up to GPU rounding.
 #include "ds4_dense.hpp"
 #include "ds4_moe.hpp"
 
@@ -60,6 +64,7 @@ struct Args {
     bool ppl = false;
     float route_bias = 0.0f;
     std::string mtp;             // the MTP head's GGUF: draft + acceptance stats
+    bool verify = false;         // --verify: speculative decoding with the MTP draft
     std::string dense_requant;   // q4_k | q5_k | q6_k: requantize the big Q8_0 dense matrices at load   // cache-aware routing: + this to the selection score of VRAM-resident experts   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
 };
 
@@ -109,6 +114,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--dense-requant") a.dense_requant = next();
         else if (k == "--route-bias") a.route_bias = (float) std::atof(next().c_str());
         else if (k == "--mtp") a.mtp = next();
+        else if (k == "--verify") a.verify = true;
         else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (!a.ids_csv.empty() || !a.ids_file.empty());
@@ -226,6 +232,10 @@ int main(int argc, char** argv) {
         f.read((char*) prompt.data(), (std::streamsize) (n * 4));
     }
     if (prompt.empty()) { std::fprintf(stderr, "ds4_generate: empty prompt\n"); return 2; }
+    if (a.verify && (a.mtp.empty() || a.temp > 0.0f)) {
+        std::fprintf(stderr, "ds4_generate: --verify needs --mtp and greedy decoding (--temp 0)\n");
+        return 2;
+    }
 
     // ---- dense half on the chosen backend
     ggml_backend_t be = nullptr;
@@ -253,8 +263,12 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "context cap %lld tokens\n", (long long) ctx);
     std::string err;
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds4_generate: dense init: %s\n", err.c_str()); return 1; }
-    if (!dense.reserve_graphs()) { std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str()); return 1; }
+    if (!dense.reserve_graphs(a.verify ? 2 : 1)) { std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str()); return 1; }
     if (a.slots <= 0) {
+        // CUDA-graph instances take VRAM when first captured (after this point): the MTP block and the 2-token
+        // verify graphs add many (a 0.9 GiB margin OOMed in cudaGraphInstantiate with --mtp, 2026-10-07)
+        if (!a.mtp.empty()) a.vram_margin_gib += 0.25;
+        if (a.verify) a.vram_margin_gib += 0.75;
         size_t fr = 0, tot = 0;
         ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot);
         const double blob = 6.75 * 1048576.0;   // one DS4 expert (IQ2_XXS gate/up + Q2_K down)
@@ -342,21 +356,61 @@ int main(int argc, char** argv) {
     // the MTP block at position `pos` with the token that follows it -> its argmax (the draft for pos + 2)
     double t_mtp = 0;
     int n_mtp = 0;
-    std::vector<int> mids((size_t) top_k);
-    std::vector<float> mw((size_t) top_k), mrouted((size_t) n_embd);
-    auto mtp_draft = [&](int next_tok, int pos, int* draft) -> bool {
+    const int NT = dense.max_tokens();
+    std::vector<int> mids((size_t) (top_k * NT));
+    std::vector<float> mw((size_t) (top_k * NT)), mrouted((size_t) (n_embd * NT));
+    // the MTP block at positions pos0..pos0+n-1 with their following tokens -> the last position's argmax
+    auto mtp_draft_n = [&](const int* next_toks, int n, int pos0, int* draft) -> bool {
         const double t0 = now_ms();
         const float* x = nullptr;
-        if (!dense.mtp_begin(&next_tok, 1)) return false;
-        if (!dense.attn_router(il_mtp, pos, -1, mids.data(), mw.data(), &x, nullptr)) return false;
-        if (!mtp_x.run(x, mids.data(), mw.data(), mrouted.data())) return false;
-        if (!dense.finish_layer(il_mtp, mrouted.data())) return false;
+        if (!dense.mtp_begin(next_toks, n)) return false;
+        if (!dense.attn_router_n(il_mtp, pos0, n, mids.data(), mw.data(), &x)) return false;
+        for (int t = 0; t < n; ++t)
+            if (!mtp_x.run(x + (size_t) t * n_embd, mids.data() + t * top_k, mw.data() + t * top_k,
+                           mrouted.data() + (size_t) t * n_embd)) return false;
+        if (!dense.finish_layer_n(il_mtp, n, mrouted.data())) return false;
         const float* lg = nullptr;
         int nv = 0;
-        if (!dense.mtp_logits_n(1, &lg, &nv)) return false;
-        if (draft) *draft = (int) (std::max_element(lg, lg + nv) - lg);
+        if (!dense.mtp_logits_n(n, &lg, &nv)) return false;
+        const float* last = lg + (size_t) (n - 1) * nv;
+        if (draft) *draft = (int) (std::max_element(last, last + nv) - last);
         t_mtp += now_ms() - t0;
         ++n_mtp;
+        return true;
+    };
+    auto mtp_draft = [&](int next_tok, int pos, int* draft) { return mtp_draft_n(&next_tok, 1, pos, draft); };
+
+    // n consecutive tokens (positions pos0..) through every trunk layer in one pass: the verify step
+    std::vector<int> ids_n((size_t) (top_k * NT));
+    std::vector<int32_t> ids32_n((size_t) (top_k * NT));
+    std::vector<float> w_n((size_t) (top_k * NT)), routed_n((size_t) (n_embd * NT));
+    auto step_n = [&](const int* toks, int n, int pos0) -> bool {
+        if (a.route_bias != 0.0f && !mc.cpu_only)
+            for (int l = 0; l < n_layer; ++l) {
+                for (int64_t e = 0; e < (int64_t) rb.size(); ++e) rb[(size_t) e] = tier.resident(l, e) ? a.route_bias : 0.0f;
+                dense.set_route_bias(l, rb.data());
+            }
+        if (!dense.begin_tokens(toks, n)) return false;
+        for (int l = 0; l < n_layer; ++l) {
+            double t0 = timing ? now_ms() : 0, t1;
+            if (!mc.cpu_only && mc.pf_b > 0 && dense.predict(l, pred_i.data(), kPredW)) {   // token 0's hint
+                int m = 0;
+                for (int i = 0; i < kPredW && pred_i[(size_t) i] >= 0; ++i) pred32[(size_t) m++] = pred_i[(size_t) i];
+                if (m > 0) tier.prefetch(l, pred32.data(), m);
+            }
+            if (timing) { t1 = now_ms(); t_ph[0] += t1 - t0; t0 = t1; }
+            const float* x = nullptr;
+            if (!dense.attn_router_n(l, pos0, n, ids_n.data(), w_n.data(), &x)) return false;
+            if (timing) { t1 = now_ms(); t_ph[1] += t1 - t0; t0 = t1; }
+            for (int k = 0; k < top_k * n; ++k) ids32_n[(size_t) k] = ids_n[(size_t) k];
+            if (!tier.run_multi(l, n, ids32_n.data(), w_n.data(), x, routed_n.data())) {
+                std::fprintf(stderr, "ds4_generate: tier.run_multi refused at layer %d\n", l);
+                return false;
+            }
+            if (timing) { t1 = now_ms(); t_ph[2] += t1 - t0; t0 = t1; }
+            if (!dense.finish_layer_n(l, n, routed_n.data())) return false;
+            if (timing) { t1 = now_ms(); t_ph[3] += t1 - t0; }
+        }
         return true;
     };
 
@@ -380,12 +434,16 @@ int main(int argc, char** argv) {
             nll += (std::log(z) + mx) - l[prompt[i + 1]];
             ++n_scored;
         }
+        static const bool vtrace = std::getenv("DS4_VRAM_TRACE") != nullptr;   // free VRAM per prefill step
+        auto vfree = [&]() { size_t fr = 0, tot = 0; ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot); return fr / 1048576.0; };
+        if (vtrace) std::fprintf(stderr, "[vram] pos %zu after trunk: %.0f MiB free\n", i, vfree());
         // the MTP block's own sliding-window KV is filled over the prompt as well (it reads the trunk state, so after
         // the trunk's logits above)
         if (il_mtp >= 0 && i + 1 < prompt.size() && !mtp_draft(prompt[i + 1], (int) i, nullptr)) {
             std::fprintf(stderr, "ds4_generate: MTP prefill failed at %zu: %s\n", i, dense.last_error().c_str());
             return 1;
         }
+        if (vtrace && il_mtp >= 0) std::fprintf(stderr, "[vram] pos %zu after MTP:   %.0f MiB free\n", i, vfree());
     }
     if (a.ppl && n_scored)
         std::fprintf(stderr, "ppl: %d positions, mean NLL %.5f, perplexity %.4f\n", n_scored, nll / n_scored,
@@ -403,7 +461,59 @@ int main(int argc, char** argv) {
     timing = true;
     t_mtp = 0; n_mtp = 0;
     int draft = -1, n_drafts = 0, n_accept = 0;
-    for (; n_gen < a.n_predict; ++n_gen) {
+    int n_passes = 0;
+    if (a.verify) {
+        // pos = the position of `cur`, the newest token (emitted, not yet forwarded); draft = MTP's guess for pos + 1
+        auto argmax = [](const float* v, int n) { return (int) (std::max_element(v, v + n) - v); };
+        bool done = false;
+        auto emit = [&](int tok) {
+            std::printf("%d\n", tok);
+            std::fflush(stdout);
+            ++n_gen;
+            if (n_gen >= a.n_predict || std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end()) done = true;
+        };
+        const double th0 = now_ms();
+        if (!dense.logits(&lg, &n_vocab)) return 1;
+        t_ph[4] += now_ms() - th0;
+        int cur = argmax(lg, n_vocab);
+        emit(cur);
+        if (!done && !mtp_draft(cur, pos - 1, &draft)) {
+            std::fprintf(stderr, "ds4_generate: MTP draft failed: %s\n", dense.last_error().c_str());
+            return 1;
+        }
+        while (!done) {
+            const int toks[2] = { cur, draft };
+            if (!step_n(toks, 2, pos)) {
+                std::fprintf(stderr, "ds4_generate: verify pass failed at pos %d: %s\n", pos, dense.last_error().c_str());
+                return 1;
+            }
+            ++n_passes;
+            const double tl0 = now_ms();
+            if (!dense.logits_n(2, &lg, &n_vocab)) return 1;
+            t_ph[4] += now_ms() - tl0;
+            const int t1 = argmax(lg, n_vocab);                       // the trunk's token at pos + 1
+            ++n_drafts;
+            if (t1 == draft) {
+                ++n_accept;
+                const int t2 = argmax(lg + n_vocab, n_vocab);         // ... and, for free, at pos + 2
+                emit(t1);
+                if (done) break;
+                emit(t2);
+                if (done) break;
+                const int nxt[2] = { t1, t2 };
+                if (!mtp_draft_n(nxt, 2, pos, &draft)) return 1;      // MTP at pos, pos+1 -> guess for pos + 3
+                cur = t2;
+                pos += 2;
+            } else {
+                emit(t1);
+                if (done) break;
+                if (!mtp_draft(t1, pos, &draft)) return 1;            // MTP at pos -> guess for pos + 2
+                cur = t1;
+                pos += 1;
+            }
+        }
+    }
+    for (; !a.verify && n_gen < a.n_predict; ++n_gen) {
         const double th0 = now_ms();
         const bool lok = dense.logits(&lg, &n_vocab);
         t_ph[4] += now_ms() - th0;
@@ -429,12 +539,15 @@ int main(int argc, char** argv) {
     }
     const double dec_ms = now_ms() - t_dec0;
     const ds4::Ds4MoeStats st = tier.stats();
-    const int dec_steps = std::max(1, n_gen - 1);   // forward passes actually run during decode
+    const int dec_steps = a.verify ? std::max(1, n_passes) : std::max(1, n_gen - 1);   // forward passes run in decode
 
     std::fprintf(stderr, "\nprefill: %zu tokens in %.2f s = %.2f tok/s (decode-loop prefill)\n", prompt.size(),
                  pf_ms / 1000.0, 1000.0 * (double) prompt.size() / pf_ms);
     std::fprintf(stderr, "decode : %d tokens, %d forward passes in %.2f s = %.2f tok/s\n", n_gen, dec_steps,
                  dec_ms / 1000.0, 1000.0 * dec_steps / dec_ms);
+    if (a.verify)   // the first token comes from the prefill's logits: the passes produced the other n_gen - 1
+        std::fprintf(stderr, "verify : %d passes, %.2f tokens/pass, %.2f tok/s (tokens after the first / decode time)\n",
+                     n_passes, (double) (n_gen - 1) / std::max(1, n_passes), 1000.0 * (n_gen - 1) / dec_ms);
     const double look = (double) std::max<int64_t>(1, st.lookups());
     std::fprintf(stderr, "experts/token: hit %.1f%% (prefetched-useful %.1f/token of %.1f issued), cpu %.1f%%, "
                          "pcie %.1f%%, file tier %lld\n",
@@ -450,6 +563,11 @@ int main(int argc, char** argv) {
                      n_mtp ? t_mtp / n_mtp : 0.0);
     std::fprintf(stderr, "tier ms/token: wall %.2f (gpu hits %.2f, pcie %.2f, cpu pool %.2f)\n", st.wall_ms / dec_steps,
                  st.hit_ms / dec_steps, st.pcie_ms / dec_steps, st.cpu_ms / dec_steps);
+    {
+        size_t fr = 0, tot = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot);
+        std::fprintf(stderr, "VRAM free at the end: %.2f GiB (calibrates --vram-margin)\n", fr / 1073741824.0);
+    }
     (void) pf_stats;
     tier.close();
     ggml_backend_free(be);

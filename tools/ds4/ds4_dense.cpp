@@ -138,6 +138,11 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, b
             if (requant >= 0 && (ty == GGML_TYPE_Q8_0 || ty == GGML_TYPE_BF16) && requant_target(ti.name) &&
                 ne[0] % ggml_blck_size((ggml_type) requant) == 0)
                 ty = (ggml_type) requant;
+            // every other BF16 matrix (the MTP file's attn_kv, attn_q_a) -> Q8_0, like the trunk's: a BF16 mul_mat
+            // goes through cuBLAS on CUDA, whose first use loads its kernels into VRAM after --slots auto has sized the
+            // expert cache (cudaGraphInstantiate OOM with --mtp, 2026-10-07)
+            else if (ty == GGML_TYPE_BF16 && ti.shape.size() >= 2 && ne[0] % 32 == 0)
+                ty = GGML_TYPE_Q8_0;
             ggml_tensor * t = ggml_new_tensor(w.ctx, ty, (int) ti.shape.size(), ne);
             if (!t) { err = "cannot create " + ti.name; return false; }
             ggml_set_name(t, ti.name.c_str());
