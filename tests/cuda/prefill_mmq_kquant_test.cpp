@@ -155,6 +155,11 @@ int main() {
                 product(ctx, s, ("Q5_K gate/up" + tag).c_str(), GGML_TYPE_Q5_K, 1280, 2560, counts, trial + 5);
                 product(ctx, s, ("Q5_1 down" + tag).c_str(), GGML_TYPE_Q5_1, 2560, 640, counts, trial + 9);
                 product(ctx, s, ("Q8_0 down" + tag).c_str(), GGML_TYPE_Q8_0, 2560, 640, counts, trial + 13);
+                // MiMo-V2.6-Flash RL GSQ-RCO: gate/up at n_ff_exp 2048 x n_embd 4096, down the other way, in
+                // Q2_K / Q3_K / MXFP4 (that pack's expert formats)
+                product(ctx, s, ("Q2_K gate/up" + tag).c_str(), GGML_TYPE_Q2_K,  2048, 4096, counts, trial + 17);
+                product(ctx, s, ("Q3_K gate/up" + tag).c_str(), GGML_TYPE_Q3_K,  2048, 4096, counts, trial + 21);
+                product(ctx, s, ("MXFP4 down" + tag).c_str(),   GGML_TYPE_MXFP4, 4096, 2048, counts, trial + 25);
                 ++trial;
             }
         }

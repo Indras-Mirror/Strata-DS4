@@ -69,6 +69,27 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     return true;
 }
 
+bool native_fmt3(int gate_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f,
+                 std::string& err) {
+    if (!native_fmt(gate_type, d_type, n_embd, n_ff, f, err)) return false;
+    if (up_type == gate_type) return true;
+    const ggml_type_traits_cpu* tu = traits(up_type);
+    if (tu == nullptr || tu->vec_dot == nullptr) {
+        err = "native experts: ggml-cpu has no dot product for type " + std::to_string(up_type);
+        return false;
+    }
+    if ((int) tu->vec_dot_type != f.gu_act || n_embd % ggml_blck_size((ggml_type) up_type)) {
+        err = "native experts: up type " + std::to_string(up_type) + " needs a different activation than gate type " +
+              std::to_string(gate_type);
+        return false;
+    }
+    f.up_type = up_type;
+    f.up_row = ggml_row_size((ggml_type) up_type, n_embd);
+    f.down_off = f.up_off + f.up_row * (size_t) n_ff;
+    f.bytes = f.down_off + f.d_row * (size_t) n_embd;
+    return true;
+}
+
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
 }
@@ -102,7 +123,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
     static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return cpu_avx2_ok() && v != nullptr && std::atoi(v) != 0; }();
-    if (kq && f.gu_type == 12 && nt >= 2 && std::isinf(f.swiglu_limit)) {   // kq256 has no clamp   // one token: ggml's own dot below (the same bits, less overhead)
+    if (kq && f.gu_type == 12 && f.up_type < 0 && nt >= 2 && std::isinf(f.swiglu_limit)) {   // kq256 has no clamp   // one token: ggml's own dot below (the same bits, less overhead)
         kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
@@ -110,7 +131,8 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // it, as before (its rows would round differently).  Each kernel only for the formats it implements: falling
     // through an empty switch would leave ff unwritten instead of falling back to ggml-cpu.
     static const bool cpu512 = cpu_avx512_ok();
-    if (nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
+    const bool mixed = f.up_type >= 0 && f.up_type != f.gu_type;   // the multi-token kernels take one type
+    if (!mixed && nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
         if (avx512 && iq512_supported(f.gu_type)) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1, f.swiglu_limit);
             return;
@@ -121,15 +143,17 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         }
     }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
+    const ggml_vec_dot_t udot = mixed ? traits(f.up_type)->vec_dot : dot;
+    const size_t urow = mixed ? f.up_row : f.gu_row;
     const int n = (int) f.n_embd;
     const float lim = f.swiglu_limit;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
-        const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
+        const uint8_t* ur = blob + f.up_off + (size_t) r * urow;
         for (int t = 0; t < nt; ++t) {
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
-            dot(n, &u, 0, ur, 0, act[t], 0, 1);
+            udot(n, &u, 0, ur, 0, act[t], 0, 1);
             g = std::min(g, lim);                        // DeepSeek-V4's clamp; lim = +inf: no-op
             u = std::min(std::max(u, -lim), lim);
             ff[t][r] = (g / (1.f + std::exp(-g))) * u;

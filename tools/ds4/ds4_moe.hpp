@@ -75,16 +75,38 @@ struct Ds4MoeGeom {
     /// `deepseek4.swiglu_clamp_exp` (10.0 on every layer of the 0731 GGUF; one value - the tier has one format):
     /// gate -> min(gate, lim), up -> clamp(up, -lim, lim) before the SwiGLU.  +inf = no clamp.
     float swiglu_limit = std::numeric_limits<float>::infinity();
+    /// PER-LAYER FORMATS (MiMo-V2.6-Flash GSQ-RCO picks a format per tensor: gate, up and down independently).
+    /// Empty = every layer is `gu_type`/`gu_type`/`d_type` (DeepSeek-V4: the uniform path, unchanged).  Otherwise
+    /// `n_layers` entries each, indexed by the MODEL's layer number; -1 = that layer has no routed experts (MiMo's
+    /// dense layer 0).  `gu_type`/`d_type` then hold the first routed layer's types (reports only).
+    std::vector<int> gate_types, up_types, down_types;
+
+    bool per_layer() const { return !gate_types.empty(); }
+    bool routed(int64_t l) const { return l >= 0 && l < n_layers && (!per_layer() || gate_types[(size_t) l] >= 0); }
+    int gate_type(int64_t l) const { return per_layer() ? gate_types[(size_t) l] : gu_type; }
+    int up_type(int64_t l) const { return per_layer() ? up_types[(size_t) l] : gu_type; }
+    int down_type(int64_t l) const { return per_layer() ? down_types[(size_t) l] : d_type; }
+    /// Layers that route (n_layers for a uniform geometry).
+    int64_t n_routed() const {
+        if (!per_layer()) return n_layers;
+        int64_t n = 0;
+        for (int64_t l = 0; l < n_layers; ++l) n += routed(l);
+        return n;
+    }
 };
 
-/// Reads `n_embd / n_ff / n_layers / n_experts / top_k` from the GGUF's `deepseek4.*` metadata, and the two
-/// expert quant types from `blk.0.ffn_gate_exps.weight` / `blk.0.ffn_down_exps.weight`.  Only the header region
-/// of the file is read (the tensor index and the metadata); no tensor data is touched.
+/// Reads `n_embd / n_ff / n_layers / n_experts / top_k` from the GGUF's `<arch>.*` metadata (`general.architecture`:
+/// deepseek4, mimo2, ...) and the expert quant types of every layer's `blk.L.ffn_{gate,up,down}_exps.weight`.  All
+/// layers present and alike -> the uniform geometry (per-layer vectors empty), exactly as before; otherwise the
+/// per-layer vectors.  Only the header region of the file is read; no tensor data is touched.
 bool ds4_moe_geom_from_gguf(const std::string& gguf, Ds4MoeGeom& g, std::string& err);
 
 /// The native blob layout for `g` (the three role slices back to back) and its byte size.  False with `err` when
-/// ggml-cpu has no dot product for the pair at this geometry, i.e. when the CPU tier could not run at all.
+/// ggml-cpu has no dot product for the pair at this geometry, i.e. when the CPU tier could not run at all.  For a
+/// per-layer geometry this is the LARGEST routed layer's layout (what buffers are sized by).
 bool ds4_moe_blob_layout(const Ds4MoeGeom& g, cpu::NativeFmt& f, std::string& err);
+/// Layer `l`'s own layout (any geometry).  False for a layer without routed experts.
+bool ds4_moe_layer_layout(const Ds4MoeGeom& g, int64_t l, cpu::NativeFmt& f, std::string& err);
 
 // ================================ blob sources ================================
 
@@ -97,10 +119,18 @@ public:
     virtual const char* kind() const = 0;
     /// Validates the source against the geometry (the roles exist, their types and strides are right).
     virtual bool open(std::string& err) = 0;
-    /// Bytes of one expert blob: [gate rows | up rows | down rows].
+    /// Bytes of one expert blob: [gate rows | up rows | down rows].  The LARGEST layer's for a per-layer geometry.
     virtual size_t blob_bytes() const = 0;
+    /// Bytes of one expert blob of layer `l` (`blob_bytes()` unless the formats differ per layer).
+    virtual size_t blob_bytes(int64_t l) const { (void) l; return blob_bytes(); }
     /// Writes one expert's blob into `dst` (blob_bytes() large).
     virtual void read(int64_t layer, int64_t expert, uint8_t* dst) const = 0;
+    /// Part `part` of `nparts` of the same blob: bytes [p0, p1) of it into dst + p0 (p0 = blob * part / nparts, 4 KiB
+    /// rounded; the parts tile the blob), so several threads can read ONE blob.  Default: part 0 reads it all.
+    virtual void read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const {
+        if (part == 0) read(layer, expert, dst);
+        (void) nparts;
+    }
 };
 
 /// The production source: the three per-role tensors of a `deepseek4` GGUF, mmap'd in place, so assembling one
@@ -116,9 +146,13 @@ public:
     const char* kind() const override { return "gguf mmap"; }
     bool open(std::string& err) override;
     size_t blob_bytes() const override { return blob_; }
+    size_t blob_bytes(int64_t l) const override;
     void read(int64_t layer, int64_t expert, uint8_t* dst) const override;
+    void read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const override;
 
 private:
+    /// Bytes [lo, hi) of role r's slice of (layer, expert) into dst (O_DIRECT, pread, then the mmap as fallbacks).
+    void read_span(int r, int64_t layer, int64_t expert, size_t lo, size_t hi, uint8_t* dst) const;
     struct Impl;
     std::unique_ptr<Impl> im_;
     Ds4MoeGeom g_;
@@ -165,6 +199,27 @@ struct Ds4MoeConfig {
     bool no_cache = false;        ///< GPU tier without a VRAM cache (every miss is CPU or PCIe)
     double mem_floor_gib = 3.0;   ///< refuse an arena that would leave less than this much MemAvailable
     double max_arena_gib = 60.0;  ///< hard ceiling on the arena, whatever `arena_gib` says
+    /// VRAM budget for the expert cache in GiB, for geometries whose blob size varies per layer (MiMo): the seed
+    /// takes the ranked profile's head until `slots` experts OR this many bytes, sizing each slot to its expert.
+    /// 0 = `slots` x the largest blob.  Ignored for uniform geometries (DS4: `slots` alone, as before).
+    double slot_gib = 0.0;
+    /// Per-layer-sized geometries (MiMo) only: leave the experts the VRAM seed takes OUT of the host arena.  That
+    /// cache never evicts or admits after the seed, so their arena copies are never read again; the bytes go to the
+    /// next-ranked experts instead (fewer file-tier reads).  Off = the arena holds the ranking's head as before.
+    bool arena_skip_resident = false;
+    /// Decode: a file-tier expert that `run` had to read replaces the least-recently-used arena expert of its layer
+    /// (same blob size), so the experts a conversation uses stay in RAM after their first use.  Off = static arena.
+    bool arena_adapt = false;
+    /// Prompt chunks (`run_chunk`): the streamed experts' products through llama.cpp's MMQ (int8 tensor cores; the
+    /// activations rounded to MMQ's q8_1) instead of the grouped MMVQ kernel, on the layers whose gate/up/down types
+    /// MMQ covers and that have no SwiGLU clamp.  Needs a build with the prompt MMQ path (`strata_mmq`, with
+    /// STRATA_MMQ_KQUANTS for K-quants / MXFP4); otherwise, and for VRAM-resident experts, the MMVQ kernel runs.
+    bool chunk_mmq = false;
+    /// Decode, per-layer-sized geometries (MiMo): a PCIe-share miss (and a prefetched expert the routing used) takes
+    /// the least-recently-used VRAM slot of its layer instead of a staging buffer, so the cache follows the
+    /// conversation (route_probe sim, 1800 slots: static 40.5% held-out hit, LRU 61.6%; FINDINGS s16).  Same math per
+    /// expert; only where the blob sits changes.  Off = the static seed, as before.
+    bool vram_lru = false;
     uint64_t seed = 20261005;     ///< the synthetic arm's generator (unused by the tier itself)
 
     static constexpr int kPredW = 16;   ///< ranked predictions the caller passes to `prefetch`
@@ -182,6 +237,10 @@ struct Ds4MoeStats {
     int64_t pcie = 0;               ///< misses DMA'd to the GPU and computed there
     int64_t file_tier = 0;          ///< reads served by the blob source instead of the arena
     double gap_ms = 0, hit_ms = 0, pcie_ms = 0, cpu_ms = 0, wall_ms = 0;
+    double file_ms = 0;             ///< time spent reading file-tier blobs (inside run / prefetch)
+    int64_t arena_swaps = 0;        ///< arena_adapt: file-tier experts moved into the arena
+    int64_t vram_swaps = 0;         ///< vram_lru: misses / prefetches moved into a VRAM slot
+    int64_t vram_demotes = 0;       ///< ...of which the victim went back to the arena (it had no arena copy)
 
     void add(const Ds4MoeStats& o);
     int64_t lookups() const { return hits + cpu + pcie; }
@@ -221,6 +280,9 @@ public:
     /// from it and fills the VRAM cache with the top `slots` of it.  The format is `moe_replay.cpp`'s:
     /// [512-token ubatch][layer][token][6] u16.
     bool seed_from_routes(const std::string& routes_bin, std::string& err);
+    /// The same for route files with `batch_tokens`-token ubatches (tools/mimo/route_probe writes 2048) and only the
+    /// routed layers in them (`Ds4MoeGeom::n_routed()` per token).
+    bool seed_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err);
     /// The same fill from an already-ranked list (the arena and the gate both have one to hand).
     bool seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
 
@@ -251,9 +313,21 @@ public:
     double arena_gib() const;
     /// Whether `expert` of `layer` is resident in a VRAM slot right now (false in CPU-only mode).
     bool resident(int64_t layer, int64_t expert) const;
+    /// Whether `expert` of `layer` is in the host arena (false in CPU-only mode and for the file tier).
+    bool in_arena(int64_t layer, int64_t expert) const;
     /// `nt` (1..4) tokens of one layer at once - draft verification: `ids`/`w` are nt*top_k (token-major), `x` and
     /// `out` nt*n_embd.  Each distinct expert is read/fetched once and applied to every token that routed to it.
     bool run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out);
+    /// A prompt chunk: `n` tokens (any count) of one layer, `ids`/`w` n*top_k token-major, `x`/`out` n*n_embd.  GPU
+    /// tier: every expert on the card - resident from its slot, the rest streamed once per chunk (MiMo prefill;
+    /// MIMO_CHUNK_STAGE_MIB sizes the two streaming halves, default 1024).  CPU tier: token by token.
+    bool run_chunk(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, float* out);
+    /// The arena alone from a routing profile (the order `seed_from_routes` would give it, incl. arena_skip_resident),
+    /// WITHOUT opening the VRAM cache - so prompt chunks can run first and `release_chunk` can give their buffers back
+    /// before the cache takes the VRAM.  A later `seed_from_routes` keeps this arena and only seeds the cache.
+    bool build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err);
+    /// Frees run_chunk's device and pinned buffers (the next run_chunk allocates them again).
+    void release_chunk();
     cpu::ExpertPool& pool();           ///< the CPU tier's worker pool (the gate's single-expert check uses it)
 
 private:

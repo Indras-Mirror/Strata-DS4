@@ -29,6 +29,11 @@ inline constexpr int kNativeFFMax = 2048;
 /// One layer's native expert geometry.
 struct NativeFmt {
     int gu_type = -1, d_type = -1;      ///< ggml types of gate/up and of down
+    /// The up projection's own type when it differs from the gate's (MiMo-V2.6-Flash GSQ-RCO picks a format per
+    /// tensor: 16 of its 47 routed layers have gate != up).  -1 = the gate's type (every other model).  Set only by
+    /// `native_fmt3`; gate and up must share the activation format (`gu_act`).
+    int up_type = -1;
+    size_t up_row = 0;                  ///< bytes per up row when `up_type` is set (else gu_row)
     int gu_act = -1, d_act = -1;        ///< their vec_dot_type (the activation formats)
     int64_t n_embd = 0, n_ff = 0;
     size_t gu_row = 0, d_row = 0;       ///< bytes per weight row
@@ -44,6 +49,11 @@ struct NativeFmt {
 bool native_experts_available() noexcept;
 /// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+
+/// `native_fmt` with gate and up of different types (MiMo GSQ-RCO).  Equal types give exactly `native_fmt`'s layout.
+/// False when the two need different activation formats (one quantized activation serves both).
+bool native_fmt3(int gate_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f,
+                 std::string& err);
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);

@@ -35,6 +35,20 @@ __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
     return x32;
 }
 __device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { return ((const int*) x)[i32]; }
+// byte-aligned (MXFP4's 17-byte blocks): llama.cpp's get_int_b1
+__device__ __forceinline__ int get_int_b1(const void* x, const int& i32) {
+    const uint8_t* x8 = (const uint8_t*) x;
+    int x32 = x8[4 * i32 + 0] << 0;
+    x32 |= x8[4 * i32 + 1] << 8;
+    x32 |= x8[4 * i32 + 2] << 16;
+    x32 |= x8[4 * i32 + 3] << 24;
+    return x32;
+}
+// E8M0 (MXFP4's shared block exponent) -> float: 2^(e-127); e == 0 is the denormal 2^-127 (llama.cpp's
+// ggml_cuda_e8m0_to_fp32)
+__device__ __forceinline__ float e8m0_to_fp32(uint8_t e) {
+    return __uint_as_float(e == 0 ? 0x00400000u : (uint32_t) e << 23);
+}
 __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t p = __popc(v) & 1;
     const uint32_t s = v ^ p << 7;
@@ -349,6 +363,65 @@ __device__ __forceinline__ float vec_dot_q2_K_q8_1(const void* __restrict__ vbq,
     return vec_dot_q2_K_q8_1_impl_mmvq(v, u, scales, bq2_K->dm, d8);
 }
 
+// Q3_K (MiMo-V2.6-Flash GSQ-RCO's gate/up/down on some layers): llama.cpp's vec_dot_q3_K_q8_1 (vecdotq.cuh),
+// VDR_Q3_K_Q8_1_MMVQ = 1.  The high-bit mask is inverted so a clear bit subtracts 4.
+constexpr int VDR_Q3_K = 1;
+__device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(const int& vl, const int& vh, const int* __restrict__ u,
+                                                             const uint8_t* __restrict__ scales, const int& scale_offset,
+                                                             const float& d3, const float* __restrict__ d8) {
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+        const int isc = scale_offset + 2 * i;
+        const int isc_low = isc % (QK_K / 32);
+        const int sc_shift_low = 4 * (isc / (QK_K / 32));
+        const int sc_low = (scales[isc_low] >> sc_shift_low) & 0xF;
+        const int isc_high = isc % (QK_K / 64);
+        const int sc_shift_high = 2 * (isc / (QK_K / 64));
+        const int sc_high = ((scales[(QK_K / 32) + isc_high] >> sc_shift_high) & 3) << 4;
+        const int sc = (sc_low | sc_high) - 32;
+        const int vil = (vl >> (2 * i)) & 0x03030303;
+        const int vih = ((vh >> i) << 2) & 0x04040404;
+        const int vi = __vsubss4(vil, vih);
+        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc);
+    }
+    return d3 * sumf;
+}
+__device__ __forceinline__ float vec_dot_q3_K_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const block_q3_K* bq3_K = (const block_q3_K*) vbq + kbx;
+    const int bq8_offset = QR3_K * (iqs / (QI3_K / 2));
+    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
+    const float d = __half2float(bq3_K->d);
+    const int vl = get_int_b2(bq3_K->qs, iqs);
+    const int vh = ~get_int_b2(bq3_K->hmask, iqs % (QI3_K / 2)) >> bq8_offset;
+    int u[QR3_K];
+    float d8[QR3_K];
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+        u[i] = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
+    }
+    return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
+}
+
+// MXFP4 (MiMo's source-format down projections on 3 layers): llama.cpp's vec_dot_mxfp4_q8_1 (vecdotq.cuh),
+// VDR_MXFP4_Q8_1_MMVQ = 2.  kvalues_mxfp4 holds the e2m1 values doubled, hence the 0.5.
+constexpr int VDR_MXFP4 = 2;
+__device__ __forceinline__ float vec_dot_mxfp4_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_mxfp4* bq4 = (const block_mxfp4*) vbq + kbx;
+    const int* q8 = (const int*) bq8_1->qs + iqs;
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP4; ++l) {
+        const int2 v = get_int_from_table_16(get_int_b1(bq4->qs, iqs + l), kvalues_mxfp4);
+        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+    }
+    return e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds) * sumi;
+}
+
 __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(const int* __restrict__ v, const int* __restrict__ u,
                                                              const uint8_t* __restrict__ sc, const uint8_t* __restrict__ m,
                                                              const half2& dm4, const float* __restrict__ d8) {
@@ -548,6 +621,10 @@ template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<10> { static constexpr int qk = 256, ipb = QI2_K / VDR_Q2_K, step = VDR_Q2_K;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_K_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<11> { static constexpr int qk = 256, ipb = QI3_K / VDR_Q3_K, step = VDR_Q3_K;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q3_K_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<39> { static constexpr int qk = 32, ipb = QI_MXFP4 / VDR_MXFP4, step = VDR_MXFP4;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_mxfp4_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<12> { static constexpr int qk = 256, ipb = QI4_K / VDR_Q4_K, step = VDR_Q4_K;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q4_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<13> { static constexpr int qk = 256, ipb = QI5_K / VDR_Q5_K, step = VDR_Q5_K;
@@ -561,8 +638,8 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8)
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(10) X(7) X(6) X(8)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8) X(10) X(11)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(10) X(7) X(6) X(8) X(11) X(39)
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(10) X(12) X(13) X(7) X(6) X(8)
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -1124,6 +1201,36 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
         for (int e = e0; e < e1; ++e) {
             const float s = row_dot<TG>(wr, xq + (size_t) ent_tok[e] * xb, nb, lane);
+            if (lane == 0) (is_up ? up : gate)[(size_t) e * L.n_ff + r] = s;
+        }
+    }
+}
+
+// native_gu_kernel with gate and up in DIFFERENT formats (MiMo-V2.6-Flash GSQ-RCO picks a format per tensor).  A
+// warp's row is a gate row or an up row; with n_ff % GU_ROWS == 0 a whole block is one or the other, so the branch is
+// block-uniform.  Same per-row arithmetic as native_gu_kernel<T> for each half.
+template<int TG, int TU>
+__global__ void __launch_bounds__(256) native_gu_mixed_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                              const int32_t* __restrict__ grp_start,
+                                                              const int32_t* __restrict__ n_groups,
+                                                              const int32_t* __restrict__ ent_tok,
+                                                              const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                              float* __restrict__ gate, float* __restrict__ up) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * GU_ROWS + warp;             // 0 .. 2*n_ff
+    if (row >= 2 * L.n_ff) return;
+    const bool is_up = row >= L.n_ff;
+    const int r = is_up ? row - (int) L.n_ff : row;
+    const size_t off = is_up ? L.up_off + (size_t) r * L.up_row : (size_t) r * L.gu_row;
+    const int xb = (int) (L.n_embd / 32);
+    const int ng = *n_groups;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + off;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; ++e) {
+            const block_q8_1* x = xq + (size_t) ent_tok[e] * xb;
+            const float s = is_up ? row_dot<TU>(wr, x, (int) (L.n_embd / Fmt<TU>::qk), lane)
+                                  : row_dot<TG>(wr, x, (int) (L.n_embd / Fmt<TG>::qk), lane);
             if (lane == 0) (is_up ? up : gate)[(size_t) e * L.n_ff + r] = s;
         }
     }
@@ -1694,6 +1801,21 @@ __device__ void dq_q8_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>((float) x[ib].qs[8 * il + j] * d);
 }
 
+// MXFP4 (MiMo's down projections on 3 layers): ggml's dequantize_row_mxfp4 - 32-value blocks, low nibbles are values
+// 0..15, high nibbles 16..31, value = kvalues_mxfp4[q] * 2^(e-127) / 2.  Same thread layout as dq_iq4_nl.
+template<typename dst_t>
+__device__ void dq_mxfp4(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_mxfp4* x = (const block_mxfp4*) vx + ibs * (QK_K / QK_MXFP4);
+    const int64_t il = tid / 8, ib = tid % 8;
+    dst_t* y = yy + 32 * ib + 4 * il;
+    const uint8_t* q4 = x[ib].qs + 4 * il;
+    const float d = e8m0_to_fp32(x[ib].e) * 0.5f;
+    for (int j = 0; j < 4; ++j) {
+        y[j + 0] = cvt<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]);
+        y[j + 16] = cvt<dst_t>(d * kvalues_mxfp4[q4[j] >> 4]);
+    }
+}
+
 // BF16 (the token embedding as the checkpoint ships it, tools/embd_bf16_pack.py): 8 values per thread.
 template<typename dst_t>
 __device__ void dq_bf16(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -1722,6 +1844,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 7: dq_q5_1(vx, ibs, y, tid); break;
         case 6: dq_q5_0(vx, ibs, y, tid); break;
         case 8: dq_q8_0(vx, ibs, y, tid); break;
+        case 39: dq_mxfp4(vx, ibs, y, tid); break;
         case 30: dq_bf16(vx, ibs, y, tid); break;
         default: break;
     }
@@ -1745,7 +1868,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
-           t == 10 || t == 12 || t == 13 || t == 7 || t == 6 || t == 8;
+           t == 10 || t == 12 || t == 13 || t == 7 || t == 6 || t == 8 || t == 39;
 }
 // values per block of the types the grouped expert kernels take (0 = none)
 int gu_qk(int t) {
@@ -1860,6 +1983,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 7: return (size_t) (n / 32) * sizeof(block_q5_1);
         case 6: return (size_t) (n / 32) * sizeof(block_q5_0);
         case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
+        case 39: return (size_t) (n / 32) * sizeof(block_mxfp4);
         case 30: return (size_t) n * 2;   // BF16: the token embedding only (iq_embed_rows, iq_dequant_f32)
         default: return 0;
     }
@@ -1944,6 +2068,23 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     L.down_off = 2 * L.up_off;
     L.bytes = L.down_off + (size_t) n_embd * L.d_row;
     return L;
+}
+
+NativeExpertLayout native_expert_layout3(int gate_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff) {
+    NativeExpertLayout L = native_expert_layout(gate_type, d_type, n_embd, n_ff);
+    if (up_type == gate_type) return L;
+    L.up_type = up_type;
+    L.up_row = iq_row_bytes(up_type, n_embd);
+    L.down_off = L.up_off + (size_t) n_ff * L.up_row;
+    L.bytes = L.down_off + (size_t) n_embd * L.d_row;
+    return L;
+}
+
+bool native_expert_supported3(int gate_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
+    if (gate_type == up_type) return native_expert_supported(gate_type, d_type, n_embd, n_ff);
+    const bool pair = (gate_type == 10 && up_type == 11) || (gate_type == 11 && up_type == 10);
+    return pair && native_expert_supported(gate_type, d_type, n_embd, n_ff) &&
+           native_expert_supported(up_type, d_type, n_embd, n_ff) && n_ff % GU_ROWS == 0;
 }
 
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
@@ -2578,6 +2719,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     } else
 #undef STRATA_GU_AMD
 #endif
+    if (L.up_type >= 0 && L.up_type != L.gu_type) {   // MiMo GSQ-RCO: gate and up in different formats
+        if (L.n_ff % GU_ROWS != 0) { std::fprintf(stderr, "native_expert_grouped: mixed gate/up needs n_ff %% %d\n", GU_ROWS); std::exit(1); }
+        if (L.gu_type == 10 && L.up_type == 11)
+            native_gu_mixed_kernel<10, 11><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else if (L.gu_type == 11 && L.up_type == 10)
+            native_gu_mixed_kernel<11, 10><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else { std::fprintf(stderr, "native_expert_grouped: gate %d / up %d\n", L.gu_type, L.up_type); std::exit(1); }
+    } else
     switch (L.gu_type) {
 #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         STRATA_GU_FMTS(STRATA_GU)
@@ -2640,6 +2789,26 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
     check("native_expert_grouped/down");
+}
+
+// out[t][i] = sum_k w[t*K + k] * parts[(t*K + k)][i] - the prompt chunk's top-k mix on the card (MiMo prefill), so
+// only n rows come back instead of n*K.  Summed in k order, like the host loop it replaces.
+__global__ void weighted_rows_sum_kernel(const float* __restrict__ parts, const float* __restrict__ w, int K,
+                                         int64_t H, int64_t n, float* __restrict__ out) {
+    const int64_t total = n * H;
+    for (int64_t q = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; q < total; q += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t t = q / H, i = q - t * H;
+        float acc = 0.0f;
+        for (int k = 0; k < K; ++k) acc += w[t * K + k] * parts[(t * K + k) * H + i];
+        out[q] = acc;
+    }
+}
+
+void weighted_rows_sum(const float* parts, const float* w, int K, int64_t H, int64_t n, float* out, void* stream) {
+    const int64_t total = n * H;
+    const unsigned blocks = (unsigned) std::min<int64_t>((total + 255) / 256, 65535);
+    weighted_rows_sum_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(parts, w, K, H, n, out);
+    check("weighted_rows_sum");
 }
 
 }  // namespace strata::kernels

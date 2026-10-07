@@ -116,6 +116,8 @@ bool supported(int t) {
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
 #ifdef STRATA_MMQ_KQUANTS
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1:   // Unsloth's UD-Q4_K_XL experts (CUDA)
+        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K:   // MiMo-V2.6-Flash RL GSQ-RCO experts are Q2_K/Q3_K (2/3-bit K-quants)
+        case GGML_TYPE_MXFP4:                       // ...and its MXFP4 expert outliers
 #endif
             return true;
         default:
@@ -201,6 +203,9 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
         case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
         case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
+        case GGML_TYPE_Q2_K: mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, a, s); break;   // MiMo GSQ-RCO experts
+        case GGML_TYPE_Q3_K: mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, a, s); break;   // MiMo GSQ-RCO experts
+        case GGML_TYPE_MXFP4: mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, a, s); break; // MiMo GSQ-RCO experts
 #endif
         default:
             std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);

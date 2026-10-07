@@ -35,6 +35,11 @@ if(TARGET CUDA::cudart AND TARGET strata_kernels)
   # strata_engine already links) - the same set of libraries `ds4_moe_replay` links.
   target_link_libraries(ds4_moe_cuda PUBLIC strata_engine strata_kernels strata_kernels_cpu strata_artifact ggml
                                            ggml-base CUDA::cudart)
+  # run_chunk's MMQ products (Ds4MoeConfig::chunk_mmq) when the build has the prompt MMQ path
+  if(TARGET strata_mmq)
+    target_compile_definitions(ds4_moe_cuda PRIVATE DS4_MOE_MMQ=1)
+    target_link_libraries(ds4_moe_cuda PUBLIC strata_mmq)
+  endif()
 
   # The gate's GPU arm: the SAME source, compiled with DS4_MOE_CUDA and linked against the CUDA flavour.  It is a
   # separate binary on purpose - the CPU gate's safety property (a binary that cannot initialise the driver) is not

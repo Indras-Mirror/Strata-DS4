@@ -1072,7 +1072,9 @@ if(STRATA_NATIVE_EXPERTS)
     # follows eddoursul/Strata 7706c1b)
     set(_strata_mmq_cuda_types ${_strata_mmq_types})
     if(STRATA_MMQ_KQUANTS)
-      list(APPEND _strata_mmq_cuda_types q4_k q5_k q5_1)
+      # q2_k / q3_k / mxfp4: MiMo-V2.6-Flash experts are Q2_K/Q3_K (prompt-chunk MMQ instances; without them the
+      # dispatch cases in moe_mmq.cu fail to link). Ported from branch mimo.
+      list(APPEND _strata_mmq_cuda_types q4_k q5_k q5_1 q2_k q3_k mxfp4)
     endif()
     foreach(_t IN LISTS _strata_mmq_cuda_types)
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)

@@ -46,6 +46,10 @@ struct NativeExpertLayout {
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob
+    // MiMo GSQ-RCO: the up projection's own type when it differs from the gate's (-1 = gu_type, every other model);
+    // set only by native_expert_layout3.  Gate and up rows are computed by different warps, so a block never mixes.
+    int up_type = -1;
+    size_t up_row = 0;
     // DeepSeek-V4's SwiGLU clamp (swiglu_clamp_exp): gate -> min(gate, lim), up -> clamp(up, -lim, lim) before
     // silu(gate) * up.  +inf (native_expert_layout's default, every other model) = no clamp, the same bits as before.
     float swiglu_limit = std::numeric_limits<float>::infinity();
@@ -55,8 +59,16 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
 /// prompt path's dequantizer takes both (checked for every layer at startup, before anything is allocated).
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;
 
+/// Gate and up of different types (MiMo GSQ-RCO): equal types give exactly `native_expert_layout`'s layout.
+NativeExpertLayout native_expert_layout3(int gate_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff);
+/// `native_expert_supported` for a gate/up/down triple: equal gate/up = the pair check; otherwise only the mixed
+/// pairs that have a kernel (Q2_K/Q3_K either way round).
+bool native_expert_supported3(int gate_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;
+
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
+/// out[t] = sum_k w[t*K + k] * parts[t*K + k] over rows of H floats, t < n (device pointers; the prompt chunk's mix).
+void weighted_rows_sum(const float* parts, const float* w, int K, int64_t H, int64_t n, float* out, void* stream);
 
 /// Grouped experts in the native format: group g's blob at device address grp_ptr[g]; its entries
 /// [grp_start[g], grp_start[g+1]) read token ent_tok[e]'s q8_1 activation (n_embd/32 blocks per token in x_q8_1)
