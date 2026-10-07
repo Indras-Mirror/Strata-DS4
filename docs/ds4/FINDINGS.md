@@ -514,3 +514,12 @@ re-read and checked); CPU check: 0 bytes differ outside the 21 replaced tensors 
 `ds4_mtp_bench` runs on it (3.5 ms/draft experts, resident).
 **NOT tested: the aligned head end to end** (real geometry needs the real trunk = GPU): acceptance A/B is GPU queue
 work.
+
+## 18. The +0.7 ms attention+router since the multi-token change: graph shapes (2026-10-07, CPU)
+
+`DS4_DBG_GRAPH=1` prints each attention graph variant's node count and op histogram once.  Old (`3e39323`, built in
+a scratch worktree with the same patch) vs now, n = 1 graphs, mini swa16, every variant (capacity doubling):
+ratio-4 layer 221 -> 243 nodes (+21 VIEW, +1 RESHAPE), ratio-128 layer 147 -> 165 (+19 VIEW, -1 RESHAPE).
+**No compute op was added** (CONT/CPY/MUL_MAT/... counts identical).  Views cost nothing on the CPU; on CUDA, the
+candidates are the CUDA-graph per-node update checks (~860 more nodes per token over 43 layers) - or noise (the
+0.7 ms was 2 runs each).  Not fixed (no evidence of cost); nsys on the GPU decides (GPU queue).

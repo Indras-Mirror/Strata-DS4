@@ -1353,6 +1353,24 @@ bool Ds4Dense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
         im.in_n = n;
     }
 
+    // DS4_DBG_GRAPH=1: each attention graph variant's node count and op histogram, once (A/B of graph shapes)
+    static const bool dbg_graph = std::getenv("DS4_DBG_GRAPH") != nullptr;
+    if (dbg_graph) {
+        static std::map<const void *, int> seen;
+        if (!seen.count(var->gf)) {
+            seen[var->gf] = 1;
+            std::map<std::string, int> hist;
+            const int nn = ggml_graph_n_nodes(var->gf);
+            for (int i = 0; i < nn; ++i) {
+                ggml_tensor * t = ggml_graph_node(var->gf, i);
+                std::string k = ggml_op_desc(t);
+                hist[k]++;
+            }
+            std::fprintf(stderr, "[graph] attn layer %d pos %lld: %d nodes |", il, (long long) pos0, nn);
+            for (auto & kv : hist) std::fprintf(stderr, " %s:%d", kv.first.c_str(), kv.second);
+            std::fprintf(stderr, "\n");
+        }
+    }
     if (ggml_backend_graph_compute(im.backend, var->gf) != GGML_STATUS_SUCCESS) {
         im.err = "attn graph compute failed";
         return false;
