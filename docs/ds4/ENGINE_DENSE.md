@@ -88,7 +88,10 @@ ratio arrays from the MTP file.  Drafting at position p (llama.cpp `deepseek4.cp
 `mtp_begin(tok[p+1])` replaces the state (the trunk's final hc streams, after its logits) with
 `eh_proj(concat(enorm(embd) x hc, hnorm(h)))`; the block runs through the usual `attn_router(_n)` / routed experts /
 `finish_layer(_n)` at position p with its own raw-window KV; `mtp_logits_n` = trunk `hc_head` ->
-`nextn.shared_head_norm` -> trunk `output`, predicting token p+2.  Works for n-token passes like every layer.
+`nextn.shared_head_norm` -> trunk `output`, predicting token p+2.  **Known bug (found 2026-10-07, not fixed yet): the MTP head
+must use the MTP file's own `output_hc_fn/base/scale`** (they differ substantially from the trunk's; llama.cpp loads
+the MTP file as its own model, so its graph_mtp uses that file's hc_head) - likely why real-model acceptance is 59.8%
+against the 74-93% measured with ik_llama.cpp.  See docs/ds4/RESUME_PROMPT.md task 1.  Works for n-token passes like every layer.
 
 Gate: `ds4_ref --mtp` runs the same block over the whole sequence (the oracle); `tools/ds4/make_mini_mtp.py` writes a
 mini MTP file (real random MXFP4 experts - the mini trunk's experts are all zeros).  The trunk's final state differs

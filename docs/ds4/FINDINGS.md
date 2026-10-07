@@ -384,3 +384,57 @@ still selects; a wrong guess wastes a DMA) but no end-to-end output check has ru
 vs llama.cpp and a real generation check before any tok/s counts. Predictions came from llama.cpp's hidden states on
 2 corpus files; recall on other text is untested. Next: build that engine (Phase 4b proper), predictor on the GPU.
 (a) llama.cpp fallback: same prefetch idea, but its cache only updates between graph runs - not started.
+
+## 13. The real engine on the GPU (2026-10-06 evening / 2026-10-07)
+
+The decode engine (`tools/ds4/ds4_generate.cpp` = `Ds4Dense` + `Ds4MoeTier`) runs the real 80.8 GiB model end to end:
+coherent text, first-token top-1 = llama.cpp's.  Speed ladder (p600 prompt, 128-token greedy decode): 5.6 tok/s ->
+CUDA graphs 9.7 -> fused `ggml_dsv4_hc_*` ops 11.2 -> 2150 slots 12.8 -> 70 GiB arena (no NVMe file-tier reads)
+16.25 -> pcie 0.55 + one input upload per token 16.97 -> `--dense-requant q6_k` 19.35 at 2350 hand-set slots.
+
+**Re-measured 2026-10-07 (the honest table - README corrected in `3a02f9c`):**
+
+| config | tok/s | hit | ppl |
+| --- | ---: | ---: | ---: |
+| q6_k, `--slots auto` (~2220-2230 slots), pre-multi-token binary | 17.21 | 68.4% | 10.47 |
+| q6_k, `--slots auto`, current binary (two runs) | 17.25 / 16.75 | 68.2% / 65.8% | 10.64 / 10.62 |
+| q6_k, `--slots auto --route-bias 0.05` (`combo`, 2026-10-06) | 19.08 | 75.1% | 10.77 |
+| q6_k, 2350 hand-set slots (at the VRAM edge; OOMed at pos 512 before `reserve_graphs`) | 19.35 | 74.6% | 10.55 |
+
+- ~120 fewer VRAM slots cost ~6 points of hit rate and ~2 tok/s: **VRAM is the scarcest resource** for this model.
+- **Perplexity moves by up to ~0.2 between identical runs** (10.47 vs 10.64): which experts the CPU vs the GPU computes
+  depends on timing and the two paths round differently (Q8_K vs q8_1 activations). Generated tokens diverge too
+  (`ab-old.ids` vs `ab-new.ids` differ from token 3). Compare configs on several runs, not one.
+- Attention+router is 22.24 ms on the multi-token binary vs 21.53 on the old one (+0.7 ms, reproduced on 2 runs) -
+  not explained (the larger input span is ~150 KB more per token: microseconds). Profile with nsys before guessing.
+
+**Multi-token passes (`c076a86`)** - `Ds4Dense::begin_tokens / attn_router_n / finish_layer_n / logits_n`, n <= 4
+(ENGINE_DENSE.md "Multi-token passes").  CPU: bit-identical to one-token decoding at every position, passes of 1-4
+tokens, both mini fixtures; n = 1 byte-identical to the pre-change build; mutation-tested (3 deliberate bugs, all
+caught).  CUDA: ggml-cuda picks other kernels for n > 1 columns (position 0 of a 2-token pass already differs 1.7%
+on the amplifying mini fixtures), so the CUDA gate is "as close to ds4_ref as one-token decoding": swa16 worst cos
+0.99678 (multi) vs 0.99687 (one-token), tame 0.99916 vs 0.99912.
+
+**MTP head (`c0cf7fa`, `a6e984b`, `cabe73f`)** - `/media/mal/NVME1TB/Models/DS4-MTP/DeepSeek-V4-Flash-MTP-bf16.gguf`
+(5.6 GB: 3.2 GB MXFP4 experts, ~0.45 GB BF16 dense, 2 GB duplicate token_embd/output that we skip).  Loads into
+`Ds4Dense` as layer 43 (`mtp_path`); `ds4_ref --mtp` is the oracle; `tools/ds4/make_mini_mtp.py` the mini fixture
+(real random MXFP4 experts - the mini trunk's expert blobs are all zeros).  CPU gate: fed the decoder's own trunk
+state (`DS4_DBG_MTP_H` -> `DS4_REF_MTP_H`), MTP logits cos 1.00000000 at all 62 positions, top-1 62/62.  Against the
+oracle's own trunk: cos 0.99996 - the trunk's final state differs from ds4_ref's by ~1 ulp (rel 1.6e-7) at every
+position, invisible in the trunk gate (zero experts) but amplified by the MTP's MXFP4 experts' Q8_0 activation rounding.
+
+**MTP acceptance on the real model (p600, q6_k, slots auto, `bench/ds4-2026-10-07/mtp-trace.log`):
+127 drafts, 76 accepted = 59.8%** (greedy: MTP's argmax at p == the trunk's next token).  Draft cost 16.2 ms
+(MTP experts = CPU ggml `mul_mat_id` straight off the MXFP4 file - v1).  That run decoded at 12.22 tok/s because each
+step also paid the draft and the hit rate was 62.5% (VRAM margin grew); ppl 10.56.
+Estimate (NOT measured): 1.6 tokens per verify pass; with a 16 ms draft ~22 tok/s, with a ~3 ms draft ~26-27.
+
+**OOM with `--mtp` (twice, `cudaGraphInstantiate`)**: fixed by `--slots auto` margin +0.25 GiB with `--mtp` (+0.75 with
+`--verify`) and the MTP file's remaining BF16 matrices -> Q8_0 at load (which of the two mattered is not isolated).
+`DS4_VRAM_TRACE=1` logs free VRAM per prefill step: ~44 MiB drops at positions 1, 5, 9, 17, 33, 65, 129 (the
+attention-graph capacity variants being captured as the compressed context doubles), finishing with 0.54 GiB free.
+After a CUDA abort, ggml's gdb backtrace on the 75 GB process drove MemAvailable under memguard's floor (watchdog
+kill): `memguard.sh` now exports `GGML_NO_BACKTRACE=1`.
+
+**`--verify` (`cabe73f`)**: greedy speculative loop written - each pass = [token, MTP draft] as one 2-token trunk pass
+(experts shared through `Ds4MoeTier::run_multi`), an accepted draft also yields the next token.  **Compiled, never run.**
