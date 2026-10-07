@@ -523,3 +523,42 @@ ratio-4 layer 221 -> 243 nodes (+21 VIEW, +1 RESHAPE), ratio-128 layer 147 -> 16
 **No compute op was added** (CONT/CPY/MUL_MAT/... counts identical).  Views cost nothing on the CPU; on CUDA, the
 candidates are the CUDA-graph per-node update checks (~860 more nodes per token over 43 layers) - or noise (the
 0.7 ms was 2 runs each).  Not fixed (no evidence of cost); nsys on the GPU decides (GPU queue).
+
+## 19. GPU session 2026-10-08: MTP acceptance A/B, CUDA-graph reuse, MiMo tier port (`bench/ds4-2026-10-08/`)
+
+Shared the GPU with the MiMo session (relay `strata-mimo`; every run through `bench/ds4-2026-10-08/q.sh` = wait for
+the lock AND MemAvailable >= 70 GiB, then memguard 80 78). p600 + 128 greedy, `--slots auto --arena-gib 70 --pcie
+0.55 --dense-requant q6_k --profile ...ds4routes.bin --ppl`.
+
+**MTP acceptance at depth 1** (127 drafts each):
+| head | acceptance | draft ms (experts / rest) | log |
+|---|---|---|---|
+| MTP file's own hc_head (`e54b5d9`) | **63.0%** (80) | 8.97 (7.20 / 1.77) | mtp-own-hc.log |
+| trunk hc_head (`DS4_MTP_TRUNK_HC=1`) | 56.7% (72) | 13.51 | mtp-trunk-hc.log |
+| 0731-aligned sidecar | 63.0% (80) | 25.30 (cold pages) | mtp-aligned.log |
+The hc_head fix is worth +6.3 points; the aligned sidecar adds nothing at depth 1. Still far below philpax's 0.74-0.93.
+Draft cost 9 ms when the MTP pages are warm (98% resident), 25 ms when cold - `--mtp-resident` matters.
+
+**Draft depth does not pay at this acceptance** (model: attention 22.3 + 1.5/extra token, experts 30.3 x {1, 1.75,
+2.4, 3.05, ...} (MiMo's measured miss scaling), 9 ms/draft): T=2 18.1 tok/s, T=3 16.8, T=6 12.5 at a = 0.63; even
+a = 0.80 peaks at 20.0 (T = 2-3). The road to 30 tok/s is a cheaper pass, not a deeper draft.
+
+**CUDA-graph reuse (`7efdf88`)**: our graphs had `cgraph->uid == 0`, so every `graph_compute` (~90 per token,
+165-243 nodes each) re-ran gallocr and `ggml_cuda_graph_update_required`'s per-node memcpy+memcmp on the CPU while
+the GPU waited (layers are serial). Each graph has its own gallocr and fixed inputs: allocate once, stamp
+`g->uid = ggml_graph_next_uid()`. `DS4_GRAPH_REUSE=0` = old path. CPU gates bit-identical either way.
+Measured: attention+router **22.31 -> 17.85 ms/token** (mtp-trunk-hc.log vs mtp-own-hc.log), ppl 10.47.
+Clean no-MTP A/B: reuse0 17.03 tok/s / attn 22.19 (b1-base-reuse0.log); reuse1 -> b1-base-reuse1.log.
+Dense weight floor: ~5 GiB read per token after requant (~6 ms at ~900 GB/s) - attention is still ~3x the floor;
+the rest is kernel count (~130 compute kernels/layer x 43, a few us each) and the per-layer syncs.
+
+**MiMo tier port (`a215ff1`) + un-gated LRU (`fb3a315`)**: `git checkout mimo --` of the shared tier files (DS4 never
+touched them since the fork). `--vram-lru`, `--arena-adapt`, `--arena-skip-resident` on ds4_generate (all opt-in).
+With skip-resident, the 2.2k VRAM-seeded experts leave the arena: ~8.7k remaining experts x 6.75 MB = ~55 GiB, so
+`--arena-gib 58` should hold every non-VRAM expert (file tier 0) and free ~12 GiB RAM for `--mtp-resident`.
+Results: b1-skipres.log, b1-lru-check.log (DS4_CHECK_LRU=1, must show 0 bad), b1-lru.log. LRU acts only in single-
+token `gpu_run`; `--verify`'s multi-token passes neither swap nor refresh recency (port it if LRU wins).
+
+Not tested: `test_ds4_dense --cuda` with reuse; `--verify` on CUDA; nsys. The load-time "dense compute buffers"
+report (one gallocr arena per graph, none shared: 43 layers x capacity variants x pass sizes) is in the source but
+the GPU binary used by batch 1 predates it - next GPU run prints it; if it is GiB-scale, sharing arenas buys slots.

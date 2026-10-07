@@ -11,6 +11,19 @@ RTX 4090 24 GB + Ryzen 7 5700X (8c, AVX2 only) + 90 GB DDR4. Public repo: https:
 Another session works on MiMo in `~/AI/Strata-MiMo` (branch `mimo`) - don't touch it; you share the GPU lock.
 Written 2026-10-07 at commit `83c5324` (end of a CPU-only session that did the whole CPU queue - FINDINGS s14-18).
 
+## UPDATE 2026-10-08 (read this first; FINDINGS s19)
+- Branch `deepseek4` +4 commits (not pushed): `a215ff1` MiMo tier port, `fb3a315` --vram-lru/--arena-adapt/
+  --arena-skip-resident for DS4, `7efdf88` CUDA-graph reuse (attention+router 22.3 -> 17.9 ms), + docs.
+- MTP acceptance (own hc_head) 63.0%; trunk head 56.7%; aligned sidecar 63.0% (no gain). Draft 9 ms warm.
+- Depth > 1 does not pay at this acceptance (s19 model). Target = cheaper single pass: attention (kernel count,
+  syncs), expert hit rate (LRU, skip-resident, route-bias, compute-buffer VRAM), then --verify depth 1.
+- GPU sharing: MiMo session on relay as `strata-mimo`, this one `strata-ds4`; queue every full run with
+  `bench/ds4-2026-10-08/q.sh <log> <extra args>` (waits for lock + 70 GiB, then memguard). Don't rebuild
+  build-ds4-gpu while a queued batch may still start a run (or run from a copied binary).
+- Batch 1 (`bench/ds4-2026-10-08/batch1.sh`, may still be running): b1-base-reuse{0,1}, b1-skipres, b1-lru-check
+  (DS4_CHECK_LRU=1: require 0 BAD), b1-lru. Read them, fill s19, then: rebuild GPU tree (compute-buffer report),
+  route-bias 0.05 + best tier flags, port LRU to the multi-token path if it wins, --mtp-resident + --verify on CUDA.
+
 ## GPU first: ask me whether it is free
 The CPU work queue is done. What is left needs the GPU (MiMo session may still have it): **ask me before any GPU
 run**, and if it is busy, only CPU work (see "If the GPU is still busy" at the end). Compiling `build-ds4-gpu` is fine.

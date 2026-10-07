@@ -1456,6 +1456,23 @@ bool Ds4Dense::reserve_graphs(int n_max) {
             im.err = "reserve: mtp"; return false;
         }
     }
+    // where the dense half's compute-buffer VRAM goes: one gallocr arena per graph, none shared
+    {
+        auto sz = [](ggml_gallocr_t a) { return a ? (double) ggml_gallocr_get_buffer_size(a, 0) : 0.0; };
+        double attn = 0, attn_max = 0, fin = 0, pred = 0, other = 0;
+        int64_t n_attn = 0;
+        for (Impl::Layer & L : im.ly) {
+            for (Impl::Var & v : L.vars) { const double b = sz(v.allo); attn += b; attn_max = std::max(attn_max, b); ++n_attn; }
+            for (ggml_gallocr_t a : L.allo_finish) fin += sz(a);
+            pred += sz(L.allo_predict);
+        }
+        for (int n = 0; n <= (int) kNtMax; ++n) other += sz(im.allo_init[n]) + sz(im.allo_head[n]);
+        for (int n = 0; n <= (int) kNtMax; ++n) other += sz(im.allo_mtp_in[n]) + sz(im.allo_mtp_head[n]);
+        const double M = 1048576.0;
+        std::fprintf(stderr, "dense compute buffers: attention %.0f MiB (%lld graphs, largest %.1f MiB), finish %.0f, "
+                             "predict %.0f, init/head/mtp %.0f MiB\n", attn / M, (long long) n_attn, attn_max / M,
+                     fin / M, pred / M, other / M);
+    }
     return true;
 }
 
