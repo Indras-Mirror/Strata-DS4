@@ -469,5 +469,30 @@ Mutation tests: a skipped position on one reject was NOT caught by token equalit
 survived it) - hence the logits-row gate, which catches it (3 failures); reusing a position on an accept: 7
 failures; MTP on accept run for the last position only: 15 failures (draft gate).  The draft gate also caught a
 stale dump in the new test hook itself (fixed).
-No loop bug was found.  **NOT tested: CUDA** (n=2 kernels round differently there, so equality vs plain greedy will
+No loop bug was found (29/29 after task 3 added `--mtp-resident` cases).  **NOT tested: CUDA** (n=2 kernels round differently there, so equality vs plain greedy will
 only be approximate - GPU queue item 2) **and real-model acceptance/speed.**
+
+## 16. The 16 ms MTP draft is page faults, not the MXFP4 kernel (2026-10-07, CPU, `tools/ds4/ds4_mtp_bench.cpp`)
+
+`ds4_mtp_bench` times `MtpExperts::run` (now in `tools/ds4/mtp_experts.hpp`, shared with ds4_generate) on the REAL
+MTP file with random routed ids (6 experts = 80.2 MB MXFP4 per draft), under an 8 GB cgroup:
+
+| state of the MTP file's pages | threads | ms/draft (experts) | effective GB/s |
+|---|---|---|---|
+| warm (page cache) | 8 / 6 / 4 / 2 | 3.55 / **3.29** / 3.47 / 5.50 | 22.6 / 24.4 / 23.1 / 14.6 |
+| `--resident` copy (anonymous RAM) | 6 | 3.34 | 24.0 |
+| starting uncached (first touch, 60 runs) | 8 | 17.73 mean (min 3.2, max 32.8) | 4.5 |
+| `MADV_PAGEOUT` before every run | 8 | 9.90 mean (max 18.6) | 8.1 |
+
+The ggml MXFP4 CPU path is bandwidth-bound and fine (~23 GB/s, the same as the tier's CPU pool).  The 16.2 ms/draft
+of the real run matches the cold rows: under memguard's 80 GB cap (which counts page cache) next to a 70 GiB pinned
+arena, the MTP file's pages are evicted.  So "Option A" (the tier's CPU pool on MXFP4) would not help; residency does.
+- `ds4_generate --mtp-resident`: copies the 3.2 GB of MTP experts into anonymous RAM at load.  CPU gate: drafts
+  bit-identical to the mmap path (verify-cpu run.sh, 3 prompts).  Costs 3.2 GB of the 80 GB cap - the GPU run must
+  check whether the arena has to shrink (file-tier reads cost ~5 ms each: trading 3 GiB of arena may cost more than
+  it saves).  Alternatives if RAM is too tight: keep only the hot MTP experts resident (needs the MTP routing skew),
+  or a smaller expert format (quality cost).
+- The MTP report line now splits the draft (`routed experts X, rest Y` ms) and prints how much of the MTP expert
+  bytes are in RAM at the end (`mincore`; 100% with the copy) - the next GPU run shows directly whether eviction
+  happened.
+**NOT measured: any of this on the real model run** (GPU queue).

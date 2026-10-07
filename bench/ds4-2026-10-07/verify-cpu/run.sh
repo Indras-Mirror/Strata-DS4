@@ -29,6 +29,8 @@ for i in 0 1 2; do
   gen $ref --ids $ids -n 40
   gen $ref.mtp --ids $ids -n 40 --mtp $D/mini-ds4-mtp.gguf      # plain greedy + MTP drafts at every position
   chk "p$i plain --mtp" $ref $ref.lg $ref.mtp
+  gen $ref.mtpres --ids $ids -n 40 --mtp $D/mini-ds4-mtp.gguf --mtp-resident   # resident MTP experts: same drafts
+  chk "p$i plain --mtp --mtp-resident" $ref $ref.lg $ref.mtpres $ref.mtp
   gen $O/p$i.v --ids $ids -n 40 --mtp $D/mini-ds4-mtp.gguf --verify
   chk "p$i verify (MTP drafts)" $ref $ref.lg $O/p$i.v $ref.mtp
   for c in 0 3 2; do

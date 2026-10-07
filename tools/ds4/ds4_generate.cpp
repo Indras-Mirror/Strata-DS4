@@ -23,8 +23,12 @@
 // 2-token pass (experts of the two tokens read once, Ds4MoeTier::run_multi); the draft is kept when it equals the
 // trunk's argmax, which also yields the next token for free.  A rejected draft's position is simply decoded again
 // (all state is position-indexed).  Same tokens as plain greedy decoding, up to GPU rounding.
+// --mtp-resident: copy the MTP experts (3.2 GB MXFP4) into anonymous RAM at load instead of reading them off the
+// file's mmap: warm, a draft's experts take ~3.5 ms (ds4_mtp_bench, 2026-10-07); with the file's pages evicted
+// ~10-18 ms.  Costs 3.2 GB of the memguard cap (the arena may have to shrink).
 #include "ds4_dense.hpp"
 #include "ds4_moe.hpp"
+#include "mtp_experts.hpp"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -65,6 +69,7 @@ struct Args {
     float route_bias = 0.0f;
     std::string mtp;             // the MTP head's GGUF: draft + acceptance stats
     bool verify = false;         // --verify: speculative decoding with the MTP draft
+    bool mtp_resident = false;   // --mtp-resident: the MTP experts copied into RAM at load (not the file's mmap)
     std::string dense_requant;   // q4_k | q5_k | q6_k: requantize the big Q8_0 dense matrices at load   // cache-aware routing: + this to the selection score of VRAM-resident experts   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
 };
 
@@ -84,7 +89,8 @@ void usage() {
     std::fprintf(stderr,
         "usage: ds4_generate -m model.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend cuda|cpu]\n"
         "       [--experts gpu|cpu] [--slots 2150] [--pcie 0.25] [--pf-b 1.43] [--profile ds4routes.bin]\n"
-        "       [--arena-gib 60] [--threads N] [--ctx N] [--temp 0] [--seed 1] [--stop id,id] [--dump-logits f.f32] [--quiet]\n");
+        "       [--arena-gib 60] [--threads N] [--ctx N] [--temp 0] [--seed 1] [--stop id,id] [--dump-logits f.f32] [--quiet]\n"
+        "       [--mtp FILE [--verify] [--mtp-resident]]\n");
 }
 
 bool parse(int argc, char** argv, Args& a) {
@@ -115,6 +121,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--route-bias") a.route_bias = (float) std::atof(next().c_str());
         else if (k == "--mtp") a.mtp = next();
         else if (k == "--verify") a.verify = true;
+        else if (k == "--mtp-resident") a.mtp_resident = true;
         else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (!a.ids_csv.empty() || !a.ids_file.empty());
@@ -135,86 +142,6 @@ int sample(const float* logits, int n_vocab, float temp, std::mt19937_64& rng) {
     for (int i = 0; i < n_vocab; ++i) if ((r -= p[(size_t) i]) <= 0) return i;
     return n_vocab - 1;
 }
-
-// The MTP block's routed experts, v1: a CPU ggml mul_mat_id straight off the MTP file (MXFP4, bound zero-copy on its
-// mmap) - ~13 MB per expert, 6 per draft.  Not in the expert tier (whose CUDA kernels do not do MXFP4).
-struct MtpExperts {
-    std::unique_ptr<strata::GgufModel> model;
-    ggml_context* wctx = nullptr;
-    ggml_context* ctx = nullptr;
-    ggml_backend_t be = nullptr;
-    ggml_backend_buffer_t wbuf = nullptr;
-    ggml_gallocr_t allo = nullptr;
-    ggml_cgraph* gf = nullptr;
-    ggml_tensor *t_x = nullptr, *t_id = nullptr, *t_w = nullptr, *out = nullptr;
-    int64_t D = 0, K = 0;
-    std::vector<float> host;
-
-    bool init(const std::string& path, int il, int64_t n_embd, int64_t topk, float clamp, int threads, std::string& err) {
-        model = std::make_unique<strata::GgufModel>(strata::GgufModel::open(path));
-        if (model->size() != 1) { err = "MTP experts: cannot open " + path + " (single file expected)"; return false; }
-        D = n_embd; K = topk;
-        be = ggml_backend_cpu_init();
-        ggml_backend_cpu_set_n_threads(be, threads);
-        ggml_init_params ip = { 16 * 1024 * 1024, nullptr, true };
-        wctx = ggml_init(ip);
-        ctx = ggml_init(ip);
-        const strata::GgufFile& sh = model->shard(0);
-        const auto& ts = sh.tensors();
-        uint8_t* base = const_cast<uint8_t*>(sh.tensor_data(ts[0])) - sh.data_start() - ts[0].offset;
-        wbuf = ggml_backend_cpu_buffer_from_ptr(base, (size_t) sh.file_size());
-        auto bind = [&](const std::string& n) -> ggml_tensor* {
-            const strata::TensorInfo* ti = model->find(n);
-            if (!ti) { err = "MTP experts: no " + n; return nullptr; }
-            int64_t ne[4] = { 1, 1, 1, 1 };
-            for (size_t d = 0; d < ti->shape.size(); ++d) ne[d] = (int64_t) ti->shape[d];
-            ggml_tensor* t = ggml_new_tensor(wctx, (ggml_type) ti->type, (int) ti->shape.size(), ne);
-            if (ggml_backend_tensor_alloc(wbuf, t, const_cast<uint8_t*>(sh.tensor_data(*ti))) != GGML_STATUS_SUCCESS) {
-                err = "MTP experts: cannot bind " + n; return nullptr;
-            }
-            return t;
-        };
-        const std::string p = "blk." + std::to_string(il) + ".";
-        ggml_tensor *gate_w = bind(p + "ffn_gate_exps.weight"), *up_w = bind(p + "ffn_up_exps.weight"),
-                    *down_w = bind(p + "ffn_down_exps.weight");
-        if (!gate_w || !up_w || !down_w) return false;
-        t_x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, 1, 1);
-        t_id = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, K, 1);
-        t_w  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, K, 1);
-        for (ggml_tensor* t : { t_x, t_id, t_w }) ggml_set_input(t);
-        ggml_tensor* up = ggml_clamp(ctx, ggml_mul_mat_id(ctx, up_w, t_x, t_id), -clamp, clamp);
-        ggml_tensor* gate = ggml_clamp(ctx, ggml_mul_mat_id(ctx, gate_w, t_x, t_id), -INFINITY, clamp);
-        ggml_tensor* down = ggml_mul(ctx, ggml_mul_mat_id(ctx, down_w, ggml_swiglu_split(ctx, gate, up), t_id), t_w);
-        for (int64_t k = 0; k < K; ++k) {
-            ggml_tensor* v = ggml_view_2d(ctx, down, D, 1, down->nb[2], (size_t) k * down->nb[1]);
-            out = out ? ggml_add(ctx, out, v) : v;
-        }
-        ggml_set_output(out);
-        gf = ggml_new_graph_custom(ctx, 256, false);
-        ggml_build_forward_expand(gf, out);
-        allo = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
-        if (!allo || !ggml_gallocr_alloc_graph(allo, gf)) { err = "MTP experts: graph alloc failed"; return false; }
-        host.resize((size_t) D);
-        return true;
-    }
-    // ids/w: K entries; x: D floats -> out D floats (the weighted routed sum)
-    bool run(const float* x, const int* ids, const float* w, float* o) {
-        std::vector<int32_t> iv(ids, ids + K);
-        ggml_backend_tensor_set(t_x, x, 0, (size_t) D * 4);
-        ggml_backend_tensor_set(t_id, iv.data(), 0, iv.size() * 4);
-        ggml_backend_tensor_set(t_w, w, 0, (size_t) K * 4);
-        if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) return false;
-        ggml_backend_tensor_get(out, o, 0, (size_t) D * 4);
-        return true;
-    }
-    ~MtpExperts() {
-        if (allo) ggml_gallocr_free(allo);
-        if (wbuf) ggml_backend_buffer_free(wbuf);
-        if (ctx) ggml_free(ctx);
-        if (wctx) ggml_free(wctx);
-        if (be) ggml_backend_free(be);
-    }
-};
 
 }  // namespace
 
@@ -300,10 +227,11 @@ int main(int argc, char** argv) {
     const int n_layer = (int) dense.n_layer();
     // ---- MTP head (draft + acceptance stats)
     const int il_mtp = dense.mtp_layer();
-    MtpExperts mtp_x;
+    ds4::MtpExperts mtp_x;
     if (il_mtp >= 0) {
         if (!mtp_x.init(a.mtp, il_mtp, dense.geom().n_embd, dense.geom().n_expert_used,
-                        (float) dense.geom().swiglu_clamp_exp[(size_t) il_mtp], a.threads > 0 ? a.threads : 8, err)) {
+                        (float) dense.geom().swiglu_clamp_exp[(size_t) il_mtp], a.threads > 0 ? a.threads : 8, err,
+                        a.mtp_resident)) {
             std::fprintf(stderr, "ds4_generate: %s\n", err.c_str());
             return 1;
         }
@@ -354,7 +282,7 @@ int main(int argc, char** argv) {
     };
 
     // the MTP block at position `pos` with the token that follows it -> its argmax (the draft for pos + 2)
-    double t_mtp = 0;
+    double t_mtp = 0, t_mtp_x = 0;   // per draft: total, of which the routed experts
     int n_mtp = 0;
     const int NT = dense.max_tokens();
     std::vector<int> mids((size_t) (top_k * NT));
@@ -377,9 +305,11 @@ int main(int argc, char** argv) {
         const float* x = nullptr;
         if (!dense.mtp_begin(next_toks, n)) return false;
         if (!dense.attn_router_n(il_mtp, pos0, n, mids.data(), mw.data(), &x)) return false;
+        const double tx0 = now_ms();
         for (int t = 0; t < n; ++t)
             if (!mtp_x.run(x + (size_t) t * n_embd, mids.data() + t * top_k, mw.data() + t * top_k,
                            mrouted.data() + (size_t) t * n_embd)) return false;
+        t_mtp_x += now_ms() - tx0;
         if (!dense.finish_layer_n(il_mtp, n, mrouted.data())) return false;
         const float* lg = nullptr;
         int nv = 0;
@@ -472,7 +402,7 @@ int main(int argc, char** argv) {
     int n_vocab = 0;
     const double t_dec0 = now_ms();
     timing = true;
-    t_mtp = 0; n_mtp = 0;
+    t_mtp = 0; t_mtp_x = 0; n_mtp = 0;
     int draft = -1, n_drafts = 0, n_accept = 0;
     int n_passes = 0;
     // DS4_DUMP_TOKLOGITS=<file>: the logits row behind every emitted token, appended (f32 x n_vocab each) - the verify
@@ -609,8 +539,10 @@ int main(int argc, char** argv) {
                  t_ph[3] / dec_steps, t_ph[4] / dec_steps);
     if (il_mtp >= 0)
         std::fprintf(stderr, "MTP: %d drafts, %d accepted = %.1f%% (greedy: draft == the next decoded token); "
-                             "%.2f ms/draft\n", n_drafts, n_accept, n_drafts ? 100.0 * n_accept / n_drafts : 0.0,
-                     n_mtp ? t_mtp / n_mtp : 0.0);
+                             "%.2f ms/draft (routed experts %.2f, rest %.2f); expert pages in RAM %.0f%%%s\n",
+                     n_drafts, n_accept, n_drafts ? 100.0 * n_accept / n_drafts : 0.0, n_mtp ? t_mtp / n_mtp : 0.0,
+                     n_mtp ? t_mtp_x / n_mtp : 0.0, n_mtp ? (t_mtp - t_mtp_x) / n_mtp : 0.0,
+                     100.0 * mtp_x.resident_frac(), a.mtp_resident ? " (--mtp-resident copy)" : " (file mmap)");
     std::fprintf(stderr, "tier ms/token: wall %.2f (gpu hits %.2f, pcie %.2f, cpu pool %.2f)\n", st.wall_ms / dec_steps,
                  st.hit_ms / dec_steps, st.pcie_ms / dec_steps, st.cpu_ms / dec_steps);
     {
