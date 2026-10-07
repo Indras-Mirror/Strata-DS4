@@ -121,8 +121,10 @@ struct Weights {
 };
 
 // `prefix` non-empty: bind only the tensors whose name starts with it (the MTP file: its own block, not its
-// duplicate token_embd/output).  A second call appends to the same context.
-static bool load_weights(const GgufModel & model, Weights & w, const std::string & prefix = "") {
+// duplicate token_embd/output), plus those named in `alias` (file name -> bound name: the MTP file's own hc_head).
+// A second call appends to the same context.
+static bool load_weights(const GgufModel & model, Weights & w, const std::string & prefix = "",
+                         const std::map<std::string, std::string> & alias = {}) {
     if (!w.ctx) {
         ggml_init_params ip = { /*mem_size*/ 1024ull * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
         w.ctx = ggml_init(ip);
@@ -140,19 +142,20 @@ static bool load_weights(const GgufModel & model, Weights & w, const std::string
         if (!buf) { std::fprintf(stderr, "[ds4_ref] cannot wrap %s\n", sh.path().c_str()); return false; }
         w.bufs.push_back(buf);
         for (const auto & ti : tensors) {
-            if (!prefix.empty() && ti.name.rfind(prefix, 0) != 0) continue;
+            if (!prefix.empty() && ti.name.rfind(prefix, 0) != 0 && !alias.count(ti.name)) continue;
+            const std::string nm = alias.count(ti.name) ? alias.at(ti.name) : ti.name;
             if (!model.in_bounds(ti, s)) { std::fprintf(stderr, "[ds4_ref] %s out of bounds\n", ti.name.c_str()); return false; }
             int64_t ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
             for (size_t d = 0; d < ti.shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) ti.shape[d];
             ggml_tensor * t = ggml_new_tensor(w.ctx, (ggml_type) ti.type, (int) ti.shape.size(), ne);
             if (!t) { std::fprintf(stderr, "[ds4_ref] cannot create %s\n", ti.name.c_str()); return false; }
-            ggml_set_name(t, ti.name.c_str());
+            ggml_set_name(t, nm.c_str());
             if (ggml_backend_tensor_alloc(buf, t, const_cast<uint8_t *>(sh.tensor_data(ti))) != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "[ds4_ref] cannot bind %s\n", ti.name.c_str());
                 return false;
             }
-            if (w.t.count(ti.name)) { std::fprintf(stderr, "[ds4_ref] duplicate tensor %s\n", ti.name.c_str()); return false; }
-            w.t[ti.name] = t;
+            if (w.t.count(nm)) { std::fprintf(stderr, "[ds4_ref] duplicate tensor %s\n", nm.c_str()); return false; }
+            w.t[nm] = t;
             w.n_tensors++;
         }
     }
@@ -728,7 +731,7 @@ int main(int argc, char ** argv) {
         if (mtp_model->size() == 0) { std::fprintf(stderr, "error: cannot open %s\n", mtp_path.c_str()); return 1; }
         if (!(err = ds4_attach_mtp(*mtp_model, g, il_mtp)).empty()) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
         const int64_t before = w.n_tensors;
-        if (!load_weights(*mtp_model, w, "blk." + std::to_string(il_mtp) + ".")) {
+        if (!load_weights(*mtp_model, w, "blk." + std::to_string(il_mtp) + ".", ds4_mtp_head_alias())) {
             std::fprintf(stderr, "error: MTP weight load failed\n"); return 1;
         }
         std::printf("[ds4_ref] MTP block %lld: bound %lld tensors from %s\n", (long long) il_mtp,
@@ -1021,14 +1024,16 @@ int main(int argc, char ** argv) {
     std::vector<float> h_trunk = hc_state;   // the trunk's final hc streams (the MTP block's `h` input)
 
     // ---------------- head: hc_head -> norm -> output, over hc_state; `pfx` "" = the trunk's, "mtp_" = the MTP block's
+    // (its own hc_head, bound as mtp.output_hc_*; the trunk's output matrix)
     auto do_head = [&](ggml_tensor * norm_w, const std::string & pfx) -> bool {
+        const std::string hp = pfx.empty() ? "" : "mtp.";
         G.fills.clear();
         ggml_tensor * xin = G.input({D, hc, nt}, hc_state.data(), hc_state.size() * 4);
         ggml_tensor * flat = ggml_reshape_2d(w.ctx, xin, hc * D, nt);
         ggml_tensor * flat_norm = ggml_rms_norm(w.ctx, flat, (float) g.rms_eps);
-        ggml_tensor * mixes = ggml_mul_mat(w.ctx, w.get("output_hc_fn.weight"), flat_norm);   // [hc, nt]
-        ggml_tensor * scale = w.get("output_hc_scale.weight");
-        ggml_tensor * base  = w.get("output_hc_base.weight");
+        ggml_tensor * mixes = ggml_mul_mat(w.ctx, w.get(hp + "output_hc_fn.weight"), flat_norm);   // [hc, nt]
+        ggml_tensor * scale = w.get(hp + "output_hc_scale.weight");
+        ggml_tensor * base  = w.get(hp + "output_hc_base.weight");
         ggml_tensor * pre = ggml_sigmoid(w.ctx, G.hc_affine(mixes, G.view1(scale, 1, 0), G.view1(base, hc, 0)));
         pre = ggml_scale_bias(w.ctx, pre, 1.0f, (float) g.hc_eps);
         ggml_tensor * hc_head = G.hc_mean(xin, pre);

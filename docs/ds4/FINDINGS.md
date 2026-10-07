@@ -438,3 +438,18 @@ kill): `memguard.sh` now exports `GGML_NO_BACKTRACE=1`.
 
 **`--verify` (`cabe73f`)**: greedy speculative loop written - each pass = [token, MTP draft] as one 2-token trunk pass
 (experts shared through `Ds4MoeTier::run_multi`), an accepted draft also yields the next token.  **Compiled, never run.**
+
+## 14. MTP head uses its own hc_head (2026-10-07, CPU-only session)
+
+The MTP head now finishes with the MTP file's own `output_hc_fn/base/scale` (bound as `mtp.output_hc_*`) instead of
+the trunk's - in `Ds4Dense`, the `ds4_ref --mtp` oracle and `make_mini_mtp.py` (whose fixture now carries its own
+hc_head, scale 2.0, fn/base from its own rng, appended last so every earlier tensor is unchanged).  llama.cpp
+(`src/models/deepseek4.cpp:95-106`) loads the MTP file as its own model with `hc_head_*` required, so this matches it.
+`DS4_MTP_TRUNK_HC=1` restores the old head (GPU A/B later).  `token_embd`/`output` stay the trunk's (0731).
+
+CPU gates (`bench/ds4-2026-10-06/dense`): trunk swa16 40/40 + tame 63/63 multi bit-identical, PASS; MTP exact form
+(decoder's own trunk state): worst cos 0.99999996, top-1 62/62, MTP in multi passes bit-identical 63/63, PASS.
+Mutation: `DS4_MTP_TRUNK_HC=1` -> worst cos 0.986, 62/62 positions below the gate, top-1 55/62, FAIL (caught).
+The old fixture (`mini-ds4-mtp.pre-hchead.gguf`, no own hc_head) is refused at attach.  `ds4_generate` on the CPU
+(`CUDA_VISIBLE_DEVICES=` - no GPU touched): output byte-identical with and without `--mtp`.
+**NOT measured: real-model acceptance with the fix** (GPU queue item 1).

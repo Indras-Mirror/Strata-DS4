@@ -262,6 +262,8 @@ inline std::string ds4_attach_mtp(const GgufModel& mtp, Ds4Geometry& g, int64_t&
     for (const char* n : { "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight", "attn_norm.weight",
                            "ffn_gate_inp.weight", "ffn_gate_exps.weight" })
         if (mtp.find(p + n) == nullptr) return "MTP file has no " + p + n;
+    for (const char* n : { "output_hc_fn.weight", "output_hc_base.weight", "output_hc_scale.weight" })
+        if (mtp.find(n) == nullptr) return std::string("MTP file has no ") + n + " (its own hc_head)";
     const GgufFile& f = mtp.meta();
     uint64_t u = 0;
     std::string err;
@@ -278,6 +280,18 @@ inline std::string ds4_attach_mtp(const GgufModel& mtp, Ds4Geometry& g, int64_t&
     if ((int64_t)g.compress_ratios.size() <= il_mtp) g.compress_ratios.resize((size_t)il_mtp + 1, 0);
     if (g.compress_ratios[(size_t)il_mtp] != 0) return "MTP block is not a ratio-0 (sliding-window) layer";
     return {};
+}
+
+/// The MTP head's own hc_head weights: loaded from the MTP file next to the trunk's under these names.  They are not
+/// the trunk's (real file: output_hc_scale 1.65 vs the 0731 trunk's 0.79) - llama.cpp loads the MTP file as its own
+/// model, so its graph_mtp uses the file's hc_head_*.
+inline const std::map<std::string, std::string>& ds4_mtp_head_alias() {
+    static const std::map<std::string, std::string> m = {
+        { "output_hc_fn.weight", "mtp.output_hc_fn.weight" },
+        { "output_hc_base.weight", "mtp.output_hc_base.weight" },
+        { "output_hc_scale.weight", "mtp.output_hc_scale.weight" },
+    };
+    return m;
 }
 
 // ------------------------------------------------------------------ the tensor map

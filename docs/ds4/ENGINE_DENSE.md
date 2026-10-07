@@ -87,11 +87,13 @@ sliding-window layer (`mtp_layer()`; `n_layer()` stays the trunk's).  `ds4_attac
 ratio arrays from the MTP file.  Drafting at position p (llama.cpp `deepseek4.cpp` graph_mtp):
 `mtp_begin(tok[p+1])` replaces the state (the trunk's final hc streams, after its logits) with
 `eh_proj(concat(enorm(embd) x hc, hnorm(h)))`; the block runs through the usual `attn_router(_n)` / routed experts /
-`finish_layer(_n)` at position p with its own raw-window KV; `mtp_logits_n` = trunk `hc_head` ->
-`nextn.shared_head_norm` -> trunk `output`, predicting token p+2.  **Known bug (found 2026-10-07, not fixed yet): the MTP head
-must use the MTP file's own `output_hc_fn/base/scale`** (they differ substantially from the trunk's; llama.cpp loads
-the MTP file as its own model, so its graph_mtp uses that file's hc_head) - likely why real-model acceptance is 59.8%
-against the 74-93% measured with ik_llama.cpp.  See docs/ds4/RESUME_PROMPT.md task 1.  Works for n-token passes like every layer.
+`finish_layer(_n)` at position p with its own raw-window KV; `mtp_logits_n` = the MTP file's OWN `hc_head`
+(`output_hc_fn/base/scale`, bound as `mtp.output_hc_*` via `ds4_mtp_head_alias()`) -> `nextn.shared_head_norm` ->
+the trunk's `output`, predicting token p+2.  The MTP file's hc_head differs substantially from the trunk's (real
+file: scale 1.65 vs 0.79); llama.cpp loads the MTP file as its own model, so its graph_mtp uses the file's.  Until
+2026-10-07 we used the trunk's (59.8% real acceptance with it); `DS4_MTP_TRUNK_HC=1` restores that for A/B.
+`ds4_attach_mtp` refuses an MTP file without its own `output_hc_*`.  The MTP head keeps the trunk's (0731)
+`token_embd`/`output`: the file's copies are BF16 copies of the original V4's - an A/B for later. Works for n-token passes like every layer.
 
 Gate: `ds4_ref --mtp` runs the same block over the whole sequence (the oracle); `tools/ds4/make_mini_mtp.py` writes a
 mini MTP file (real random MXFP4 experts - the mini trunk's experts are all zeros).  The trunk's final state differs

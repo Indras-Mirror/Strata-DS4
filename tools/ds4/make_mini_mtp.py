@@ -5,8 +5,9 @@ The real MTP head ships as its own GGUF (DeepSeek-V4-Flash-MTP-bf16.gguf): block
 sliding-window layer plus the nextn tensors (eh_proj, enorm, hnorm, shared_head_norm), MXFP4 routed experts.  This
 writes the same tensor set at the mini geometry (layer index L = 2), with tame 1/sqrt(fan_in) weights like
 bench/ds4-2026-10-06/dense/make_mini_tame.py and - unlike the mini trunk, whose expert blobs are all zeros - real
-random MXFP4 experts, so the gate exercises the MXFP4 expert path too.  token_embd / output / output_hc_* are not
-written: the MTP head uses the trunk's (the real file's copies are duplicates).
+random MXFP4 experts, so the gate exercises the MXFP4 expert path too.  The MTP head's own hc_head (`output_hc_*`,
+like the real file's) is written with values unlike the trunk's, so a head that used the trunk's would fail the gate.
+token_embd / output are not written: the MTP head uses the trunk's (the real file's are original-V4 copies).
 
     python3 tools/ds4/make_mini_mtp.py <out.gguf>
 
@@ -61,6 +62,10 @@ def tensors():
         (p + "ffn_gate_shexp.weight", [D, M.NFF * M.NSHEXP], "F16"),
         (p + "ffn_up_shexp.weight", [D, M.NFF * M.NSHEXP], "F16"),
         (p + "ffn_down_shexp.weight", [M.NFF * M.NSHEXP, D], "F16"),
+        # appended last so the rng stream (and every tensor above) stays what the seed-11 fixture always had
+        ("output_hc_fn.weight", [HC * D, HC], "F16"),
+        ("output_hc_base.weight", [HC], "F32"),
+        ("output_hc_scale.weight", [1], "F32"),
     ]
 
 
@@ -78,7 +83,9 @@ def write_model(path: Path) -> None:
         n = int(np.prod(ne))
         np_shape = tuple(reversed(ne))          # gguf-py writes dims reversed
         x = rng.standard_normal(n).astype(np.float32).reshape(np_shape)
-        if name.endswith("norm.weight"):
+        if name == "output_hc_scale.weight":
+            x = np.full(np_shape, 2.0, np.float32)   # the real MTP file's is ~2x the trunk's
+        elif name.endswith("norm.weight"):
             x = 1.0 + 0.1 * x                   # norm gains near 1, like a trained checkpoint
         elif len(ne) >= 2 or name.endswith("_fn.weight"):
             x = x / math.sqrt(float(ne[0]))     # 1/sqrt(fan_in)

@@ -82,16 +82,19 @@ bool requant_target(const std::string & n) {
 }
 
 // `prefix` non-empty: only the tensors whose name starts with it (the MTP file: its own block - its token_embd and
-// output duplicate the trunk's).  A second call appends to the same store.
+// output duplicate the trunk's), plus those named in `alias` (file name -> store name: the MTP file's own hc_head
+// weights, which differ from the trunk's).  A second call appends to the same store.
 bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, bool skip_experts, int requant,
-                  std::string & err, const std::string & prefix = "") {
+                  std::string & err, const std::string & prefix = "",
+                  const std::map<std::string, std::string> & alias = {}) {
     if (!w.ctx) {
         ggml_init_params ip = { /*mem_size*/ 256ull * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
         w.ctx = ggml_init(ip);
         if (!w.ctx) { err = "ggml_init(weights) failed"; return false; }
     }
     ggml_set_no_alloc(w.ctx, true);
-    auto wanted = [&](const std::string & n) { return prefix.empty() || n.rfind(prefix, 0) == 0; };
+    auto wanted = [&](const std::string & n) { return prefix.empty() || n.rfind(prefix, 0) == 0 || alias.count(n); };
+    auto sname = [&](const std::string & n) { auto it = alias.find(n); return it == alias.end() ? n : it->second; };
 
     const bool cpu = ggml_backend_get_default_buffer_type(backend) == ggml_backend_cpu_buffer_type();
 
@@ -113,12 +116,12 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, b
                 for (size_t d = 0; d < ti.shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) ti.shape[d];
                 ggml_tensor * t = ggml_new_tensor(w.ctx, (ggml_type) ti.type, (int) ti.shape.size(), ne);
                 if (!t) { err = "cannot create " + ti.name; return false; }
-                ggml_set_name(t, ti.name.c_str());
+                ggml_set_name(t, sname(ti.name).c_str());
                 if (ggml_backend_tensor_alloc(buf, t, const_cast<uint8_t *>(sh.tensor_data(ti))) != GGML_STATUS_SUCCESS) {
                     err = "cannot bind " + ti.name;
                     return false;
                 }
-                w.t[ti.name] = t;
+                w.t[sname(ti.name)] = t;
             }
         }
         return true;
@@ -145,8 +148,8 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, b
                 ty = GGML_TYPE_Q8_0;
             ggml_tensor * t = ggml_new_tensor(w.ctx, ty, (int) ti.shape.size(), ne);
             if (!t) { err = "cannot create " + ti.name; return false; }
-            ggml_set_name(t, ti.name.c_str());
-            w.t[ti.name] = t;
+            ggml_set_name(t, sname(ti.name).c_str());
+            w.t[sname(ti.name)] = t;
         }
     }
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(w.ctx, ggml_backend_get_default_buffer_type(backend));
@@ -155,7 +158,7 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, b
     for (size_t s = 0; s < model.size(); ++s) {
         for (const auto & ti : model.shard(s).tensors()) {
             if (skip(ti.name)) continue;
-            ggml_tensor * t = w.t[ti.name];
+            ggml_tensor * t = w.t[sname(ti.name)];
             if ((int) t->type == (int) ti.type) {
                 ggml_backend_tensor_set(t, model.shard(s).tensor_data(ti), 0, ggml_nbytes(t));
                 continue;
@@ -860,8 +863,10 @@ static ggml_cgraph * build_init(Ds4Dense::Impl & im, int64_t n) {
     return gf;
 }
 
-// logits: hc_head -> output_norm -> output, per token.  `mtp`: the MTP head (its shared_head_norm, the trunk's
-// hc_head and output - llama.cpp deepseek4.cpp graph_mtp)
+// logits: hc_head -> output_norm -> output, per token.  `mtp`: the MTP head - its own hc_head (`mtp.output_hc_*`, from
+// the MTP file: llama.cpp loads that file as its own model, so graph_mtp's hc_head_* are the file's) and
+// shared_head_norm, the trunk's output (the file's is a BF16 copy of the original V4's; ours is 0731's).
+// DS4_MTP_TRUNK_HC=1: the trunk's hc_head instead (the pre-2026-10-07 behaviour, for A/B and mutation checks)
 static ggml_cgraph * build_head(Ds4Dense::Impl & im, int64_t n, bool mtp = false) {
     ggml_context * gc = im.gctx;
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 256, false);
@@ -871,9 +876,11 @@ static ggml_cgraph * build_head(Ds4Dense::Impl & im, int64_t n, bool mtp = false
     ggml_tensor * xin = ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1], im.x_state->nb[2], 0);
     ggml_tensor * flat = ggml_reshape_2d(gc, xin, HC * D, n);
     ggml_tensor * flat_norm = ggml_rms_norm(gc, flat, (float) im.g.rms_eps);
-    ggml_tensor * mixes = ggml_mul_mat(gc, im.w.get("output_hc_fn.weight"), flat_norm);
-    ggml_tensor * scale = im.w.get("output_hc_scale.weight");
-    ggml_tensor * base  = im.w.get("output_hc_base.weight");
+    static const bool trunk_hc = [] { const char * e = std::getenv("DS4_MTP_TRUNK_HC"); return e && *e && *e != '0'; }();
+    const std::string hp = mtp && !trunk_hc ? "mtp." : "";
+    ggml_tensor * mixes = ggml_mul_mat(gc, im.w.get(hp + "output_hc_fn.weight"), flat_norm);
+    ggml_tensor * scale = im.w.get(hp + "output_hc_scale.weight");
+    ggml_tensor * base  = im.w.get(hp + "output_hc_base.weight");
     ggml_tensor * pre = ggml_sigmoid(gc, b.hc_affine(mixes, b.v1(scale, 1, 0), b.v1(base, HC, 0)));
     pre = ggml_scale_bias(gc, pre, 1.0f, (float) im.g.hc_eps);
     ggml_tensor * hc_head = b.hc_mean(xin, pre);
@@ -935,7 +942,7 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
         if (!(err = ds4_attach_mtp(*im.mtp_model, im.g, im.il_mtp)).empty()) return false;
         if (!load_weights(*im.mtp_model, im.backend, im.w, cfg.skip_routed_experts,
                           ggml_backend_is_cpu(im.backend) ? -1 : cfg.requant_type, err,
-                          "blk." + std::to_string(im.il_mtp) + ".")) return false;
+                          "blk." + std::to_string(im.il_mtp) + ".", ds4_mtp_head_alias())) return false;
     }
     {
         size_t sh = 0;
