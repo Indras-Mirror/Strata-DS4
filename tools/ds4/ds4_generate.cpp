@@ -359,6 +359,18 @@ int main(int argc, char** argv) {
     const int NT = dense.max_tokens();
     std::vector<int> mids((size_t) (top_k * NT));
     std::vector<float> mw((size_t) (top_k * NT)), mrouted((size_t) (n_embd * NT));
+    const float* mtp_last = nullptr;   // the last draft's MTP logits row (valid until the next Ds4Dense call)
+    int mtp_nv = 0;
+    // DS4_DUMP_DRAFTLOGITS=<file>: per draft, int32 k (the index of the generated token it guesses) + the MTP logits
+    // row - plain --mtp and --verify must agree wherever both drafted token k (the MTP block's own KV across passes)
+    std::FILE* drl = nullptr;
+    if (const char* f = std::getenv("DS4_DUMP_DRAFTLOGITS")) drl = std::fopen(f, "wb");
+    auto dump_draft = [&](int k) {
+        if (!drl || !mtp_last) return;
+        const int32_t k32 = k;
+        std::fwrite(&k32, 4, 1, drl);
+        std::fwrite(mtp_last, 4, (size_t) mtp_nv, drl);
+    };
     // the MTP block at positions pos0..pos0+n-1 with their following tokens -> the last position's argmax
     auto mtp_draft_n = [&](const int* next_toks, int n, int pos0, int* draft) -> bool {
         const double t0 = now_ms();
@@ -373,6 +385,7 @@ int main(int argc, char** argv) {
         int nv = 0;
         if (!dense.mtp_logits_n(n, &lg, &nv)) return false;
         const float* last = lg + (size_t) (n - 1) * nv;
+        mtp_last = last; mtp_nv = nv;
         if (draft) *draft = (int) (std::max_element(last, last + nv) - last);
         t_mtp += now_ms() - t0;
         ++n_mtp;
@@ -462,6 +475,12 @@ int main(int argc, char** argv) {
     t_mtp = 0; n_mtp = 0;
     int draft = -1, n_drafts = 0, n_accept = 0;
     int n_passes = 0;
+    // DS4_DUMP_TOKLOGITS=<file>: the logits row behind every emitted token, appended (f32 x n_vocab each) - the verify
+    // gate: on the CPU, multi-token passes are bit-identical to one-token decoding, so these rows must match exactly
+    // (greedy tokens alone miss e.g. a skipped position on the mini fixtures)
+    std::FILE* tokl = nullptr;
+    if (const char* f = std::getenv("DS4_DUMP_TOKLOGITS")) tokl = std::fopen(f, "wb");
+    auto dump_row = [&](const float* row, int nv) { if (tokl) std::fwrite(row, 4, (size_t) nv, tokl); };
     if (a.verify) {
         // pos = the position of `cur`, the newest token (emitted, not yet forwarded); draft = MTP's guess for pos + 1
         auto argmax = [](const float* v, int n) { return (int) (std::max_element(v, v + n) - v); };
@@ -472,15 +491,37 @@ int main(int argc, char** argv) {
             ++n_gen;
             if (n_gen >= a.n_predict || std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end()) done = true;
         };
+        // test hooks (the mini MTP's random weights never draft right, so only the reject path would run):
+        // DS4_VERIFY_ORACLE=<file> - drafts from a plain greedy run's stdout (one id per line; draft for the token
+        // emitted n-th = line n); DS4_VERIFY_CORRUPT=k - then spoil every k-th draft (mixed accept/reject)
+        std::vector<int> oracle;
+        int corrupt_every = 0, n_fixed = 0;
+        if (const char* f = std::getenv("DS4_VERIFY_ORACLE")) {
+            std::FILE* fp = std::fopen(f, "r");
+            if (!fp) { std::fprintf(stderr, "ds4_generate: cannot read DS4_VERIFY_ORACLE %s\n", f); return 1; }
+            int v = 0;
+            while (std::fscanf(fp, "%d", &v) == 1) oracle.push_back(v);
+            std::fclose(fp);
+            if (const char* c = std::getenv("DS4_VERIFY_CORRUPT")) corrupt_every = std::atoi(c);
+            std::fprintf(stderr, "verify : TEST drafts from %s (%zu ids), corrupt every %d\n", f, oracle.size(), corrupt_every);
+        }
+        auto fix_draft = [&]() {   // after each MTP draft: n_gen = the index of the token the draft guesses
+            dump_draft(n_gen);
+            if (oracle.empty() || n_gen >= (int) oracle.size()) return;
+            draft = oracle[(size_t) n_gen];
+            if (corrupt_every > 0 && ++n_fixed % corrupt_every == 0) draft = (draft + 1) % n_vocab;
+        };
         const double th0 = now_ms();
         if (!dense.logits(&lg, &n_vocab)) return 1;
         t_ph[4] += now_ms() - th0;
         int cur = argmax(lg, n_vocab);
+        dump_row(lg, n_vocab);
         emit(cur);
         if (!done && !mtp_draft(cur, pos - 1, &draft)) {
             std::fprintf(stderr, "ds4_generate: MTP draft failed: %s\n", dense.last_error().c_str());
             return 1;
         }
+        if (!done) fix_draft();
         while (!done) {
             const int toks[2] = { cur, draft };
             if (!step_n(toks, 2, pos)) {
@@ -496,18 +537,23 @@ int main(int argc, char** argv) {
             if (t1 == draft) {
                 ++n_accept;
                 const int t2 = argmax(lg + n_vocab, n_vocab);         // ... and, for free, at pos + 2
+                dump_row(lg, n_vocab);
                 emit(t1);
                 if (done) break;
+                dump_row(lg + n_vocab, n_vocab);
                 emit(t2);
                 if (done) break;
                 const int nxt[2] = { t1, t2 };
                 if (!mtp_draft_n(nxt, 2, pos, &draft)) return 1;      // MTP at pos, pos+1 -> guess for pos + 3
+                fix_draft();
                 cur = t2;
                 pos += 2;
             } else {
+                dump_row(lg, n_vocab);
                 emit(t1);
                 if (done) break;
                 if (!mtp_draft(t1, pos, &draft)) return 1;            // MTP at pos -> guess for pos + 2
+                fix_draft();
                 cur = t1;
                 pos += 1;
             }
@@ -522,12 +568,14 @@ int main(int argc, char** argv) {
             if (std::FILE* f = std::fopen(a.dump_logits.c_str(), "wb")) { std::fwrite(lg, 4, (size_t) n_vocab, f); std::fclose(f); }
         }
         const int tok = sample(lg, n_vocab, a.temp, rng);
+        dump_row(lg, n_vocab);
         if (draft >= 0) { ++n_drafts; n_accept += draft == tok; }
         draft = -1;
         if (il_mtp >= 0 && !mtp_draft(tok, pos - 1, &draft)) {   // MTP at the position whose logits gave `tok`
             std::fprintf(stderr, "ds4_generate: MTP draft failed at pos %d: %s\n", pos - 1, dense.last_error().c_str());
             return 1;
         }
+        if (il_mtp >= 0) dump_draft(n_gen + 1);
         std::printf("%d\n", tok);
         std::fflush(stdout);
         if (std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end()) { ++n_gen; break; }
@@ -537,6 +585,8 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    if (tokl) std::fclose(tokl);
+    if (drl) std::fclose(drl);
     const double dec_ms = now_ms() - t_dec0;
     const ds4::Ds4MoeStats st = tier.stats();
     const int dec_steps = a.verify ? std::max(1, n_passes) : std::max(1, n_gen - 1);   // forward passes run in decode

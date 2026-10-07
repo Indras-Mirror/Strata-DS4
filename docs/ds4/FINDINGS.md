@@ -453,3 +453,21 @@ Mutation: `DS4_MTP_TRUNK_HC=1` -> worst cos 0.986, 62/62 positions below the gat
 The old fixture (`mini-ds4-mtp.pre-hchead.gguf`, no own hc_head) is refused at attach.  `ds4_generate` on the CPU
 (`CUDA_VISIBLE_DEVICES=` - no GPU touched): output byte-identical with and without `--mtp`.
 **NOT measured: real-model acceptance with the fix** (GPU queue item 1).
+
+## 15. `--verify` smoke-tested on the CPU (2026-10-07, CPU-only, `bench/ds4-2026-10-07/verify-cpu/`)
+
+First run of the speculative loop.  `run.sh` (mini tame fixture, `CUDA_VISIBLE_DEVICES=` so no GPU is touched)
+checks every `--verify` run against plain greedy on three things: the tokens, the logits row behind every token
+(`DS4_DUMP_TOKLOGITS`; bit-identical on the CPU), and the MTP draft logits wherever both drafted the same token
+index (`DS4_DUMP_DRAFTLOGITS` + `tools/ds4/cmp_draft_logits.py`; this checks the MTP block's own KV across 1- and
+2-token MTP passes).  Test hooks drive the accept path the random mini MTP never reaches: `DS4_VERIFY_ORACLE=<plain
+stdout>` (drafts = the right tokens) and `DS4_VERIFY_CORRUPT=k` (spoil every k-th).
+Result: **26/26 identical** - 3 prompts x {MTP drafts (0% accept), oracle 100%, 69.6%, 50%}, `-n` 1/2/3/7/8, and
+`--stop` at a token first seen at index 1, 5, 9 (with and without corruption).  Pass counts are as expected
+(40 tokens at 100% = 20 passes, 1.95 tokens/pass).
+Mutation tests: a skipped position on one reject was NOT caught by token equality (the mini model's greedy tokens
+survived it) - hence the logits-row gate, which catches it (3 failures); reusing a position on an accept: 7
+failures; MTP on accept run for the last position only: 15 failures (draft gate).  The draft gate also caught a
+stale dump in the new test hook itself (fixed).
+No loop bug was found.  **NOT tested: CUDA** (n=2 kernels round differently there, so equality vs plain greedy will
+only be approximate - GPU queue item 2) **and real-model acceptance/speed.**
