@@ -70,6 +70,9 @@ struct Args {
     std::string mtp;             // the MTP head's GGUF: draft + acceptance stats
     bool verify = false;         // --verify: speculative decoding with the MTP draft
     bool mtp_resident = false;   // --mtp-resident: the MTP experts copied into RAM at load (not the file's mmap)
+    bool vram_lru = false;       // --vram-lru: misses / used prefetches take the layer's LRU VRAM slot (MiMo s16)
+    bool arena_adapt = false;    // --arena-adapt: a file-tier read replaces the layer's LRU arena expert
+    bool arena_skip = false;     // --arena-skip-resident: the VRAM seed's experts stay out of the host arena
     std::string dense_requant;   // q4_k | q5_k | q6_k: requantize the big Q8_0 dense matrices at load   // cache-aware routing: + this to the selection score of VRAM-resident experts   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
 };
 
@@ -122,6 +125,9 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--mtp") a.mtp = next();
         else if (k == "--verify") a.verify = true;
         else if (k == "--mtp-resident") a.mtp_resident = true;
+        else if (k == "--vram-lru") a.vram_lru = true;
+        else if (k == "--arena-adapt") a.arena_adapt = true;
+        else if (k == "--arena-skip-resident") a.arena_skip = true;
         else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (!a.ids_csv.empty() || !a.ids_file.empty());
@@ -215,6 +221,9 @@ int main(int argc, char** argv) {
     mc.arena_gib = a.arena_gib;
     mc.max_arena_gib = a.arena_gib;   // the explicit flag is the ceiling; mem_floor_gib + memguard still guard RAM
     mc.cpu_only = a.experts == "cpu";
+    mc.vram_lru = a.vram_lru;
+    mc.arena_adapt = a.arena_adapt;
+    mc.arena_skip_resident = a.arena_skip;
     if (!tier.init(a.model, mc, err)) { std::fprintf(stderr, "ds4_generate: tier init: %s\n", err.c_str()); return 1; }
     if (!a.profile.empty() && !mc.cpu_only && !tier.seed_from_routes(a.profile, err)) {
         std::fprintf(stderr, "ds4_generate: profile: %s\n", err.c_str());
@@ -534,6 +543,10 @@ int main(int argc, char** argv) {
                  100.0 * (double) st.hits / look, (double) st.prefetched_useful / dec_steps,
                  (double) st.prefetch_issued / dec_steps, 100.0 * (double) st.cpu / look,
                  100.0 * (double) st.pcie / look, (long long) st.file_tier);
+    if (a.vram_lru || a.arena_adapt || st.file_tier > 0)
+        std::fprintf(stderr, "tier moves: vram_lru swaps %.2f/pass (demoted %lld), arena swaps %lld, file reads %.2f "
+                             "ms/pass\n", (double) st.vram_swaps / dec_steps, (long long) st.vram_demotes,
+                     (long long) st.arena_swaps, st.file_ms / dec_steps);
     std::fprintf(stderr, "decode ms/token: predict+prefetch %.2f, attention+router %.2f, experts %.2f, finish %.2f, "
                          "head %.2f\n", t_ph[0] / dec_steps, t_ph[1] / dec_steps, t_ph[2] / dec_steps,
                  t_ph[3] / dec_steps, t_ph[4] / dec_steps);

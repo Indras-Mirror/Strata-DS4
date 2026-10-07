@@ -203,9 +203,9 @@ struct Ds4MoeConfig {
     /// takes the ranked profile's head until `slots` experts OR this many bytes, sizing each slot to its expert.
     /// 0 = `slots` x the largest blob.  Ignored for uniform geometries (DS4: `slots` alone, as before).
     double slot_gib = 0.0;
-    /// Per-layer-sized geometries (MiMo) only: leave the experts the VRAM seed takes OUT of the host arena.  That
-    /// cache never evicts or admits after the seed, so their arena copies are never read again; the bytes go to the
-    /// next-ranked experts instead (fewer file-tier reads).  Off = the arena holds the ranking's head as before.
+    /// Leave the experts the VRAM seed takes OUT of the host arena: a cache that never evicts never reads their arena
+    /// copies again, so the bytes go to the next-ranked experts (fewer file-tier reads); with `vram_lru` an evicted
+    /// expert is demoted into the arena slot its replacement vacates.  Off = the arena holds the ranking's head.
     bool arena_skip_resident = false;
     /// Decode: a file-tier expert that `run` had to read replaces the least-recently-used arena expert of its layer
     /// (same blob size), so the experts a conversation uses stay in RAM after their first use.  Off = static arena.
@@ -215,7 +215,7 @@ struct Ds4MoeConfig {
     /// MMQ covers and that have no SwiGLU clamp.  Needs a build with the prompt MMQ path (`strata_mmq`, with
     /// STRATA_MMQ_KQUANTS for K-quants / MXFP4); otherwise, and for VRAM-resident experts, the MMVQ kernel runs.
     bool chunk_mmq = false;
-    /// Decode, per-layer-sized geometries (MiMo): a PCIe-share miss (and a prefetched expert the routing used) takes
+    /// Decode (MiMo and DS4): a PCIe-share miss (and a prefetched expert the routing used) takes
     /// the least-recently-used VRAM slot of its layer instead of a staging buffer, so the cache follows the
     /// conversation (route_probe sim, 1800 slots: static 40.5% held-out hit, LRU 61.6%; FINDINGS s16).  Same math per
     /// expert; only where the blob sits changes.  Off = the static seed, as before.

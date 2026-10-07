@@ -762,10 +762,10 @@ bool Ds4MoeTier::init(const Ds4MoeGeom& geom, Ds4BlobSource* blobs, const Ds4Moe
 }
 
 
-/// The arena's ranking: with `arena_skip_resident` (per-layer-sized geometries), minus the head the VRAM seed takes
+/// The arena's ranking: with `arena_skip_resident`, minus the head the VRAM seed takes
 /// (the same walk as the cache seed: ranked order, up to `slots` experts or the `slot_gib` bytes).
 std::vector<std::pair<int32_t, int32_t>> arena_order(const Ds4MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& ranked) {
-    if (!(im.cfg.arena_skip_resident && im.mixed_sizes && !im.cfg.no_cache && im.cfg.slots > 0)) return ranked;
+    if (!(im.cfg.arena_skip_resident && !im.cfg.no_cache && im.cfg.slots > 0)) return ranked;
     const double budget = im.cfg.slot_gib > 0 ? im.cfg.slot_gib * 1073741824.0 : (double) im.cfg.slots * (double) im.blob;
     std::vector<char> res((size_t) (im.g.n_layers * im.g.n_experts), 0);
     double used = 0;
@@ -945,6 +945,20 @@ bool Ds4MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
     if (!im_->gpu || !im_->gpu->cache) return true;   // no cache: nothing to seed
     const int64_t want = std::min<int64_t>(im_->cfg.slots, im_->gpu->cache->full_slots());
     int64_t filled = 0;
+    // vram_lru: the LRU's starting order = the profile's rank: the coldest seeded expert goes first
+    auto lru_seed_order = [&](int64_t n_seeded) {
+        if (!im_->cfg.vram_lru) return;
+        const int64_t NX = im_->g.n_experts;
+        im_->vlast.assign((size_t) (im_->g.n_layers * NX), -1);
+        int64_t r = 0;
+        for (const auto& le : ranked) {
+            if (r >= n_seeded) break;
+            if (!im_->g.routed(le.first) || le.second < 0 || le.second >= NX) continue;
+            int64_t& v = im_->vlast[(size_t) (le.first * NX + le.second)];
+            if (v != -1 || im_->gpu->cache->slot_of(le.first, le.second) < 0) continue;
+            v = -2 - r++;   // rank 0 -> -2 (most recent of the seeds), the last seeded -> the oldest
+        }
+    };
     if (im_->mixed_sizes) {
         // MiMo: the same admissions in the same order, but the copies overlap - arena blobs queued straight from the
         // pinned arena, file-tier blobs read by 8 threads into pinned buffers (the serial seed read one blob at a time:
@@ -997,18 +1011,7 @@ bool Ds4MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
         }
         im_->st.file_tier += (int64_t) fjobs.size();
         im_->st.file_ms += now_ms() - t0;
-        if (im_->cfg.vram_lru) {   // the LRU's starting order = the profile's rank: the coldest seeded expert goes first
-            const int64_t NX = im_->g.n_experts;
-            im_->vlast.assign((size_t) (im_->g.n_layers * NX), -1);
-            int64_t r = 0;
-            for (const auto& le : ranked) {
-                if (r >= filled) break;
-                if (!im_->g.routed(le.first) || le.second < 0 || le.second >= NX) continue;
-                int64_t& v = im_->vlast[(size_t) (le.first * NX + le.second)];
-                if (v != -1 || cache.slot_of(le.first, le.second) < 0) continue;
-                v = -2 - r++;   // rank 0 -> -2 (most recent of the seeds), the last seeded -> the oldest
-            }
-        }
+        lru_seed_order(filled);
         if (bad) {
             err = terr.empty() ? "seed: pinned buffer allocation failed" : terr;
             return false;
@@ -1029,6 +1032,7 @@ bool Ds4MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
         if (!im_->gpu->cache->fill_slot_blocking(s, p, err, im_->bl[(size_t) le.first])) return false;
         ++filled;
     }
+    lru_seed_order(filled);
     im_->admitted = filled;
     return true;
 #endif
@@ -1134,7 +1138,7 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
     const int64_t K = im.g.top_k;
     const int64_t B = im.blob;                        // staging STRIDE (the largest blob)
     const int64_t BL = im.bl[(size_t) layer];         // this layer's blob (the bytes a DMA moves)
-    const bool lru = im.cfg.vram_lru && im.mixed_sizes && gp.cache && !im.cfg.no_cache;
+    const bool lru = im.cfg.vram_lru && gp.cache && !im.cfg.no_cache;   // uniform (DS4) too: every slot fits any blob
     if (lru && !im.cfg.arena_adapt) ++im.tick;   // (arena_adapt bumps it below)
     if (im.cfg.arena_adapt) {   // every lookup of this layer is a use (the LRU the arena swaps below evict by)
         const int64_t NX = im.g.n_experts;
@@ -1543,6 +1547,7 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
     if (gp.cache && !im.cfg.no_cache && !im.mixed_sizes) {   // mixed: the seed sized every slot to its expert
         for (int i = 0; i < nc; ++i) {
             const int32_t e = ids6[cpu_i[i]];
+            if (gp.cache->slot_of(layer, e) >= 0) continue;   // vram_lru already gave it a slot this call
             const uint8_t* p = gp.arena.ptr(layer, e);
             if (!p) continue;
             const int32_t s = gp.cache->admit(layer, e);
