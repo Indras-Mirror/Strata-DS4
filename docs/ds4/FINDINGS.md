@@ -496,3 +496,21 @@ arena, the MTP file's pages are evicted.  So "Option A" (the tier's CPU pool on 
   bytes are in RAM at the end (`mincore`; 100% with the copy) - the next GPU run shows directly whether eviction
   happened.
 **NOT measured: any of this on the real model run** (GPU queue).
+
+## 17. The 0731-aligned MTP sidecar applied (2026-10-07, CPU, `tools/ds4/mtp_sidecar.py`)
+
+avlp12's `mtp_aligned_r6c_step5000.safetensors` (MTP non-expert tensors re-trained on 0731's own greedy outputs;
+they report chained acceptance d2 43.2->51.1%, d3 9.8->22.2% - **depth 1, the only one our verify loop uses, is not
+reported**) -> `/media/mal/NVME1TB/Models/DS4-MTP/DeepSeek-V4-Flash-MTP-bf16-aligned0731.gguf` (outside the repo).
+`mtp_sidecar.py check` maps all 22 sidecar tensors onto GGUF names and compares each with the original:
+- 20 at cos >= 0.995 (a fine-tune: attention linears rel change ~9.5%, hc fn ~7%; norms, enorm/hnorm and
+  shared_head_norm unchanged), `hc_head.fn` -> `output_hc_fn` cos 0.89 (the most changed tensor).
+- `hc_head.*` matches the MTP file's OWN `output_hc_*` (scale within 0.35%), not the trunk's - independent
+  confirmation of task 1.
+- `e_proj`/`h_proj` fuse into `nextn.eh_proj` as **[e_proj | h_proj] along the input dim** (cos 0.995/0.998 vs the
+  GGUF's halves; the other order 0.03) - the same order as our graph's `concat(enorm(embd), hnorm(h))`.
+`write` patches a copy in place (each tensor converted to the GGUF's existing type, BF16 round-to-nearest-even,
+re-read and checked); CPU check: 0 bytes differ outside the 21 replaced tensors (header, experts identical);
+`ds4_mtp_bench` runs on it (3.5 ms/draft experts, resident).
+**NOT tested: the aligned head end to end** (real geometry needs the real trunk = GPU): acceptance A/B is GPU queue
+work.
