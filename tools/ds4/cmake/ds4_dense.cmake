@@ -9,7 +9,8 @@ if(TARGET ggml-cpu)
     add_library(ds4_dense STATIC tools/ds4/ds4_dense.cpp)
     target_include_directories(ds4_dense PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4)
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/src)   # ggml-impl.h (graph uid)
     target_link_libraries(ds4_dense PRIVATE ggml ggml-cpu ggml-base)
 
     add_executable(test_ds4_dense tools/ds4/test_ds4_dense.cpp)

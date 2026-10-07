@@ -10,6 +10,7 @@
 #include "ds4_dense.hpp"
 
 #include "ggml-alloc.h"
+#include "ggml-impl.h"   // ggml_cgraph::uid + ggml_graph_next_uid (graph reuse, see alloc_graph)
 #include "ggml-cpu.h"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -36,6 +37,19 @@ constexpr float SENTINEL = -1.0e30f;   // "compressor state row not written yet"
 // Tokens one verify pass carries (the main token + up to 3 drafts).  Every ring is this many - 1 slots longer than
 // its gather window, so a later token of a pass never overwrites a row an earlier token of the same pass reads.
 constexpr int64_t kNtMax = 4;
+
+// Every graph here has its own gallocr and never changes after it is built, so it needs allocating once.  Stamping it
+// with a uid then lets ggml-cuda skip its per-call node-property memcpy/memcmp (ggml_cuda_graph_update_required) and
+// reuse the captured CUDA graph as is: ~90 graph launches per token, 165-243 nodes each, all CPU time the GPU waits
+// on (the layers are serial).  The inputs are uploaded into fixed tensors, so nothing a reused graph reads moves.
+// DS4_GRAPH_REUSE=0: allocate and compare every call, as before (A/B).
+bool alloc_graph(ggml_gallocr_t a, ggml_cgraph * g) {
+    static const bool reuse = [] { const char * e = std::getenv("DS4_GRAPH_REUSE"); return !e || std::atoi(e) != 0; }();
+    if (reuse && g->uid != 0) return true;
+    if (!ggml_gallocr_alloc_graph(a, g)) return false;
+    if (reuse) g->uid = ggml_graph_next_uid();
+    return true;
+}
 
 int64_t next_pow2(int64_t v) {
     int64_t p = 1;
@@ -1206,7 +1220,7 @@ bool Ds4Dense::begin_token(int tid) { return begin_tokens(&tid, 1); }
 bool Ds4Dense::begin_tokens(const int * tids, int n) {
     Impl & im = *p_;
     if (!im.ensure_n(n)) return false;
-    if (!ggml_gallocr_alloc_graph(im.allo_init[n], im.gf_init[n])) { im.err = "gallocr(init) failed"; return false; }
+    if (!alloc_graph(im.allo_init[n], im.gf_init[n])) { im.err = "gallocr(init) failed"; return false; }
     std::vector<int32_t> t32((size_t) n);
     // embd[tid] on the host, exactly what get_rows + cast computes (F16 -> F32 is exact; quantized rows dequantize
     // with the same to_float)
@@ -1236,7 +1250,7 @@ bool Ds4Dense::predict(int il, int * top_ids, int n_top) {
     Impl::Layer & L = im.ly[(size_t) il];
     for (int i = 0; i < n_top; ++i) top_ids[i] = -1;
 
-    if (!ggml_gallocr_alloc_graph(L.allo_predict, L.gf_predict)) { im.err = "gallocr(predict) failed"; return false; }
+    if (!alloc_graph(L.allo_predict, L.gf_predict)) { im.err = "gallocr(predict) failed"; return false; }
     if (ggml_backend_graph_compute(im.backend, L.gf_predict) != GGML_STATUS_SUCCESS) {
         im.err = "predict graph compute failed";
         return false;
@@ -1288,7 +1302,7 @@ bool Ds4Dense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
         return false;
     }
     Impl::Var * var = attn_var(im, il, attn_cap(L, pos_last), n);
-    if (!ggml_gallocr_alloc_graph(var->allo, var->gf)) { im.err = "gallocr(attn) failed"; return false; }
+    if (!alloc_graph(var->allo, var->gf)) { im.err = "gallocr(attn) failed"; return false; }
 
     // ---- per-step inputs: every layer's, for this pass, in ONE upload per pass ------------------
     if (pos0 != im.in_pos || n != im.in_n) {
@@ -1460,7 +1474,7 @@ bool Ds4Dense::finish_layer_n(int il, int n, const float * routed_sum) {
     if (il < 0 || il >= (int) im.ly.size()) { im.err = "finish_layer: bad layer"; return false; }
     if (!im.ensure_n(n)) return false;
     Impl::Layer & L = im.ly[(size_t) il];
-    if (!ggml_gallocr_alloc_graph(L.allo_finish[n], L.gf_finish[n])) { im.err = "gallocr(finish) failed"; return false; }
+    if (!alloc_graph(L.allo_finish[n], L.gf_finish[n])) { im.err = "gallocr(finish) failed"; return false; }
     ggml_backend_tensor_set(im.routed_sum, routed_sum, 0, (size_t) (im.D * n) * 4);
     if (ggml_backend_graph_compute(im.backend, L.gf_finish[n]) != GGML_STATUS_SUCCESS) {
         im.err = "finish graph compute failed";
@@ -1476,7 +1490,7 @@ bool Ds4Dense::logits(const float ** out, int * n_vocab) { return logits_n(1, ou
 bool Ds4Dense::logits_n(int n, const float ** out, int * n_vocab) {
     Impl & im = *p_;
     if (!im.ensure_n(n)) return false;
-    if (!ggml_gallocr_alloc_graph(im.allo_head[n], im.gf_head[n])) { im.err = "gallocr(head) failed"; return false; }
+    if (!alloc_graph(im.allo_head[n], im.gf_head[n])) { im.err = "gallocr(head) failed"; return false; }
     if (ggml_backend_graph_compute(im.backend, im.gf_head[n]) != GGML_STATUS_SUCCESS) {
         im.err = "head graph compute failed";
         return false;
@@ -1491,7 +1505,7 @@ bool Ds4Dense::mtp_begin(const int * next_tids, int n) {
     Impl & im = *p_;
     if (im.il_mtp < 0) { im.err = "mtp_begin: no MTP head loaded"; return false; }
     if (!im.ensure_n(n)) return false;
-    if (!ggml_gallocr_alloc_graph(im.allo_mtp_in[n], im.gf_mtp_in[n])) { im.err = "gallocr(mtp_in) failed"; return false; }
+    if (!alloc_graph(im.allo_mtp_in[n], im.gf_mtp_in[n])) { im.err = "gallocr(mtp_in) failed"; return false; }
     im.host_emb.resize((size_t) (im.D * n));
     for (int t = 0; t < n; ++t) {
         const int tid = next_tids[t];
@@ -1523,7 +1537,7 @@ bool Ds4Dense::mtp_logits_n(int n, const float ** out, int * n_vocab) {
     Impl & im = *p_;
     if (im.il_mtp < 0) { im.err = "mtp_logits_n: no MTP head loaded"; return false; }
     if (!im.ensure_n(n)) return false;
-    if (!ggml_gallocr_alloc_graph(im.allo_mtp_head[n], im.gf_mtp_head[n])) { im.err = "gallocr(mtp head) failed"; return false; }
+    if (!alloc_graph(im.allo_mtp_head[n], im.gf_mtp_head[n])) { im.err = "gallocr(mtp head) failed"; return false; }
     if (ggml_backend_graph_compute(im.backend, im.gf_mtp_head[n]) != GGML_STATUS_SUCCESS) {
         im.err = "mtp head graph compute failed";
         return false;
