@@ -43,10 +43,39 @@ constexpr int64_t kNtMax = 4;
 // reuse the captured CUDA graph as is: ~90 graph launches per token, 165-243 nodes each, all CPU time the GPU waits
 // on (the layers are serial).  The inputs are uploaded into fixed tensors, so nothing a reused graph reads moves.
 // DS4_GRAPH_REUSE=0: allocate and compare every call, as before (A/B).
+// With one allocator shared by every decode graph (Impl::make_allo), a graph that needs more than the buffer holds
+// makes ggml-alloc reallocate it, which leaves every graph allocated earlier pointing into freed memory: the
+// allocator's epoch then advances and each graph re-allocates (and ggml-cuda re-captures it) on its next use.
+// reserve_graphs reserves every variant first, so in practice the buffer reaches its size before any graph runs.
 bool alloc_graph(ggml_gallocr_t a, ggml_cgraph * g) {
     static const bool reuse = [] { const char * e = std::getenv("DS4_GRAPH_REUSE"); return !e || std::atoi(e) != 0; }();
-    if (reuse && g->uid != 0) return true;
+    static std::map<const void *, uint64_t> epoch;                  // per allocator
+    static std::map<const ggml_cgraph *, uint64_t> graph_epoch;     // the epoch each graph was allocated in
+    uint64_t & ep = epoch[a];
+    auto it = graph_epoch.find(g);
+    if (reuse && g->uid != 0 && it != graph_epoch.end() && it->second == ep) return true;
+    if (it != graph_epoch.end() && it->second != ep) {
+        // allocated before the shared buffer moved: ggml-alloc never re-binds a tensor that has data, so unbind this
+        // graph's compute-buffer tensors (and views of them) first.  Persistent state, inputs and weights live in
+        // other buffers and keep theirs.
+        auto computed = [](const ggml_tensor * t) {
+            return t && t->buffer && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+        };
+        auto unbind = [&](ggml_tensor * t) {
+            if (computed(t) || (t->view_src && computed(t->view_src))) { t->data = nullptr; t->buffer = nullptr; }
+        };
+        const int nn = ggml_graph_n_nodes(g);
+        for (int i = 0; i < nn; ++i) {
+            ggml_tensor * t = ggml_graph_node(g, i);
+            for (int j = 0; j < GGML_MAX_SRC; ++j) if (t->src[j]) unbind(t->src[j]);
+            unbind(t);
+        }
+        for (int i = 0; i < g->n_leafs; ++i) unbind(g->leafs[i]);
+    }
+    const size_t before = ggml_gallocr_get_buffer_size(a, 0);
     if (!ggml_gallocr_alloc_graph(a, g)) return false;
+    if (ggml_gallocr_get_buffer_size(a, 0) != before && before != 0) ++ep;   // the buffer moved
+    graph_epoch[g] = ep;
     if (reuse) g->uid = ggml_graph_next_uid();
     return true;
 }
@@ -284,10 +313,22 @@ struct Ds4Dense::Impl {
     // give each decode graph the stable, dedicated buffer ggml-cuda needs to capture it as a CUDA graph.
     bool ensure_n(int64_t n);           // init/head/finish graphs for n-token passes (defined after the builders)
 
+    // DS4_SHARED_ALLO (default on): every decode graph on ONE allocator - they run one at a time and everything that
+    // outlives a graph lives in sbuf / ibuf / obuf, so their intermediates may share memory (was ~850 MiB of VRAM for
+    // ~500 per-graph arenas at p600).  Needs alloc_graph's epoch (a growth reallocates the shared buffer).
+    // DS4_SHARED_ALLO=0: one allocator per graph, as before.
+    mutable ggml_gallocr_t shared_allo = nullptr;
+    static bool shared_on() {
+        static const bool on = [] { const char * e = std::getenv("DS4_SHARED_ALLO"); return !e || std::atoi(e) != 0; }();
+        return on;
+    }
     ggml_gallocr_t make_allo() const {
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
-        return ggml_gallocr_new(buft);
+        if (!shared_on()) return ggml_gallocr_new(buft);
+        if (!shared_allo) shared_allo = ggml_gallocr_new(buft);
+        return shared_allo;
     }
+    void free_allo(ggml_gallocr_t a) { if (a && a != shared_allo) ggml_gallocr_free(a); }
 
     int64_t D = 0, HC = 0, DH = 0, DHR = 0, NH = 0, OG = 0, OL = 0, OGD = 0, NHPG = 0, RQ = 0, SWA = 0;
     int64_t RAW = 0;   // raw window ring storage = SWA + kNtMax - 1
@@ -388,15 +429,16 @@ struct Ds4Dense::Impl {
 
     ~Impl() {
         pf_free();
-        for (Var & v : all_vars()) if (v.allo) ggml_gallocr_free(v.allo);
+        for (Var & v : all_vars()) free_allo(v.allo);
         for (Layer & L : ly) {
-            if (L.allo_predict) ggml_gallocr_free(L.allo_predict);
-            for (ggml_gallocr_t a : L.allo_finish) if (a) ggml_gallocr_free(a);
+            free_allo(L.allo_predict);
+            for (ggml_gallocr_t a : L.allo_finish) free_allo(a);
         }
-        for (ggml_gallocr_t a : allo_init) if (a) ggml_gallocr_free(a);
-        for (ggml_gallocr_t a : allo_head) if (a) ggml_gallocr_free(a);
-        for (ggml_gallocr_t a : allo_mtp_in) if (a) ggml_gallocr_free(a);
-        for (ggml_gallocr_t a : allo_mtp_head) if (a) ggml_gallocr_free(a);
+        for (ggml_gallocr_t a : allo_init) free_allo(a);
+        for (ggml_gallocr_t a : allo_head) free_allo(a);
+        for (ggml_gallocr_t a : allo_mtp_in) free_allo(a);
+        for (ggml_gallocr_t a : allo_mtp_head) free_allo(a);
+        if (shared_allo) ggml_gallocr_free(shared_allo);
         if (sbuf) ggml_backend_buffer_free(sbuf);
         if (ibuf) ggml_backend_buffer_free(ibuf);
         if (obuf) ggml_backend_buffer_free(obuf);
@@ -1554,8 +1596,10 @@ bool Ds4Dense::reserve_graphs(int n_max) {
             im.err = "reserve: mtp"; return false;
         }
     }
-    // where the dense half's compute-buffer VRAM goes: one gallocr arena per graph, none shared
-    {
+    if (Impl::shared_on() && im.shared_allo) {
+        std::fprintf(stderr, "dense compute buffers: one shared arena %.1f MiB for every decode graph\n",
+                     ggml_gallocr_get_buffer_size(im.shared_allo, 0) / 1048576.0);
+    } else {   // where the dense half's compute-buffer VRAM goes: one gallocr arena per graph
         auto sz = [](ggml_gallocr_t a) { return a ? (double) ggml_gallocr_get_buffer_size(a, 0) : 0.0; };
         double attn = 0, attn_max = 0, fin = 0, pred = 0, other = 0;
         int64_t n_attn = 0;
@@ -1734,7 +1778,7 @@ static bool pf_alloc(Ds4Dense::Impl & im) {
         im.pf_fn = (float *) (base + o_sz);
         im.pf_routed = (float *) (base + o_sz + r_sz);
     }
-    im.pf_allo = im.make_allo();
+    im.pf_allo = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));   // its own (freed by pf_free)
     if (!im.pf_allo) { im.err = "prefill: ggml_gallocr_new"; return false; }
     im.pf_meta.assign(64ull * 1024 * 1024, 0);
     return true;
