@@ -663,3 +663,13 @@ CPU fixtures (same math), (b)/(e) by real-model ppl. Needs a long prompt: build 
 (tools/ds4/ds4_chat.py has the tokenizer) and time prefill + decode at each.
 Batch 19 (`bench/ds4-2026-10-08/b19-ctx{65536,131072,262144}.log`, load at those --ctx with a short prompt) was running
 at handoff - read it first: it shows what loads today and how many expert slots remain.
+**Batch 19 result (what loads today, short prompt, positions ~600, so decode speed here is NOT long-context speed):**
+| --ctx | shared decode arena | expert slots | decode (32 tok, pos ~600) |
+|---|---|---|---|
+| ~730 (p600 default) | 2.7 MiB | 2442 | 24.9 |
+| 65,536 | 65 MiB | 2223 | 19.1 |
+| 131,072 | 129 MiB | 2089 | 20.0 |
+| 262,144 | 257 MiB | 1818 | 17.6 |
+256K loads and runs today; it costs ~620 slots (F32 compressed caches + the larger arena), hit 83 -> 70%. 1M would
+not fit in VRAM as F32 (~13.5 GB). Real long-context decode/prefill speed is still unmeasured (needs a long prompt
+and the s22 fixes: masked full-cap attention and the per-token vis upload grow with position, not capacity).
