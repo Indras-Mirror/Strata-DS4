@@ -657,6 +657,7 @@ static bool sparse_on();   // DS4_SPARSE, defined with the other switches below
 static bool vis_dev_on();  // DS4_VIS_DEV, ditto
 static int64_t idx_block_n(int64_t n);   // DS4_IDX_BLOCK, ditto
 static int64_t raw_block_n(int64_t n);   // DS4_RAW_BLOCK, ditto
+static bool fused_idx_on(bool cpu);     // DS4_FUSED_IDX, ditto
 
 static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_t n, Ds4Dense::Impl::Layer & L,
                                bool emit = true) {
@@ -838,8 +839,25 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             // every chunk up to the block size are byte-identical by construction (DS4_IDX_BLOCK=0 = all at once).
             const int64_t QB = idx_block_n(n);
             ggml_tensor * sc = nullptr;
+            // DS4_FUSED_IDX (default off-CPU): ggml's fused lightning-indexer op does score, relu, head weights, sum
+            // and mask in one kernel (tensor cores when icomp is F16/Q8_0: --icomp-q8) instead of the ~9-op chain
+            // below with its two [cap, n, 64] permute+cont copies.  Same math, different summation order, so the
+            // CPU keeps the chain (its gate is bit-exact against ds4_ref).
+            const bool fidx = fused_idx_on(ggml_backend_is_cpu(im.backend));
+            ggml_tensor * vis16 = fidx ? ggml_cast(gc, var.vis, GGML_TYPE_F16) : nullptr;
             for (int64_t t0 = 0; t0 < n; t0 += QB) {
                 const int64_t nb = std::min<int64_t>(QB, n - t0);
+                if (fidx) {
+                    ggml_tensor * iqb = nb == n ? iq
+                        : ggml_view_3d(gc, iq, im.IDXK, im.IDXH, nb, iq->nb[1], iq->nb[2], (size_t) t0 * iq->nb[2]);
+                    ggml_tensor * iwb = nb == n ? iw
+                        : ggml_view_2d(gc, iw, im.IDXH, nb, iw->nb[1], (size_t) t0 * iw->nb[1]);
+                    ggml_tensor * mb = nb == n ? vis16
+                        : ggml_view_2d(gc, vis16, cap, nb, vis16->nb[1], (size_t) t0 * vis16->nb[1]);
+                    ggml_tensor * scb = ggml_lightning_indexer(gc, iqb, lid_src, iwb, mb);   // [cap, nb]
+                    sc = sc ? ggml_concat(gc, sc, scb, 1) : scb;
+                    continue;
+                }
                 ggml_tensor * qpb = nb == n ? qp
                     : ggml_view_3d(gc, qp, im.IDXK, nb, im.IDXH, qp->nb[1], qp->nb[2], (size_t) t0 * qp->nb[1]);
                 ggml_tensor * iwb = nb == n ? iw
@@ -868,24 +886,27 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             const bool batched_tk = im.pf && !ggml_backend_is_cpu(im.backend);
             ggml_tensor * tk = ggml_cont(gc, batched_tk ? ggml_argsort_top_k(gc, sc, (int) ntk)
                                                         : ggml_top_k(gc, sc, (int) ntk));   // [ntk, n]
-            ggml_tensor * a = ggml_fill(gc, var.vis, NEG_INF);
-            a = ggml_view_4d(gc, a, 1, cap, n, 1, a->nb[0], a->nb[1], a->nb[2], 0);
-            ggml_tensor * zv = b.fill_f32({ 1, ntk, n }, 0.0f);
-            ggml_tensor * m = ggml_set_rows(gc, a, zv, tk);                     // query j's indices into slice j
-            m = ggml_view_4d(gc, m, m->ne[1], m->ne[2], 1, 1, m->nb[2], m->nb[3], m->nb[3], 0);
-            m = ggml_add(gc, m, var.vis);
             if (n == 1 && !im.pf && sparse_on()) {
                 // DS4_SPARSE (default): attend to the indexer's rows only - gather them instead of masking every block
-                // (attention cost stops growing with the context).  The selected-and-visible rows come out of one
-                // argsort of [mask - i * 1e-6], i.e. in ascending block order - the order the masked flash-attention
-                // visits its unmasked keys, so the CPU result is the same bits.  The tail (if fewer than ntk rows are
-                // visible) is masked rows, gathered with their -inf.
-                ggml_tensor * m1 = ggml_reshape_1d(gc, ggml_cont(gc, m), cap);
-                ggml_tensor * ramp = ggml_scale(gc, ggml_arange(gc, 0.0f, (float) cap, 1.0f), -1.0e-6f);
-                sel = ggml_view_1d(gc, ggml_argsort(gc, ggml_add(gc, m1, ramp), GGML_SORT_ORDER_DESC), ntk, 0);
-                ggml_tensor * msel = ggml_get_rows(gc, ggml_reshape_2d(gc, m1, 1, cap), sel);   // [1, ntk]
+                // (attention cost stops growing with the context).  The rows are the top-k set in ascending block
+                // order - the order the masked flash-attention visits its unmasked keys, so the CPU result is the same
+                // bits.  Sorting the ntk indices themselves (not an argsort of a [cap] mask, as before) keeps the
+                // whole selection O(ntk): a selected row's mask is just its visibility, and the invisible rows the
+                // top-k can only pick when fewer than ntk are visible all sit above every visible one (i >= i_nvis),
+                // so they land in the tail, masked -inf, exactly as before.
+                ggml_tensor * tk1 = ggml_reshape_2d(gc, tk, 1, ntk);                                     // [1, ntk]
+                ggml_tensor * ord = ggml_argsort(gc, ggml_cast(gc, ggml_reshape_1d(gc, tk, ntk), GGML_TYPE_F32),
+                                                 GGML_SORT_ORDER_ASC);
+                sel = ggml_reshape_1d(gc, ggml_get_rows(gc, tk1, ord), ntk);                             // I32 [ntk]
+                ggml_tensor * msel = ggml_get_rows(gc, ggml_reshape_2d(gc, var.vis, 1, cap), sel);      // [1, ntk]
                 cmask = ggml_cast(gc, ggml_reshape_2d(gc, msel, ntk, 1), GGML_TYPE_F16);
             } else {
+                ggml_tensor * a = ggml_fill(gc, var.vis, NEG_INF);
+                a = ggml_view_4d(gc, a, 1, cap, n, 1, a->nb[0], a->nb[1], a->nb[2], 0);
+                ggml_tensor * zv = b.fill_f32({ 1, ntk, n }, 0.0f);
+                ggml_tensor * m = ggml_set_rows(gc, a, zv, tk);                     // query j's indices into slice j
+                m = ggml_view_4d(gc, m, m->ne[1], m->ne[2], 1, 1, m->nb[2], m->nb[3], m->nb[3], 0);
+                m = ggml_add(gc, m, var.vis);
                 cmask = ggml_cast(gc, m, GGML_TYPE_F16);
             }
         } else {
@@ -1542,6 +1563,12 @@ static bool vis_dev_on() {
 // DS4_IDX_BLOCK (default 64, 0 = all queries at once): how many queries the lightning indexer's [cap, query, 64]
 // score tensor is computed for at a time - the tensor that otherwise blocks every long prompt (FINDINGS s24).
 // Queries are independent here, so the value is the same; only n > block changes the graph at all.
+// DS4_FUSED_IDX (default 1 off-CPU, 0 on the CPU; set it to force either way): ggml_lightning_indexer
+static bool fused_idx_on(bool cpu) {
+    static const int v = [] { const char * e = std::getenv("DS4_FUSED_IDX"); return e ? std::atoi(e) : -1; }();
+    return v < 0 ? !cpu : v != 0;
+}
+
 // DS4_RAW_BLOCK (default 64, 0 = all queries in one flash-attn): how many queries attend together over their union raw
 // window (build_attn's attention section).  n <= block builds the single-call graph.
 static int64_t raw_block_n(int64_t n) {
