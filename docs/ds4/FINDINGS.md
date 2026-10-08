@@ -1153,3 +1153,31 @@ measurements are queued as `bench/ds4-2026-10-08/batch25.sh` (~20 min: CUDA mini
 - Decode graph op census (CPU build, n=1): a CSA layer is **161 compute ops when a block completes (1 in 4) and
   121 otherwise** - CONT 27 / CPY 14 / GET_ROWS 12 / MUL_MAT 20.  Fusion targets: the overlap compressor (~9
   conts per call, two calls) and the 7 matvecs that all read `xn` (q_a, kv, 2x compressor kv+gate, indexer proj).
+
+**s35 GPU results (b25 + b26, `bench/ds4-2026-10-08/b25-*`, `b26-*`; ~35 min of GPU in two short slots).**
+
+| run | decode tok/s | attention+router | experts | slots | ppl (p600) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| p600 old binary (cq8) | 23.96 | 15.72 ms | 21.97 | 2449 | 10.4468 |
+| p600 new (fused idx + O(ntk) select) | 23.71 / 23.82 | 15.85 / 15.89 | 22.2 / 22.0 | 2449 | **10.4468** |
+| p600 `--comp-type q8_0 --icomp-q8` | 24.64 | 15.59 | 20.63 | 2451 | 10.5031 (+0.54%) |
+| p600 `--comp-type q4_0 --icomp-q8` (rotated) | 25.25 | 15.73 | 19.78 | 2451 | 10.5358 (+0.85%) |
+| p600 `--comp-type iq4_nl --icomp-q8` (rotated) | 24.84 | 15.90 | 20.34 | 2451 | **10.5090 (+0.60%)** |
+| probe 128K, `DS4_FUSED_IDX=0` (chain) | 13.73 | **38.18** | 31.11 | 1984 | - |
+| probe 128K, fused | **19.01** | **18.69** | 30.37 | 1984 | - |
+| probe 128K, fused + q8_0 + icomp-q8 | **22.37** | 17.05 | 24.01 | 2199 | - |
+| probe 256K, fused + q4_0 + icomp-q8 | **21.75** | 18.51 | 24.01 | 2188 | - |
+| probe 256K, fused + q8_0 + icomp-q8 + `--comp-host` | 18.99 | 21.57 | 27.42 | 2250 | - |
+
+- **The fused indexer is the long-context decode fix**: attention+router at 128K 38.2 -> 18.7 ms (+3 ms over
+  p600, in line with fairydreaming's +4.6 ms).  Real-model ppl old vs new identical to 4 decimals (10.4468).
+- **KV quantization**: rotated IQ4_NL costs +0.60% ppl - barely more than Q8_0's +0.54% at half the bytes; Q4_0
+  +0.85%.  `--icomp-q8` adds nothing measurable on top of comp q8 (10.5031 both with and without it, s33).
+  p600 speeds are within the ~1 tok/s run-to-run swing.
+- **`--comp-host` works on CUDA** (no assert, sane run) but at 256K it buys only +62 slots for +3 ms of attention
+  (zero-copy gathers over PCIe): not worth it while the quantized caches fit in VRAM.  Keep it for 512K-1M.
+- **Probe caveat**: `--pos-offset` caches are empty and the expert hit rate is the 16-token probe prompt's (80%),
+  not a real 128K document's (53-63% in s31).  The attention columns are real; the totals are an upper bound.
+- CUDA mini-fixture arm: it aborted on the fused op (unsupported mini dims) -> c2a64a1 gates the op on
+  `ggml_backend_supports_op`; with that, tame matches the s25 CUDA baseline to the digit (0.99912037).
+- **Recommended long-context decode flags now:** `--comp-type iq4_nl --icomp-q8` (DS4_FUSED_IDX is default).
