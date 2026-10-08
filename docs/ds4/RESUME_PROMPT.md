@@ -1,16 +1,24 @@
-## RESUME HERE (2026-10-08 night, after a693545 pushed + 7 local commits) - read FINDINGS s20-s22 first
-State: decode **24.9 tok/s** (`--vram-lru --pf-b 0.7 --f16-q8 --arena-skip-resident --arena-gib 58`, quiet box),
-prefill up to **392 tok/s** at 6K (`--prefill-chunk 4096 --chunk-mmq --chunk-prestage --vram-lru`, full
-`--arena-gib 70`; never with --arena-skip-resident). Pushed to ds4/main up to a693545 (README there says 23-24);
-local commits after it: f16-q8, verify gctx fix, --mtp-keep, docs - push when Mal says.
-**Priority 1 = long context (Mal needs 250K-1M):** FINDINGS s22 plan (a)-(e): sparse top-512 CSA gather **(done,
-17cab42)**; device-side visibility **(done, s23: `DS4_VIS_DEV`, the mask is built from a per-layer `i_nvis` count -
-decode ~22 MiB/token off the span at 256K, prefill ~1 GiB per ratio per chunk + ~1.1 GiB persistent, DS4_VIS_DEV=0
-= old path)**; **query-blocked prefill indexer = the critical path (s24): the indexer tensor is `[cap, chunk, 64]`
-F32 = 16 GiB at a 64K prompt and 64 GiB at 256K, so no long prompt can be read at all until it is blocked - and
-without a long prompt there is no long-context number to take, which puts it ahead of the Q8_0 caches**; then Q8_0
-(or TBQ4 from ~/AI/llama.cpp-master-rebase) compressed caches (VRAM), then caches in pinned RAM. Long prompts are
-built: `bench/ds4-2026-10-08/ctx/ctx{65536,131072,262144}.i32`. Read b19-ctx*.log first.
+## RESUME HERE (2026-10-08, end of the long-context session) - read FINDINGS **s23-s33** first, then s19-s22
+**Long context works now and the curve is measured** - decode 24.96 (p600) / 12.71 (16K) / 14.22 (32K) / 13.11 (64K)
+/ **10.38-9.81 (128K)** tok/s; prefill 466 (16K) / 429 (32K) / ~355 (64K, 244.6 with `--ppl`) / 247.8 (128K) tok/s;
+the full table, the split (attention+router 15.5 -> 48-51 ms, experts 20.5 -> 44-46 ms) and the 20+ arithmetic
+(~46 ms = 21.7 tok/s at 128K) are in FINDINGS s31 and in the paste-ready prompt
+`~/AI/DS4_RESUME_2026-10-08-longctx.md` - **use that one to start a fresh session**; this block is the short version.
+Done this session: `DS4_VIS_DEV` (s23: device-built visibility, bit-identical to the host mask on CPU *and* CUDA),
+`DS4_IDX_BLOCK` (s27: the indexer's `[cap,n,64]` tensor in query blocks - 64 GiB at 256K before, this is what made a
+long prompt readable), `--comp-q8` (s33: compressed K caches as Q8_0, +0.49% ppl for ~3.5 GB / ~560 slots at 256K),
+the first long-prompt runs (s28/s31), the prefill kernel attribution (s31: `flash_attn_ext` over the full compressed
+cache, `O(cap*n)`, 73% of a 128K prefill - and the raw window is attended as one `[SWA+n-1, n]` batch, 33x the keys
+needed, ~22x available by blocking queries to `<= SWA` with the bit-exact chunk gate intact), and the harness traps
+(s32: `llama-cli` spins in its interactive loop -> use `llama-server`; the oracle is `build-cu134`, `build/` is a
+stale CUDA-12 build).
+**Open, in order:** (1) the raw-window query blocking - the top implementable lever, not started; (2) `icomp` as
+Q8_0; (3) `--comp-q8` at 128K (its ppl cost is measured, its slot gain is not); (4) the **llama.cpp 64K bar - never
+obtained** (killed to free the GPU; one command: `bash bench/ds4-2026-10-08/llamacpp-ctx.sh`); (5) 256K end to end
+(`ctx/ctx262144.i32` is built, never run - use `--vram-margin 2.0`, s30); (6) **the cross-layer LRU needs Mal's
+decision** (it changes `ExpertCache`'s slot ownership, a class shared with Qwen/MiMo; the additive form is an opt-in
+`--slots-global`). Sparse CSA gather (17cab42) and the long-prompt builder (`tools/ds4/make_ctx_prompts.py` ->
+`bench/ds4-2026-10-08/ctx/ctx{N}.i32`, +`.txt`, git-ignored) are done.
 Priority 2 = speculative decode: `--mtp-keep 2` + VRAM LRU in run_multi + verify margin calibration; then DSpark.
 Tools: queue GPU runs with `bench/ds4-2026-10-08/q.sh <log> <args>` (env DS4_BIN=<snapshot in bench/ds4-2026-10-08/bin/>,
 Q_PROMPT, Q_N, Q_PPL= to drop --ppl); interleave A/B pairs (single runs swing ~1 tok/s); stop the wakeword daemon
