@@ -1062,3 +1062,13 @@ It is not free to gate: any B > 1 changes the flash-attn key set, so the result 
 chunk >= 64 (`DS4_CPU_FA_REF=1`).  So it wants either its own tolerance gate or a CPU-side reference that always
 uses B = 1.  Recorded, not implemented: the queued 32K nsys profile (bwiezvpve) will show the raw-versus-compressed
 split as instances before anyone spends a day on it.
+
+**Addendum 3 is gatable after all (same question, answered).**  `DS4_CPU_FA_REF=1` (`ds4_dense.cpp:1174`) puts
+ggml-cpu's *reference* flash-attn in place for any query count ("its tiled kernel takes >= 64 queries and rounds
+differently"), and the reference sums a row's keys in a defined order with the masked ones at `-inf`.  A masked key
+therefore contributes `exp(-inf) = 0` and `a + 0.0f == a` exactly, and `-inf` entries cannot change the row max - so
+a query block with a wider union window (the extra keys all masked) computes **bit-identically** to the same query in
+the decode loop, which is exactly how s20 already shows 64+-token chunks as "the decode math exactly" under that
+variable.  So the raw-window blocking of addendum 3 keeps its bit-exact chunk gate (run it with `DS4_CPU_FA_REF=1`,
+as chunks >= 64 already require); the earlier "it can no longer hold" was wrong.  Off-CPU the same change is
+flop-bound and simply faster.
