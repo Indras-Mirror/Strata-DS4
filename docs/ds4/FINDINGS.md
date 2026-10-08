@@ -906,3 +906,28 @@ The expert numbers at 16K are **confounded by content**: the first 16K tokens ar
 the 64K prompt is the whole corpus (prose + code), and the static profile seed scores differently on each - so the
 hit rate at 16K (54.3%) being *worse* than at 64K (60.7%) with *more* slots (2304 vs 2196) is a routing-distribution
 effect, not a context effect.  Compare decode across contexts only with the caveat, or use one prompt truncated.
+
+## 30. Two oracle facts that move the bar, and one that just cost a queue slot (2026-10-08)
+
+**The oracle binary is `~/AI/llama.cpp-master-rebase/build-cu134/bin/llama-cli` - CUDA 13, commit `4cd3d353d`,
+the build the 16.34 tok/s bar was measured with.**  `build/bin/llama-cli` in the same tree is a stale **CUDA 12**
+build (Aug 29) and dies with `libcudart.so.12: cannot open shared object file`; the first b22 launch pointed at it
+and had to be re-pointed.  Worth remembering when quoting or re-measuring the baseline.
+
+**llama.cpp PR #29887 ("add a GPU cache for MoE experts kept in host memory", am17an, `--moe-cache-mib`) is the
+mechanism this engine already implements** - a VRAM cache over host-resident experts, which is where our +52% at
+p600 (24.9 vs 16.34) comes from.  The oracle build above has `--moe-expert-cache N` and
+`--moe-expert-cache-inserts N` (an upload rate limit, the analogue of our `--pf-b`) but **not** `--moe-cache-mib`,
+so **the 16.34 bar and the 64K comparison (b22) are both pre-#29887**: they are conservative in llama.cpp's favour
+and the margin will shrink when that flag reaches a build we compare against.  Re-measure the baseline whenever the
+oracle tree moves.  The thread also shows the flag is not a free win (one 8 GB user found 2000-4000 MiB "waaay
+slower" than their tuned default) - the same tuning trap our own `--slots auto` / `--pcie` / `--pf-b` sweeps hit.
+
+**`--vram-margin` (default 0.9 GiB) does not cover the decode CUDA-graph captures at long context.**
+`b21-ctx32768.log` prefilled fine (38428 ms for 32768 tokens = 435 tok/s, experts 36014 ms) and printed two tokens,
+then aborted: `CUDA error: out of memory` in `ggml_cuda_graph_evaluate_and_capture` ->
+`cudaGraphInstantiate`.  The decode graph variant for the starting position has to be captured there, and its cost
+grows with `cap` (`cap = next_pow2(pos/4+1)`: 8192 at 32K, 16384 at 64K, 32768 at 128K; the `[cap, n]` tensors are
+`cap * n * 4` bytes each).  0.9 GiB was enough at 64K's 2196 slots by luck and not at 32K's 2255; `batch21b.sh`
+re-runs 32K and 128K with `--vram-margin 2.0`.  **A real fix, not a bigger constant:** `--slots auto` should size
+its margin from the capture the largest reachable `cap` needs, not a fixed GiB.
