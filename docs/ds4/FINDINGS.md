@@ -1021,3 +1021,27 @@ global LRU.  Two consequences for s29's suggestion:
   global victim search, inside a class shared with the Qwen and MiMo engines.  Per the standing rule that shared
   files take only backward-compatible additions, this needs Mal's decision before it is written - the safe form is
   an opt-in `--slots-global` mode so nothing that exists today changes behaviour.
+
+**s31 addendum 2 - the existing prefill profile names the kernels, and it is not the cont copies.**  The nsys
+prefill profiles from s20 are still in `bench/ds4-2026-10-08/nsys/` (`pf-mmq` 16:34, `s2_*cuda_gpu_kern_sum.csv`
+16:48, kernel summary).  Top by GPU time at the **6K** prompt:
+
+| share | kernel | instances | avg |
+| ---: | --- | ---: | ---: |
+| 21.5% | `flash_attn_ext_f16<512, 512, 8, ...>` (the raw-window + full-cap compressed attention) | 43 (one per layer) | **10.6 ms** |
+| 10.7% | `mul_mat_q<IQ2_XXS, ...>` (the streamed expert MMQ) | 142 | 1.6 ms |
+| (older `stats_` run, before s20's batched-argsort fix) | `cub::DeviceTopKKernel` (the indexer's per-query top-k) | 125,958 | 3 us |
+
+So the dense half's time is the **attention kernel over the whole compressed cache**, one launch per layer at
+10.6 ms, plus the expert MMQ - *not* the `[cap, n, 64]` permute/cont copies s31 hypothesised (those are element
+copies, and ~8.6 GB/layer/chunk at cap 8192 is ~10 ms of bandwidth, an order below the 12 s/chunk measured).  At
+128K the same kernel attends `cap` = 32768 keys for all 4096 queries - **O(cap * n)**, i.e. quadratic-ish in the
+prompt, which is why the dense half reaches 73% of the 128K prefill.
+
+And that cost is the model's, not this implementation's: `flash_attn_ext` takes ONE key tensor for all queries, so
+s22's sparse gather (which is per query, and works because decode has n = 1) cannot be expressed in a batched
+prefill without a per-query gathering attention kernel.  llama.cpp's `build_csa_lid_attention` has the same shape -
+it concatenates the full compressed cache and applies `top_k_mask` - so our prefill pays what the reference pays,
+and is faster at it (466 tok/s at 16K vs llama.cpp's ~154-175 tok/s at 7.8K).  **The lever for long-context prefill
+is therefore a sparse attention kernel (per-query gather of the indexer's rows), not a code restructure** - and that
+is a much bigger piece of work than the s22 list assumed.
