@@ -79,6 +79,7 @@ struct Args {
     float skip_miss = 0.0f;      // --skip-miss T: drop a VRAM-miss expert whose weight < T x the token's weight sum
     bool f16_q8 = false;         // --f16-q8: compressor / indexer F16 matrices as Q8_0 (VRAM + bandwidth)
     int mtp_keep = 0;            // --mtp-keep K: the MTP draft computes only its K heaviest routed experts (0 = all)
+    bool comp_q8 = false;        // --comp-q8: the compressed-row K caches (comp) as Q8_0 instead of F32 (s22 (b))
     std::string dense_requant;   // q4_k | q5_k | q6_k: requantize the big Q8_0 dense matrices at load   // cache-aware routing: + this to the selection score of VRAM-resident experts   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
 };
 
@@ -140,6 +141,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--skip-miss") a.skip_miss = (float) std::atof(next().c_str());
         else if (k == "--f16-q8") a.f16_q8 = true;
         else if (k == "--mtp-keep") a.mtp_keep = std::atoi(next().c_str());
+        else if (k == "--comp-q8") a.comp_q8 = true;
         else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (!a.ids_csv.empty() || !a.ids_file.empty());
@@ -213,6 +215,7 @@ int main(int argc, char** argv) {
     dc.mtp_path = a.mtp;
     dc.prefill_chunk = a.prefill_chunk;
     dc.f16_q8 = a.f16_q8;
+    dc.comp_q8 = a.comp_q8;
     if (a.prefill_chunk > 0 && !a.mtp.empty()) {
         std::fprintf(stderr, "ds4_generate: --prefill-chunk does not fill the MTP window yet; drop --mtp or the chunk\n");
         return 2;

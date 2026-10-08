@@ -421,6 +421,8 @@ struct Ds4Dense::Impl {
         bool have_attn = false, have_finish = false;
         ggml_tensor * vis_full = nullptr; // F32 [comp_max * kNtMax]  compressed-row visibility (graphs view [cap, n])
         ggml_tensor * i_nvis = nullptr;   // I32[kNtMax]  complete compressed blocks per query (DS4_VIS_DEV, s22)
+        ggml_tensor * i_idx_all = nullptr; // I32[comp_max + 1]  0..comp_max: the masked path gathers with these when
+                                           // `comp` is quantized (--comp-q8); filled once, never uploaded per token
         ggml_tensor * rbias = nullptr;    // F32 [NEXP]       cache-aware routing: added to the SELECTION score only
         // router outputs: per token a block of o_blk bytes [fn | ids | wts], kNtMax blocks, one readback per layer
         ggml_tensor * o_ids = nullptr;    // I32 [NUSED]      token 0's router ids
@@ -919,7 +921,9 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             ggml_tensor * rows = ggml_get_rows(gc, comp2, sel);                 // [DH, ntk]
             k_all = ggml_concat(gc, k_all, ggml_reshape_3d(gc, rows, DH, 1, rows->ne[1]), 2);
         } else {
-            ggml_tensor * comp_src = ggml_view_2d(gc, comp2, DH, cap, comp2->nb[1], 0);
+            // a raw view of the cache works only while it is F32: a quantized comp needs the dequantizing gather
+            ggml_tensor * comp_src = L.i_idx_all ? ggml_get_rows(gc, comp2, first(L.i_idx_all, cap))
+                                                 : ggml_view_2d(gc, comp2, DH, cap, comp2->nb[1], 0);
             k_all = ggml_concat(gc, k_all, ggml_reshape_3d(gc, comp_src, DH, 1, cap), 2);
         }
         mask = ggml_concat(gc, mask, cmask, 0);                              // [n_raw + cap, n]
@@ -1279,7 +1283,11 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
             L.rbias = in1(GGML_TYPE_F32, im.NEXP);
 
             if (L.ratio != 0) {
-                L.comp  = nt2(GGML_TYPE_F32, im.DH, L.comp_max + 1);
+                // comp_q8 (s22 (b)): the compressed-row K cache as Q8_0 - ~0.65 GB per 32K tokens back for the
+                // expert cache at 256K.  Written by ggml's quantized set_rows, read back dequantized (get_rows),
+                // so it is lossy by construction; the default F32 path is untouched.
+                L.comp  = nt2(cfg.comp_q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F32, im.DH, L.comp_max + 1);
+                if (cfg.comp_q8) L.i_idx_all = nt1(GGML_TYPE_I32, L.comp_max + 1);
                 L.st_kv = nt2(GGML_TYPE_F32, L.sdim, L.ring_sz);
                 L.st_sc = nt2(GGML_TYPE_F32, L.sdim, L.ring_sz);
                 if (L.csa) {
@@ -1301,6 +1309,12 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
         im.sbuf = ggml_backend_alloc_ctx_tensors_from_buft(im.sctx, ggml_backend_get_default_buffer_type(im.backend));
         if (!im.sbuf) { err = "cannot allocate the persistent decode state"; return false; }
         ggml_backend_buffer_clear(im.sbuf, 0);
+        for (Impl::Layer & L : im.ly) {   // comp_q8: the ascending row indices the masked path gathers with (once)
+            if (!L.i_idx_all) continue;
+            std::vector<int32_t> ix((size_t) (L.comp_max + 1));
+            for (int64_t i = 0; i <= L.comp_max; ++i) ix[(size_t) i] = (int32_t) i;
+            ggml_backend_tensor_set(L.i_idx_all, ix.data(), 0, ix.size() * 4);
+        }
 
         // ---- the input span and the per-layer output blocks: tensors placed at fixed offsets ----
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(im.backend);

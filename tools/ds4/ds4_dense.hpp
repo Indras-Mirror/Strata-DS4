@@ -54,6 +54,11 @@ struct Ds4DenseConfig {
     int64_t        prefill_chunk = 0;
     /// Off-CPU: the compressor / indexer F16 matrices as Q8_0 (router and hyper-connection mixers stay F16).
     bool           f16_q8 = false;
+    /// The compressed-row K caches (`comp`, the CSA/HCA keys) as Q8_0 instead of F32: ~0.65 GB per 32K tokens of
+    /// VRAM back for the expert cache at 256K (s22 (b) - they are F32 in the state today).  Rows are written with
+    /// ggml's quantized set_rows and read back dequantized (get_rows), so this is lossy by construction: judge it on
+    /// real-model ppl, not on the CPU bit-exact gate.  The indexer's `icomp` stays F32 in this cut.
+    bool           comp_q8 = false;
 };
 
 /// One-token decode of the DS4 dense half.  Not thread-safe; one instance decodes one sequence.
