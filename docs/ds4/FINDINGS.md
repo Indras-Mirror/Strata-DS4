@@ -1098,3 +1098,27 @@ slots, ~25% more cache - which is the expert half of the s31 20+ arithmetic.  Tw
 
 NOT yet done: `icomp` as Q8_0, and the long-context A/B (the ppl cost is context-independent, but the *slot* gain
 needs a 256K run to show up).
+
+## 34. KV quantization and streaming: the references for the next session (2026-10-08, from the code and the docs)
+
+Mal asked how Strata's Qwen engine holds int8 KV at 200K+ "with barely any overhead".  The answer is **streaming, not
+quantization**, and it matters for us because our decode gathers a constant number of compressed rows.
+
+- **Strata (Qwen, `docs/DETAILS.md`)**: 8-bit KV is the default; `--kv q4_0` halves it with "a Hadamard rotation
+  before 4-bit rounding (PR #21)" at +8-12% perplexity on long documents.  The 200K trick is `--kv-resident 32768`
+  (on by default from 64K): the KV cache lives in RAM and only the part attention reads is in VRAM - Q2_0 at 262K
+  50.9 -> 62.6 tok/s (1,589 -> 3,872 expert slots), ~13.7 KB of RAM per context token.  `--kv k8v4` (K 8-bit, V
+  rotated 4-bit) is 23% less KV and 85 -> 99 tok/s at 198K on a 3090.
+- **llama.cpp's DSV4 already stores TBQ in these caches** (`~/AI/llama.cpp-master-rebase`,
+  `src/llama-kv-cache-dsv4.cpp:1251`): "DSV4 stores TBQ3_0/TBQ4_0 K in all four caches"; the compressed caches use
+  `DSV4_CTK_COMP` when set (default `type_k`).  TBQ4 has a fused flash-attn (`ggml-cuda/fattn-mma-tbq4*.cuh`,
+  branched at `llama-graph.cpp:2621`); TBQ3 dequantizes to F32 at the read sites.  So `DSV4_CTK_COMP=tbq4_0` is a
+  reference configuration for the cache `--comp-q8` covers, and a way to price 4-bit compressed K on this model
+  without porting anything first.
+- **Why this is bigger for DS4 than for Qwen**: Qwen's dense attention over a growing KV makes streaming O(ctx) per
+  token (hence its 32K resident window).  Our decode gathers a constant top-512 rows per layer, so the compressed
+  cache can live in pinned RAM at *constant* cost - 512 x 512 x 2 B = 0.5 MB/layer x 21 = **~11 MB/token, ~0.4 ms at
+  25 GB/s**.  That is s22 (e), and it is the 1M enabler (VRAM is otherwise already ~3.4 GB with Q8_0 at 1M).
+- Ladder: (1) `--comp-q8` done and measured (s33); (2) `icomp` as Q8_0 (~0.7 GB more at 256K); (3) both in pinned
+  RAM; (4) TBQ4 instead of Q8_0 - which **needs the Hadamard rotation before rounding** (PR #21 / `attn_rot_k`),
+  since only the indexer path is rotated today (s9) and `comp` is not.
