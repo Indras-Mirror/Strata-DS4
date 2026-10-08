@@ -828,3 +828,37 @@ prompt rows, unlike the generated-token dump (24 rows of tokens were insensitive
 (source restored and re-verified at 64.6256; `idx_block_n` was also instrumented once to confirm the loop really
 runs - `[idxblock] n=32 blk=8`.)  Lesson for the CPU gates: an indexer gate is only a gate when `cap > indexer
 top_k`; the 40- and 63-token fixtures used so far are below or at that line for the chunk cases.
+
+## 28. First real long prompt: 64K prefill 245 tok/s, ppl 4.07, decode 13.1 tok/s at position 65536 (2026-10-08)
+
+`bench/ds4-2026-10-08/b21-ctx65536.log` - `--ctx 70000 --prefill-chunk 4096 --chunk-mmq --chunk-prestage
+--vram-lru --pf-b 0.7 --slots auto --arena-gib 70 --pcie 0.55 --dense-requant q6_k --ppl`, prompt
+`ctx/ctx65536.i32` (65,536 tokens of the repo's own text), through `q.sh`.  **This run needed s27's blocked
+indexer** - at chunk 4096 with cap growing to 16384 the indexer's `[cap, n, 64]` tensor is 16 GiB by itself.
+
+| | |
+| --- | --- |
+| prefill (65,536 tokens, chunk 4096) | **267.99 s = 244.55 tok/s** |
+| prefill split | dense 115.5 s (attention+router 114.4), experts 69.4 s, **head/ppl 79.3 s**, cache seed 0.8 s |
+| prompt ppl (65,535 positions) | mean NLL 1.40255, **perplexity 4.0656** |
+| decode (16 tokens, 15 passes) | **13.11 tok/s** (1.14 s) |
+| decode ms/token | attention+router 36.16, experts 35.48, predict+prefetch 2.19, finish 1.22, head 0.56 |
+| slots / hit / file tier | 2196 (vs 2442 at p600) / 60.7% / 6 reads per token |
+
+ppl 4.07 over 65K tokens of real prose and code is the quality check that the long path is numerically sane end to
+end (the model has 64K of context to predict with, so it is expected to be far below the 6.4 measured at 3K in s20;
+the point is that it is a plausible number, not NaN or garbage).  79.3 s of the 268 s is the **`--ppl` machinery**
+(the head readback for every prompt position), not the engine: the same prefill without `--ppl` should be ~185 s
+(~355 tok/s) - the 16K/32K points below run without it to confirm.
+
+**Decode at 64K is 13.1 tok/s against 24.9 at p600, and the drop has two parts:** the expert hit rate (83.4 -> 60.7%,
+slots 2442 -> 2196 as the compressed caches and the larger graph arena take VRAM) and attention+router more than
+doubling (15.47 -> 36.16 ms).  The second part says s22's sparse gather only did half the job: the *attention* now
+gathers `top_k` rows instead of attending over every block, but **two sorts per CSA layer per token are still
+O(cap)**: the indexer's `ggml_top_k(sc, 512)` over `cap` blocks, and the sparse gather's own
+`argsort(m1 + ramp)` over `cap` elements (added in s22 to put the gathered rows in ascending block order).  At
+cap = 16384 and 21 CSA layers that is 42 sorts of 16k elements per token.  **NOT attributed yet** - the candidate
+that would settle it is the scaling curve (attention+router should step up as cap doubles, cap = next_pow2(pos/4+1));
+the 16K/32K/128K points are measured next.  If it is the gather's argsort, the fix is to sort only the `ntk` = 512
+indices the indexer already selected (O(ntk log ntk)) instead of re-sorting the whole mask - but that must keep the
+ascending-block-order property the CPU bit-exactness gate checks against the masked path.
