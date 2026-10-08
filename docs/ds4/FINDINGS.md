@@ -702,3 +702,29 @@ sharper check there).
 NOT measured: any GPU run, and a real 256K/1M prompt - the gain is bytes off the H2D (~22 MiB/token at 256K and
 ~87 MiB/token at 1M for decode, ~1 GiB per ratio per chunk for prefill, plus the persistent ~1.1 GiB of chunk
 masks), which only a long-context GPU run shows.
+
+## 24. The real blocker for a long-prompt measurement: the prefill indexer tensor (2026-10-08, CPU)
+
+Long-context decode can only be measured at a real long *position* after a long prompt has been read, and chunked
+prefill cannot read one today. The lightning indexer in `build_attn` materialises
+`kq = ggml_mul_mat(kp, qp)` as `[cap, chunk, 64 heads]` F32 (`qp`/`kp`/`kq`, `ds4_dense.cpp`). `cap = attn_cap =
+next_pow2(pos_last/4 + 1)`, the chunk is 4096:
+
+| prompt | cap | indexer `kq` at chunk 4096 | other prefill intermediates (`[cap,chunk]` F32 x ~4, mask F16, `k_all`) |
+| --- | ---: | ---: | ---: |
+| 6K (what ran, s20) | 2,048 | 2 GiB | ~0.1 GiB |
+| 16K | 4,096 | 4 GiB | ~0.2 GiB |
+| 64K | 16,384 | 16 GiB | ~0.7 GiB |
+| 256K | 65,536 | **64 GiB** | ~4 GiB |
+
+So a 64K prompt already needs the indexer (and its score/mask assembly) computed in query blocks - s22 item (d) -
+before any long prompt fits; everything else in the chunk graph is small enough. A tiny chunk makes 256K *fit*
+(chunk 128: 2 GiB) but streams every layer's experts 32x more often, i.e. hours, not a measurement. **(d) is
+therefore the critical path for the long-context work, ahead of (b)'s decode-VRAM saving: without it there is no
+long-context number to take.**  The blocked indexer must keep the chunk gate bit-identical (chunks 1..33 vs the
+decode loop); the top-k among ReLU-zero ties is the thing to watch (the off-CPU batched argsort already accepts
+that class of difference, s20).
+
+Long prompts are ready for when it lands: `bench/ds4-2026-10-08/ctx/ctx{65536,131072,262144}.i32` (tokenized with
+`strata_tokenizer` from the repo's own sources + docs - 1.94M tokens available, so a 1M-token file too; feed with
+`ds4_generate --ids-file`).

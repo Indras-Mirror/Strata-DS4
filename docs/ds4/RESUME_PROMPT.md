@@ -4,11 +4,13 @@ prefill up to **392 tok/s** at 6K (`--prefill-chunk 4096 --chunk-mmq --chunk-pre
 `--arena-gib 70`; never with --arena-skip-resident). Pushed to ds4/main up to a693545 (README there says 23-24);
 local commits after it: f16-q8, verify gctx fix, --mtp-keep, docs - push when Mal says.
 **Priority 1 = long context (Mal needs 250K-1M):** FINDINGS s22 plan (a)-(e): sparse top-512 CSA gather **(done,
-17cab42)**, Q8_0 (or TBQ4 from ~/AI/llama.cpp-master-rebase) compressed caches, device-side visibility **(done,
-FINDINGS s23: `DS4_VIS_DEV`, the mask is built from a per-layer `i_nvis` count - decode ~22 MiB/token off the span
-at 256K, prefill ~1 GiB per ratio per chunk + ~1.1 GiB persistent)**,
-query-blocked prefill indexer, then caches in pinned RAM. Read b19-ctx*.log first. Then build long prompts and measure
-prefill/decode at 64K..256K.
+17cab42)**; device-side visibility **(done, s23: `DS4_VIS_DEV`, the mask is built from a per-layer `i_nvis` count -
+decode ~22 MiB/token off the span at 256K, prefill ~1 GiB per ratio per chunk + ~1.1 GiB persistent, DS4_VIS_DEV=0
+= old path)**; **query-blocked prefill indexer = the critical path (s24): the indexer tensor is `[cap, chunk, 64]`
+F32 = 16 GiB at a 64K prompt and 64 GiB at 256K, so no long prompt can be read at all until it is blocked - and
+without a long prompt there is no long-context number to take, which puts it ahead of the Q8_0 caches**; then Q8_0
+(or TBQ4 from ~/AI/llama.cpp-master-rebase) compressed caches (VRAM), then caches in pinned RAM. Long prompts are
+built: `bench/ds4-2026-10-08/ctx/ctx{65536,131072,262144}.i32`. Read b19-ctx*.log first.
 Priority 2 = speculative decode: `--mtp-keep 2` + VRAM LRU in run_multi + verify margin calibration; then DSpark.
 Tools: queue GPU runs with `bench/ds4-2026-10-08/q.sh <log> <args>` (env DS4_BIN=<snapshot in bench/ds4-2026-10-08/bin/>,
 Q_PROMPT, Q_N, Q_PPL= to drop --ppl); interleave A/B pairs (single runs swing ~1 tok/s); stop the wakeword daemon
