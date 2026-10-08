@@ -362,6 +362,7 @@ struct Ds4Dense::Impl {
     std::vector<float> host_emb;
     ggml_tensor * i_pos      = nullptr;   // I32[kNtMax]
     ggml_tensor * rot        = nullptr;   // [idx_k, idx_k] F32 Walsh-Hadamard (lightning indexer)
+    ggml_tensor * neg_ramp   = nullptr;   // F32 [max comp_max]: -i, the DS4_VIS_DEV mask's constant half
     std::vector<float> host_logits;       // [V, kNtMax]
     int64_t       o_blk = 0;              // bytes per token in a layer's router output block [fn | ids | wts]
     int64_t       o_ids_off = 0, o_wts_off = 0;
@@ -423,7 +424,7 @@ struct Ds4Dense::Impl {
         int  tap_n = 0;                   // the n of the pass the taps / host_fn hold
         bool have_attn = false, have_finish = false;
         ggml_tensor * vis_full = nullptr; // F32 [comp_max * kNtMax]  compressed-row visibility (graphs view [cap, n])
-        ggml_tensor * i_nvis = nullptr;   // I32[kNtMax]  complete compressed blocks per query (DS4_VIS_DEV, s22)
+        ggml_tensor * i_nvis = nullptr;   // F32[kNtMax]  complete compressed blocks per query (DS4_VIS_DEV, s22)
         ggml_tensor * i_idx_all = nullptr; // I32[comp_max + 1]  0..comp_max: the masked path gathers with these when
                                            // `comp` is quantized (--comp-q8); filled once, never uploaded per token
         ggml_tensor * rbias = nullptr;    // F32 [NEXP]       cache-aware routing: added to the SELECTION score only
@@ -754,12 +755,12 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             // block i completed at or before pos_t, i.e. (i+1)*ratio <= pos_t+1 <=> i < i_nvis[t].  step() gives
             // exactly 1 (visible) / 0 (hidden) and log() exactly 0.0f / -INFINITY - the host's values; scaling by
             // NEG_INF instead would be 0 * inf = NaN.
-            ggml_tensor * nvs = ggml_cast(gc, first(L.i_nvis, n), GGML_TYPE_F32);             // [n]
-            ggml_tensor * iv  = ggml_arange(gc, 0.0f, (float) cap, 1.0f);                     // [cap] = i
-            ggml_tensor * shp = ggml_new_tensor_2d(gc, GGML_TYPE_F32, cap, n);
-            ggml_tensor * ivN = ggml_repeat(gc, ggml_reshape_2d(gc, iv, cap, 1), shp);         // [cap, n] = i
-            ggml_tensor * nvN = ggml_repeat(gc, ggml_reshape_2d(gc, nvs, 1, n), shp);          // [cap, n] = i_nvis[t]
-            var.vis = ggml_log(gc, ggml_step(gc, ggml_sub(gc, nvN, ivN)));                      // i < i_nvis -> 0
+            // nv - i as one broadcast add of the F32 count onto the persistent -i ramp (was cast + arange + 2 repeats
+            // + sub: 7 kernels per compressed layer per token -> 3); small integers, so the same exact floats
+            ggml_tensor * nvs = ggml_reshape_2d(gc, first(L.i_nvis, n), 1, n);                 // [1, n] = i_nvis[t]
+            ggml_tensor * ivN = ggml_view_2d(gc, im.neg_ramp, cap, 1, (size_t) cap * sizeof(float), 0);   // -i
+            if (n > 1) ivN = ggml_repeat(gc, ivN, ggml_new_tensor_2d(gc, GGML_TYPE_F32, cap, n));
+            var.vis = ggml_log(gc, ggml_step(gc, ggml_add(gc, ivN, nvs)));                      // i < i_nvis -> 0
         } else {
             var.vis = ggml_view_2d(gc, L.vis_full, cap, n, (size_t) cap * sizeof(float), 0);
         }
@@ -1385,7 +1386,7 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
             L.i_idx_state = in1(GGML_TYPE_I32, std::max<int64_t>(1, L.ring) * NT);
             if (L.ratio != 0) {
                 // DS4_VIS_DEV: a 16-byte per-layer count replaces the whole-capacity host mask in the span
-                if (vis_dev_on()) L.i_nvis   = in1(GGML_TYPE_I32, NT);
+                if (vis_dev_on()) L.i_nvis   = in1(GGML_TYPE_F32, NT);
                 else              L.vis_full = in1(GGML_TYPE_F32, L.comp_max * NT);
             }
             L.rbias = in1(GGML_TYPE_F32, im.NEXP);
@@ -1414,6 +1415,11 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
             }
         }
         if (any_csa) im.rot = nt2(GGML_TYPE_F32, im.IDXK, im.IDXK);
+        {
+            int64_t cm = 0;
+            for (const Impl::Layer & L : im.ly) cm = std::max<int64_t>(cm, L.ratio ? L.comp_max : 0);
+            if (cm > 0) im.neg_ramp = ggml_new_tensor_1d(im.sctx, GGML_TYPE_F32, cm);
+        }
         if (im.comp_rot && (!im.rot || im.DH % im.IDXK != 0)) { err = "--comp-rot needs the indexer rotation"; return false; }
         if (im.hctx) {
             im.hbuf = ggml_backend_alloc_ctx_tensors_from_buft(im.hctx, comp_hbt);
@@ -1490,6 +1496,11 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
                 sent.assign((size_t) (2 * im.IDXK * L.ring_sz), SENTINEL);
                 ggml_backend_tensor_set(L.ist_sc, sent.data(), 0, sent.size() * 4);
             }
+        }
+        if (im.neg_ramp) {
+            std::vector<float> r((size_t) im.neg_ramp->ne[0]);
+            for (size_t i = 0; i < r.size(); ++i) r[i] = -(float) i;
+            ggml_backend_tensor_set(im.neg_ramp, r.data(), 0, r.size() * 4);
         }
         if (im.rot) {
             const int n = (int) im.IDXK;
@@ -1743,7 +1754,8 @@ bool Ds4Dense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
             }
         }
         const bool vdev = vis_dev_on();
-        std::vector<int32_t> sp(n), cpp(n), sc(n), ss(n), sidx, nvis;
+        std::vector<int32_t> sp(n), cpp(n), sc(n), ss(n), sidx;
+        std::vector<float> nvis;
         std::vector<float> vis;
         for (Impl::Layer & Ly : im.ly) {
             put(Ly.i_slot_raw, s32.data(), s32.size() * 4);
@@ -1771,7 +1783,7 @@ bool Ds4Dense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
                     sidx[(size_t) (t * Ly.ring + i)] = half ? 2 * slot + (i >= Ly.ratio ? 1 : 0) : slot;
                 }
                 const int64_t nv = (pt + 1) / Ly.ratio;           // complete blocks query t may see
-                if (vdev) nvis[(size_t) t] = (int32_t) nv;
+                if (vdev) nvis[(size_t) t] = (float) nv;
                 else for (int64_t i = 0; i < nv && i < cp_; ++i) vis[(size_t) (t * cp_ + i)] = 0.0f;
             }
             put(Ly.i_state_pos, sp.data(), (size_t) n * 4);
@@ -2031,7 +2043,7 @@ static bool pf_alloc(Ds4Dense::Impl & im) {
         R.i_comp_pos   = ggml_new_tensor_1d(c, GGML_TYPE_I32, NP);
         R.i_state_pos  = ggml_new_tensor_1d(c, GGML_TYPE_I32, NP);
         R.i_idx_state  = ggml_new_tensor_1d(c, GGML_TYPE_I32, L->ring * NP);
-        if (vis_dev_on()) R.i_nvis   = ggml_new_tensor_1d(c, GGML_TYPE_I32, NP);   // DS4_VIS_DEV (FINDINGS s23)
+        if (vis_dev_on()) R.i_nvis   = ggml_new_tensor_1d(c, GGML_TYPE_F32, NP);   // DS4_VIS_DEV (FINDINGS s23)
         else              R.vis_full = ggml_new_tensor_1d(c, GGML_TYPE_F32, L->comp_max * NP);
     }
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(im.backend);
@@ -2173,7 +2185,8 @@ bool Ds4Dense::prefill_begin(const int * tids, int n, int pos0) {
         if (!L) continue;
         Impl::PfRatio & R = *pf_ratio_set(im, r);
         const int64_t cap = attn_cap(*L, pos_last);
-        std::vector<int32_t> sp((size_t) n), cpp((size_t) n), sc((size_t) n), sidx((size_t) (L->ring * n)), nvis;
+        std::vector<int32_t> sp((size_t) n), cpp((size_t) n), sc((size_t) n), sidx((size_t) (L->ring * n));
+        std::vector<float> nvis;
         std::vector<float> vis;
         if (vis_dev_on()) nvis.resize((size_t) n);
         else              vis.assign((size_t) (cap * n), NEG_INF);
@@ -2189,7 +2202,7 @@ bool Ds4Dense::prefill_begin(const int * tids, int n, int pos0) {
                 sidx[(size_t) (t * L->ring + i)] = half ? 2 * slot + (i >= r ? 1 : 0) : slot;
             }
             const int64_t nv = (pt + 1) / r;
-            if (vis_dev_on()) nvis[(size_t) t] = (int32_t) nv;
+            if (vis_dev_on()) nvis[(size_t) t] = (float) nv;
             else for (int64_t i = 0; i < nv && i < cap; ++i) vis[(size_t) (t * cap + i)] = 0.0f;
         }
         const std::vector<int32_t> ss = tail(L->ring_sz);
