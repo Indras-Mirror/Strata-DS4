@@ -1122,3 +1122,34 @@ quantization**, and it matters for us because our decode gathers a constant numb
 - Ladder: (1) `--comp-q8` done and measured (s33); (2) `icomp` as Q8_0 (~0.7 GB more at 256K); (3) both in pinned
   RAM; (4) TBQ4 instead of Q8_0 - which **needs the Hadamard rotation before rounding** (PR #21 / `attn_rot_k`),
   since only the indexer path is rotated today (s9) and `comp` is not.
+
+## 35. KV ladder + decode-path cuts, all CPU-gated (2026-10-08 late, GPU shared with strata-glm; GPU numbers = b25)
+
+Mal: no long runs; GLM has GPU priority; short A/Bs only.  Everything here is gated on the CPU fixtures; the GPU
+measurements are queued as `bench/ds4-2026-10-08/batch25.sh` (~20 min: CUDA mini gate, p600 old/new, probes).
+
+- **`DS4_RAW_BLOCK` (bc21c1e, default 64)** - s31 addendum 3 implemented: prefill queries attend in blocks over
+  their own union raw window (`SWA + nb - 1`) plus the compressed rows; outputs concatenated.  Gate: with
+  `DS4_CPU_FA_REF=1`, logits **byte-identical** to the decode loop on tame and swa16 (62-token prompt, chunks
+  7/13/33/60, blocks 3/5/8/16/64); mutation (mask column offset dropped) caught on swa16 (65.2775 -> 65.0249).
+- **KV ladder (bc21c1e)**: `--comp-type f32|q8_0|q5_0|q4_0|iq4_nl` (`--comp-q8` = q8_0), rows Walsh-Hadamard
+  rotated (128-blocks, self-inverse) before quantizing and after the gather - auto-on below 8 bits, `--comp-rot
+  0|1` forces it.  f32+rot is exact (64.9626 = 64.9626).  On the mini fixture rotation narrows the q8 gap
+  (64.9724 -> 64.9637) and the q4 gap (64.9700 -> 64.9675) - direction only, real ppl comes from the model.
+  `--icomp-q8`: the indexer keys as Q8_0, scored by the quantized mul_mat / the fused op's WMMA kernel.
+  `--comp-host`: `comp` in a pinned host buffer, read zero-copy (decode gathers a fixed 512 rows/CSA layer; the
+  only ggml-cuda buffer checks are `#ifndef NDEBUG`, and build-ds4-gpu is Release).  **Untested on CUDA.**
+- **`DS4_FUSED_IDX` (812b27a, default on off-CPU)**: `ggml_lightning_indexer` (already in the vendored ggml, CUDA
+  kernel included) replaces the ~9-op score chain with its two `[cap, n, 64]` permute+cont copies.  Forced on the
+  CPU it is byte-identical (tame+swa16, decode and chunk 60); mutation (negated head weights) caught.
+- **O(ntk) sparse select (812b27a)**: the decode gather sorts the 512 top-k indices instead of argsorting a [cap]
+  mask, and the selected rows' mask is just their visibility - no fill/set_rows/add/argsort over cap.  Decode
+  logits byte-identical to the previous build (cap 16 > top_k 8 exercised); mutation (DESC order) caught.
+- **Why these two**: fairydreaming's llama.cpp DSV4 fork (RTX PRO 6000, all resident) decodes 29.67 (8K) ->
+  26.11 (128K) -> 23.34 (256K) tok/s, i.e. **+4.6 ms/token at 128K** for context; ours was **+32.6 ms**
+  (attention+router 15.5 -> 48).  The O(cap) chain per CSA layer was the suspect.
+- **`--pos-offset N` (9230d29)**: decode as if at position N over empty caches - long-context *decode* timing in
+  ~2 min with no prefill (graphs, cap, top-k sizes are real; tokens are meaningless).
+- Decode graph op census (CPU build, n=1): a CSA layer is **161 compute ops when a block completes (1 in 4) and
+  121 otherwise** - CONT 27 / CPY 14 / GET_ROWS 12 / MUL_MAT 20.  Fusion targets: the overlap compressor (~9
+  conts per call, two calls) and the 7 matvecs that all read `xn` (q_a, kv, 2x compressor kv+gate, indexer proj).
