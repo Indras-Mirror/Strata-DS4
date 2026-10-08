@@ -1045,3 +1045,20 @@ it concatenates the full compressed cache and applies `top_k_mask` - so our pref
 and is faster at it (466 tok/s at 16K vs llama.cpp's ~154-175 tok/s at 7.8K).  **The lever for long-context prefill
 is therefore a sparse attention kernel (per-query gather of the indexer's rows), not a code restructure** - and that
 is a much bigger piece of work than the s22 list assumed.
+
+**s31 addendum 3 - the cheaper half of that attention cost: the raw window is attended as one masked batch.**
+`k_all` = the raw union window (`SWA + n - 1` = 4223 keys for a 4096-token chunk) followed by the compressed rows,
+and the whole thing goes through one `flash_attn_ext` per layer with a per-query mask.  But a query's raw window is
+only `SWA` = 128 keys: the batch form makes every query visit `SWA + n - 1` keys and mask all but 128 of them -
+**33x more raw-window work than the decode path does for the same query**.  Splitting the chunk's queries into
+blocks of B <= SWA shrinks the union window per block to `SWA + B - 1` (191 keys at B = 64) - **a ~22x cut on that
+term with no new kernel** (flash_attn_ext takes one K per call, and within a block of <=128 queries that K is still
+a shared union).  At 6K/chunk 4096 the raw part is ~74% of the attention's keys (4223 of 5723), and the attention
+kernel is the top GPU term (21.5%, 10.6 ms per layer), so this is the largest *implementable* prefill lever found so
+far; at 128K the compressed rows (32768) dominate the key count and the saving shrinks to ~10% of that term.
+
+It is not free to gate: any B > 1 changes the flash-attn key set, so the result moves in the last bits and the
+"bit-identical to the decode loop" chunk gate can no longer hold - exactly the regime s20 already documented for
+chunk >= 64 (`DS4_CPU_FA_REF=1`).  So it wants either its own tolerance gate or a CPU-side reference that always
+uses B = 1.  Recorded, not implemented: the queued 32K nsys profile (bwiezvpve) will show the raw-versus-compressed
+split as instances before anyone spends a day on it.
