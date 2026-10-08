@@ -843,7 +843,11 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             // and mask in one kernel (tensor cores when icomp is F16/Q8_0: --icomp-q8) instead of the ~9-op chain
             // below with its two [cap, n, 64] permute+cont copies.  Same math, different summation order, so the
             // CPU keeps the chain (its gate is bit-exact against ds4_ref).
-            const bool fidx = fused_idx_on(ggml_backend_is_cpu(im.backend));
+            // ... and only where the backend has a kernel for these shapes (ggml-cuda: idx_k 128, 32/64 heads - the
+            // mini fixtures are smaller and take the chain); the probe node is never added to the graph
+            const bool fidx = fused_idx_on(ggml_backend_is_cpu(im.backend)) &&
+                ggml_backend_supports_op(im.backend, ggml_lightning_indexer(gc, iq, lid_src, iw,
+                                                                            ggml_cast(gc, var.vis, GGML_TYPE_F16)));
             ggml_tensor * vis16 = fidx ? ggml_cast(gc, var.vis, GGML_TYPE_F16) : nullptr;
             for (int64_t t0 = 0; t0 < n; t0 += QB) {
                 const int64_t nb = std::min<int64_t>(QB, n - t0);
