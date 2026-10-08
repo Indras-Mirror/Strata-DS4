@@ -683,14 +683,22 @@ per pass). `DS4_VIS_DEV` (default on) replaces it with a per-layer I32 count `i_
 the mask itself - row `i` is visible to query `t` iff `i < i_nvis[t]` (block `i` completed at or before `pos_t`) -
 from `arange(cap)`, `repeat`, `step` and `log`. `log(step(...))` is exactly `0.0f` / `-INFINITY`, the host's two
 values; scaling by `NEG_INF` instead is `0 * inf = NaN` (the naive port's first failure - it makes every indexer
-score non-finite and the whole decode NaN). Prefill keeps its own per-chunk `vis_full` (s22 item (d) will block
-that one); `DS4_VIS_DEV=0` restores the host path for an A/B.
+score non-finite and the whole decode NaN).  The same mask now serves prefill: `PfRatio::vis_full` (comp_max * chunk
+floats per ratio - ~1 GiB per ratio per chunk at 256K, rebuilt and re-uploaded every chunk, with a host loop of
+cap * chunk writes) becomes a chunk-sized `i_nvis` too, so `vis_full` is gone from both paths.  `DS4_VIS_DEV=0`
+restores the host masks (and their cost) for an A/B.
 
 Gates (CPU fixtures, `bench/ds4-2026-10-06/dense`), device mask vs `DS4_VIS_DEV=0`: swa16 40 tokens and tame 63
 tokens with `--multi 2,3,1,4` - per-layer taps cos 1.0000000, worst logits cos 0.9999999649, multi-token
 bit-identical 40/40 and 63/63, identical numbers in both modes (the device mask is the host mask, bit for bit).
 MTP block gate: worst cos 0.99999996, top-1 62/62, MTP in multi bit-identical. `verify-cpu/run.sh`: FAILURES: 0
-(29 runs; the n <= 4 path this change also touches). Mutation: inverting the comparison (`ivN - nvN`) fails the gate
-on 69 checks (taps 0.92-0.99, 60 of 63 positions below the gate).
-NOT measured: any GPU run, and a real 256K/1M prompt - the gain is the span bytes per token
-(~22 MiB at 256K, ~87 MiB at 1M) off the one H2D per pass, which only a long-context GPU run shows.
+(29 runs; the n <= 4 path this change also touches).  Chunked prefill (`ds4_generate --backend cpu --prefill-chunk N`
+on tame, a 32-token prompt + 24 greedy tokens, `DS4_DUMP_TOKLOGITS` against the decode-loop run): chunks 1, 2, 3, 7,
+16, 33 byte-identical tokens and logits.
+Mutations (each must fail the gate, then restored): inverting the comparison (`ivN - nvN`) fails the decode gate on
+69 checks (taps 0.92-0.99, 60 of 63 positions below the gate); leaking one future block in the chunk mask
+(`nvis = nv + 1`) fails the chunk gate (tokens and logits at chunk 7, logits at chunk 33 - the logits row is the
+sharper check there).
+NOT measured: any GPU run, and a real 256K/1M prompt - the gain is bytes off the H2D (~22 MiB/token at 256K and
+~87 MiB/token at 1M for decode, ~1 GiB per ratio per chunk for prefill, plus the persistent ~1.1 GiB of chunk
+masks), which only a long-context GPU run shows.

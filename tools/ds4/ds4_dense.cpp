@@ -288,7 +288,7 @@ struct Ds4Dense::Impl {
     ggml_tensor * pf_logits = nullptr;   // the last chunk head graph's output
     struct PfRatio {                     // per compress ratio (4 = CSA, 128 = HCA): the layers of a ratio share inputs
         ggml_tensor * i_slot_comp = nullptr, * i_slot_state = nullptr, * i_comp_pos = nullptr, * i_state_pos = nullptr,
-                    * i_idx_state = nullptr, * vis_full = nullptr;
+                    * i_idx_state = nullptr, * vis_full = nullptr, * i_nvis = nullptr;
     };
     struct PfSet {
         ggml_tensor * x_state = nullptr, * routed_sum = nullptr, * i_tid = nullptr, * i_emb = nullptr, * i_pos = nullptr;
@@ -725,14 +725,15 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
         ggml_tensor * comp_pos  = first(L.i_comp_pos, n);
         ggml_tensor * slot_st   = im.pf ? nullptr : first(L.i_slot_state, n);   // chunk: tail_into uses its own
         ggml_tensor * idx_st    = first(L.i_idx_state, L.ring * n);   // [ring] per token, flat (get_rows takes 1-D)
-        if (vis_dev_on() && !im.pf) {
+        if (vis_dev_on()) {
             // DS4_VIS_DEV (default on): build the compressed-row visibility on the device from the per-layer count
-            // `i_nvis` (the blocks each query may see) instead of a host mask.  That host mask carried comp_max *
-            // kNtMax floats per compressed layer inside the per-token input span, of which only `cap` rows were ever
-            // used: ~22 MiB/token at 256K and ~90 MiB at 1M of pure upload (FINDINGS s22).  Row i is visible to
-            // query t iff block i completed at or before pos_t, i.e. (i+1)*ratio <= pos_t+1 <=> i < i_nvis[t].
-            // step() gives exactly 1 (visible) / 0 (hidden) and log() exactly 0.0f / -INFINITY - the host's values;
-            // scaling by NEG_INF instead would be 0 * inf = NaN.
+            // `i_nvis` (the blocks each query may see) instead of a host mask.  The decode host mask carried
+            // comp_max * kNtMax floats per compressed layer in the per-token input span, and the chunk mask
+            // comp_max * N floats (at 256K: ~22 MiB per token, and 1 GiB per chunk per ratio, uploaded every
+            // chunk), of which only `cap` rows were ever used (FINDINGS s22).  Row i is visible to query t iff
+            // block i completed at or before pos_t, i.e. (i+1)*ratio <= pos_t+1 <=> i < i_nvis[t].  step() gives
+            // exactly 1 (visible) / 0 (hidden) and log() exactly 0.0f / -INFINITY - the host's values; scaling by
+            // NEG_INF instead would be 0 * inf = NaN.
             ggml_tensor * nvs = ggml_cast(gc, first(L.i_nvis, n), GGML_TYPE_F32);             // [n]
             ggml_tensor * iv  = ggml_arange(gc, 0.0f, (float) cap, 1.0f);                     // [cap] = i
             ggml_tensor * shp = ggml_new_tensor_2d(gc, GGML_TYPE_F32, cap, n);
@@ -1850,7 +1851,8 @@ static bool pf_alloc(Ds4Dense::Impl & im) {
         R.i_comp_pos   = ggml_new_tensor_1d(c, GGML_TYPE_I32, NP);
         R.i_state_pos  = ggml_new_tensor_1d(c, GGML_TYPE_I32, NP);
         R.i_idx_state  = ggml_new_tensor_1d(c, GGML_TYPE_I32, L->ring * NP);
-        R.vis_full     = ggml_new_tensor_1d(c, GGML_TYPE_F32, L->comp_max * NP);
+        if (vis_dev_on()) R.i_nvis   = ggml_new_tensor_1d(c, GGML_TYPE_I32, NP);   // DS4_VIS_DEV (FINDINGS s23)
+        else              R.vis_full = ggml_new_tensor_1d(c, GGML_TYPE_F32, L->comp_max * NP);
     }
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(im.backend);
     im.pf_buf = ggml_backend_alloc_ctx_tensors_from_buft(c, buft);
@@ -1900,6 +1902,7 @@ static void pf_swap(Ds4Dense::Impl & im, Ds4Dense::Impl::Layer * L) {
         std::swap(L->i_slot_comp, R->i_slot_comp); std::swap(L->i_slot_state, R->i_slot_state);
         std::swap(L->i_comp_pos, R->i_comp_pos); std::swap(L->i_state_pos, R->i_state_pos);
         std::swap(L->i_idx_state, R->i_idx_state); std::swap(L->vis_full, R->vis_full);
+        std::swap(L->i_nvis, R->i_nvis);
     }
 }
 
@@ -1990,8 +1993,10 @@ bool Ds4Dense::prefill_begin(const int * tids, int n, int pos0) {
         if (!L) continue;
         Impl::PfRatio & R = *pf_ratio_set(im, r);
         const int64_t cap = attn_cap(*L, pos_last);
-        std::vector<int32_t> sp((size_t) n), cpp((size_t) n), sc((size_t) n), sidx((size_t) (L->ring * n));
-        std::vector<float> vis((size_t) (cap * n), NEG_INF);
+        std::vector<int32_t> sp((size_t) n), cpp((size_t) n), sc((size_t) n), sidx((size_t) (L->ring * n)), nvis;
+        std::vector<float> vis;
+        if (vis_dev_on()) nvis.resize((size_t) n);
+        else              vis.assign((size_t) (cap * n), NEG_INF);
         for (int t = 0; t < n; ++t) {
             const int64_t pt = (int64_t) pos0 + t, bl = pt / r;
             sp[(size_t) t]  = (int32_t) (pt % r);
@@ -2000,7 +2005,8 @@ bool Ds4Dense::prefill_begin(const int * tids, int n, int pos0) {
             sc[(size_t) t]  = (int32_t) (later_same ? L->comp_max : bl);
             for (int64_t i = 0; i < L->ring; ++i) sidx[(size_t) (t * L->ring + i)] = ext(pt - L->ring + 1 + i, L->ring_sz);
             const int64_t nv = (pt + 1) / r;
-            for (int64_t i = 0; i < nv && i < cap; ++i) vis[(size_t) (t * cap + i)] = 0.0f;
+            if (vis_dev_on()) nvis[(size_t) t] = (int32_t) nv;
+            else for (int64_t i = 0; i < nv && i < cap; ++i) vis[(size_t) (t * cap + i)] = 0.0f;
         }
         const std::vector<int32_t> ss = tail(L->ring_sz);
         ggml_backend_tensor_set(R.i_state_pos, sp.data(), 0, sp.size() * 4);
@@ -2008,7 +2014,8 @@ bool Ds4Dense::prefill_begin(const int * tids, int n, int pos0) {
         ggml_backend_tensor_set(R.i_slot_comp, sc.data(), 0, sc.size() * 4);
         ggml_backend_tensor_set(R.i_idx_state, sidx.data(), 0, sidx.size() * 4);
         ggml_backend_tensor_set(R.i_slot_state, ss.data(), 0, ss.size() * 4);
-        ggml_backend_tensor_set(R.vis_full, vis.data(), 0, vis.size() * 4);
+        if (vis_dev_on()) ggml_backend_tensor_set(R.i_nvis, nvis.data(), 0, nvis.size() * 4);
+        else              ggml_backend_tensor_set(R.vis_full, vis.data(), 0, vis.size() * 4);
     }
     im.pf_pos0 = pos0;
     im.pf_n = n;

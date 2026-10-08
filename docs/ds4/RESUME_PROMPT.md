@@ -5,7 +5,8 @@ prefill up to **392 tok/s** at 6K (`--prefill-chunk 4096 --chunk-mmq --chunk-pre
 local commits after it: f16-q8, verify gctx fix, --mtp-keep, docs - push when Mal says.
 **Priority 1 = long context (Mal needs 250K-1M):** FINDINGS s22 plan (a)-(e): sparse top-512 CSA gather **(done,
 17cab42)**, Q8_0 (or TBQ4 from ~/AI/llama.cpp-master-rebase) compressed caches, device-side visibility **(done,
-FINDINGS s23: `DS4_VIS_DEV`, the mask is built from a per-layer `i_nvis` count; ~22 MiB/token off the span at 256K)**,
+FINDINGS s23: `DS4_VIS_DEV`, the mask is built from a per-layer `i_nvis` count - decode ~22 MiB/token off the span
+at 256K, prefill ~1 GiB per ratio per chunk + ~1.1 GiB persistent)**,
 query-blocked prefill indexer, then caches in pinned RAM. Read b19-ctx*.log first. Then build long prompts and measure
 prefill/decode at 64K..256K.
 Priority 2 = speculative decode: `--mtp-keep 2` + VRAM LRU in run_multi + verify margin calibration; then DSpark.
