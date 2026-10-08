@@ -970,3 +970,16 @@ same experts it would be 63 ms (15.9 tok/s); with the context-linear work remove
 hit rate recovered to ~83% (~25 ms) it is ~46 ms = **21.7 tok/s**.  Both levers are named: the `cap`-dependent
 attention/mask/sort work above, and residency - the cross-layer LRU (s29) plus the Q8_0 compressed caches giving
 back the VRAM the F32 caches take (s22 (b): ~5.4 GB at 256K).
+
+**s31 addendum - the 385 s of dense prefill is NOT explained by the indexer's flops, which points at kernel
+efficiency.**  The lightning indexer's score matmul is `[idx_k, cap, 1] x [idx_k, n, idx_h]` per CSA layer per chunk,
+i.e. `2 * cap * n * idx_h * idx_k` = 2 * cap * 4096 * 64 * 128 flops = 5.5e11 flops per layer at cap 8192, 1.2e13
+for the 21 CSA layers, and ~7.4e14 flops summed over the 128K run's 32 chunks (cap grows 2048 -> 32768).  At a
+generous 30 TFLOPS effective F32 on a 4090 that is ~25 s - the measured dense half is **385 s**, 15x more.  So the
+time is not the matmul arithmetic; the candidates are the kernel shape (a batched contraction with K = 128 is
+memory-bound and badly suited to the tensor-core path, and it runs in F32) and the `ggml_cont` copies the permute
+pattern forces on `[cap, n, 64]` (`cap*4096*64*4` bytes per layer per chunk = 8.6 GB at cap 8192, x21 layers).
+**Confirming test: nsys on the 128K prefill** (`bench/ds4-2026-10-08/nsys/` has the workflow) - it will name the
+kernel in one run, and the likely fix is either an F16/BF16 tensor-core path for the indexer scores (it is a
+*selection* score; the reference's own accuracy budget is far looser than the attention itself) or restructuring the
+permute so the `[cap, n, 64]` tensor is never materialised twice.  Do not start either before nsys says which.
