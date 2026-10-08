@@ -84,6 +84,8 @@ struct Args {
     int comp_rot = -1;           // --comp-rot 0|1: force the Hadamard rotation of comp rows on/off (-1 = auto)
     bool icomp_q8 = false;       // --icomp-q8: the lightning indexer's key cache as Q8_0
     bool comp_host = false;      // --comp-host: comp in pinned host RAM, read zero-copy (CUDA)
+    int pos_offset = 0;          // --pos-offset N: decode as if at position N+i over EMPTY caches - a timing probe for
+                                 // long-context decode without the prefill (output is meaningless; graphs/cap are real)
     std::string dense_requant;   // q4_k | q5_k | q6_k: requantize the big Q8_0 dense matrices at load   // cache-aware routing: + this to the selection score of VRAM-resident experts   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
 };
 
@@ -150,6 +152,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--comp-rot") a.comp_rot = std::atoi(next().c_str());
         else if (k == "--icomp-q8") a.icomp_q8 = true;
         else if (k == "--comp-host") a.comp_host = true;
+        else if (k == "--pos-offset") a.pos_offset = std::atoi(next().c_str());
         else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (!a.ids_csv.empty() || !a.ids_file.empty());
@@ -218,7 +221,11 @@ int main(int argc, char** argv) {
     }   // the tier owns them (on the GPU backend they would be a 72 GiB upload)
     // the compressed-KV state is sized for the context actually used, not the model's context_length: the
     // smallest compress ratio is 4, so ctx/4 rows (+2 for the partial block) cover every layer
-    const int64_t ctx = a.ctx > 0 ? a.ctx : (int64_t) prompt.size() + a.n_predict + 64;
+    const int64_t ctx = std::max<int64_t>(a.ctx > 0 ? a.ctx : 0, (int64_t) a.pos_offset + (int64_t) prompt.size() + a.n_predict + 64);
+    if (a.pos_offset > 0 && (a.prefill_chunk > 0 || !a.mtp.empty())) {
+        std::fprintf(stderr, "ds4_generate: --pos-offset is a decode-loop probe: no --prefill-chunk / --mtp\n");
+        return 2;
+    }
     dc.comp_cap_max = ctx / 4 + 2;
     dc.mtp_path = a.mtp;
     dc.prefill_chunk = a.prefill_chunk;
@@ -312,6 +319,7 @@ int main(int argc, char** argv) {
     // one token through every layer; returns false on any engine error
     std::vector<float> rb((size_t) tier.geom().n_experts);
     auto step = [&](int tid, int pos) -> bool {
+        pos += a.pos_offset;
         if (a.route_bias != 0.0f && !mc.cpu_only)
             for (int l = 0; l < n_layer; ++l) {   // the residency the cache has NOW (admissions move it per token)
                 for (int64_t e = 0; e < (int64_t) rb.size(); ++e) rb[(size_t) e] = tier.resident(l, e) ? a.route_bias : 0.0f;
@@ -389,6 +397,7 @@ int main(int argc, char** argv) {
     std::vector<int32_t> ids32_n((size_t) (top_k * NT));
     std::vector<float> w_n((size_t) (top_k * NT)), routed_n((size_t) (n_embd * NT));
     auto step_n = [&](const int* toks, int n, int pos0) -> bool {
+        pos0 += a.pos_offset;
         if (a.route_bias != 0.0f && !mc.cpu_only)
             for (int l = 0; l < n_layer; ++l) {
                 for (int64_t e = 0; e < (int64_t) rb.size(); ++e) rb[(size_t) e] = tier.resident(l, e) ? a.route_bias : 0.0f;
