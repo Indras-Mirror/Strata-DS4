@@ -811,3 +811,20 @@ Gate (CPU, `ds4_generate --backend cpu --prefill-chunk 33` on mini tame, a 32-to
 `DS4_DUMP_TOKLOGITS` against the decode-loop run): byte-identical tokens and logits at
 `DS4_IDX_BLOCK=8`, `16` and `64` (5, 3 and 1 blocks for the chunk).  The dense gates (swa16 40/40, tame 63/63,
 `--multi 2,3,1,4`) still PASS.
+
+**s27 addendum - the first version of that gate had no power, and the fixture tells you why.**  A 32-token prompt
+gives `cap = 8` and `IDXTOPK = 8`, i.e. the indexer's top-k selects *every* block, so the score mask (and therefore
+the per-block mask slice) cannot affect anything: mutating the slice offset to 0 left tokens and logits identical.
+With a **62-token** prompt `cap = 16 > ntk`, and the gate becomes real - measure it with `--ppl`, which covers the
+prompt rows, unlike the generated-token dump (24 rows of tokens were insensitive where 61 rows of logits are not):
+
+```
+64.6256  decode-loop prefill                 (mean NLL 4.16861)
+64.6256  --prefill-chunk 60, DS4_IDX_BLOCK=8  (8 blocks)
+64.6256  --prefill-chunk 60, DS4_IDX_BLOCK=16 (4 blocks)
+64.6256  --prefill-chunk 60, DS4_IDX_BLOCK=64 (1 block = the old graph)
+64.6145  the same at block 8 with the per-block mask slice forced to offset 0   <- the mutation, caught
+```
+(source restored and re-verified at 64.6256; `idx_block_n` was also instrumented once to confirm the loop really
+runs - `[idxblock] n=32 blk=8`.)  Lesson for the CPU gates: an indexer gate is only a gate when `cap > indexer
+top_k`; the 40- and 63-token fixtures used so far are below or at that line for the chunk cases.
