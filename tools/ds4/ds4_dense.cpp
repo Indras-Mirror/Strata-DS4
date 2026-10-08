@@ -354,6 +354,9 @@ struct Ds4Dense::Impl {
     struct Var {
         int64_t cap = 0;
         int64_t n = 1;                    // tokens per pass
+        // false: the pass completes no compressed block (one token, (pos+1) % ratio != 0) - the compressor and
+        // indexer ring states are written, but the pooled row (invisible until its block completes) is not built
+        bool emit = true;
         ggml_tensor * vis = nullptr;      // F32 [cap, n] 0 visible / -inf hidden, per query
         ggml_tensor * dbg_isc = nullptr;  // F32 [cap, n] indexer scores + visibility (DS4_DBG_INDEXER=1)
         ggml_cgraph * gf = nullptr;
@@ -630,10 +633,12 @@ struct B {
 // per-query window mask, the compressed keys are the cache after every token of the pass wrote its row, with a
 // per-query visibility mask (a block completed by token t is visible to tokens > t, never the reverse).  The
 // compressor rings take every token's state before any gather; each token gathers its own `ring` slots.
-static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_t n, Ds4Dense::Impl::Layer & L) {
+static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_t n, Ds4Dense::Impl::Layer & L,
+                               bool emit = true) {
     Ds4Dense::Impl::Var var;
     var.cap = cap;
     var.n = n;
+    var.emit = emit = emit || im.pf || n != 1;   // only one-token decode skips
 
     ggml_context * gc = im.gctx;
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 4096, false);
@@ -720,6 +725,11 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
                 if (!im.pf) {
                     rkv = ggml_set_rows(gc, ring_kv, skv, slot_st);
                     rsc = ggml_set_rows(gc, ring_sc, ssc, slot_st);
+                    if (!emit) {   // the states only: no block completes at this position
+                        wb.push_back(rkv);
+                        wb.push_back(rsc);
+                        return nullptr;
+                    }
                 } else {   // [ring | the chunk's states]; the ring gets the chunk's last states afterwards
                     rkv = ggml_concat(gc, ring_kv, skv, 1);
                     rsc = ggml_concat(gc, ring_sc, ssc, 1);
@@ -750,9 +760,11 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             comp_k = overlap("attn_compressor", DH, L.st_kv, L.st_sc);
 
             // lightning indexer: compressed keys (post-WHT) + query, then top-k over the visible blocks, per query
-            ggml_tensor * lid_k = ggml_cont(gc, overlap("indexer_compressor", im.IDXK, L.ist_kv, L.ist_sc));
-            lid_k = b.hadamard(lid_k, im.rot);
-            ggml_tensor * icomp2 = ggml_set_rows(gc, L.icomp, ggml_cont_2d(gc, lid_k, im.IDXK, n), first(L.i_slot_comp, n));
+            ggml_tensor * icomp2 = L.icomp;   // !emit: the block keys as they are (the current block is invisible)
+            if (ggml_tensor * lk = overlap("indexer_compressor", im.IDXK, L.ist_kv, L.ist_sc)) {
+                ggml_tensor * lid_k = b.hadamard(ggml_cont(gc, lk), im.rot);
+                icomp2 = ggml_set_rows(gc, L.icomp, ggml_cont_2d(gc, lid_k, im.IDXK, n), first(L.i_slot_comp, n));
+            }
             // ds4_ref's lid_k is 3-D [idx_k, 1, n_blocks]; this 3-D view of the ring's first `cap`
             // columns has the same shape, so the permute below lands `cap` on ne[1] exactly like the
             // reference's kp = permute(lid_k, 0,2,1,3).  A 2-D view would put `cap` on ne[2] and the
@@ -812,26 +824,30 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             if (!im.pf) {
                 rkv = ggml_set_rows(gc, L.st_kv, skv, slot_st);
                 rsc = ggml_set_rows(gc, L.st_sc, ssc, slot_st);
+                if (!emit) { wb.push_back(rkv); wb.push_back(rsc); }
             } else {
                 rkv = ggml_concat(gc, L.st_kv, skv, 1);
                 rsc = ggml_concat(gc, L.st_sc, ssc, 1);
                 tail_into(L.st_kv, skv, L.ring_sz, L.i_slot_state);
                 tail_into(L.st_sc, ssc, L.ring_sz, L.i_slot_state);
             }
-            ggml_tensor * rows_kv = ggml_reshape_3d(gc, ggml_get_rows(gc, rkv, idx_st), DH, ratio, n);
-            ggml_tensor * rows_sc = ggml_reshape_3d(gc, ggml_get_rows(gc, rsc, idx_st), DH, ratio, n);
-            ggml_tensor * values = ggml_cont(gc, ggml_permute(gc, rows_kv, 1, 0, 2, 3));   // [ratio, DH, n]
-            ggml_tensor * scores = ggml_cont(gc, ggml_permute(gc, rows_sc, 1, 0, 2, 3));
-            ggml_tensor * wts = ggml_soft_max(gc, scores);
-            ggml_tensor * cc = ggml_sum_rows(gc, ggml_mul(gc, values, wts));  // [1, DH, n]
-            cc = ggml_cont(gc, ggml_permute(gc, cc, 1, 0, 2, 3));             // [DH, 1, n]
-            cc = b.rms_w(cc, b.BL(il, "attn_compressor_norm.weight"));
-            comp_k = b.rope_at(cc, comp_pos, DHR, DH - DHR, n_ctx, crb,
-                               freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+            if (emit) {
+                ggml_tensor * rows_kv = ggml_reshape_3d(gc, ggml_get_rows(gc, rkv, idx_st), DH, ratio, n);
+                ggml_tensor * rows_sc = ggml_reshape_3d(gc, ggml_get_rows(gc, rsc, idx_st), DH, ratio, n);
+                ggml_tensor * values = ggml_cont(gc, ggml_permute(gc, rows_kv, 1, 0, 2, 3));   // [ratio, DH, n]
+                ggml_tensor * scores = ggml_cont(gc, ggml_permute(gc, rows_sc, 1, 0, 2, 3));
+                ggml_tensor * wts = ggml_soft_max(gc, scores);
+                ggml_tensor * cc = ggml_sum_rows(gc, ggml_mul(gc, values, wts));  // [1, DH, n]
+                cc = ggml_cont(gc, ggml_permute(gc, cc, 1, 0, 2, 3));             // [DH, 1, n]
+                cc = b.rms_w(cc, b.BL(il, "attn_compressor_norm.weight"));
+                comp_k = b.rope_at(cc, comp_pos, DHR, DH - DHR, n_ctx, crb,
+                                   freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+            }
             cmask = ggml_cast(gc, var.vis, GGML_TYPE_F16);
         }
 
-        ggml_tensor * comp2 = ggml_set_rows(gc, L.comp, ggml_cont_2d(gc, comp_k, DH, n), first(L.i_slot_comp, n));
+        ggml_tensor * comp2 = comp_k ? ggml_set_rows(gc, L.comp, ggml_cont_2d(gc, comp_k, DH, n), first(L.i_slot_comp, n))
+                                     : L.comp;   // !emit: no block completes here
         ggml_tensor * comp_src = ggml_view_2d(gc, comp2, DH, cap, comp2->nb[1], 0);
         k_all = ggml_concat(gc, k_all, ggml_reshape_3d(gc, comp_src, DH, 1, cap), 2);
         mask = ggml_concat(gc, mask, cmask, 0);                              // [n_raw + cap, n]
@@ -1333,12 +1349,19 @@ bool Ds4Dense::Impl::ensure_n(int64_t n) {
 }
 
 // the attention variant for (cap, n), built on first use
-static Ds4Dense::Impl::Var * attn_var(Ds4Dense::Impl & im, int il, int64_t cap, int64_t n) {
+static Ds4Dense::Impl::Var * attn_var(Ds4Dense::Impl & im, int il, int64_t cap, int64_t n, bool emit = true) {
     Ds4Dense::Impl::Layer & L = im.ly[(size_t) il];
+    emit = emit || n != 1 || cap == 0;
     for (Ds4Dense::Impl::Var & v : L.vars)
-        if (v.cap == cap && v.n == n) return &v;
-    build_attn(im, il, cap, n, L);
+        if (v.cap == cap && v.n == n && v.emit == emit) return &v;
+    build_attn(im, il, cap, n, L, emit);
     return &L.vars.back();
+}
+
+// DS4_COMP_SKIP (default on): a one-token pass that completes no compressed block skips the pooled row (FINDINGS s21)
+static bool comp_skip_on() {
+    static const bool on = [] { const char * e = std::getenv("DS4_COMP_SKIP"); return !e || std::atoi(e) != 0; }();
+    return on;
 }
 
 // compressed-row capacity a pass whose last token sits at `pos_last` needs (0 for a ratio-0 layer)
@@ -1441,7 +1464,8 @@ bool Ds4Dense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
         im.err = "attn_router: position beyond the compressed cache capacity";
         return false;
     }
-    Impl::Var * var = attn_var(im, il, attn_cap(L, pos_last), n);
+    const bool emit = !(comp_skip_on() && n == 1 && L.ratio != 0 && (pos_last + 1) % L.ratio != 0);
+    Impl::Var * var = attn_var(im, il, attn_cap(L, pos_last), n, emit);
     if (!alloc_graph(var->allo, var->gf)) { im.err = "gallocr(attn) failed"; return false; }
 
     // ---- per-step inputs: every layer's, for this pass, in ONE upload per pass ------------------
@@ -1583,6 +1607,10 @@ bool Ds4Dense::reserve_graphs(int n_max) {
             for (int64_t cap : caps) {
                 Impl::Var * var = attn_var(im, il, cap, n);
                 if (!ggml_gallocr_reserve(var->allo, var->gf)) { im.err = "reserve: attention graph"; return false; }
+                if (n == 1 && cap > 0 && comp_skip_on()) {   // the no-block-completes variant too
+                    var = attn_var(im, il, cap, n, false);
+                    if (!ggml_gallocr_reserve(var->allo, var->gf)) { im.err = "reserve: attention graph"; return false; }
+                }
             }
             if (!ggml_gallocr_reserve(L.allo_finish[n], L.gf_finish[n])) { im.err = "reserve: finish"; return false; }
         }
