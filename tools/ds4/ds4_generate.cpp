@@ -77,6 +77,7 @@ struct Args {
     bool chunk_mmq = false;      // --chunk-mmq: prompt chunks' streamed experts through MMQ (int8 tensor cores)
     bool chunk_prestage = false; // --chunk-prestage: stream layer l+1's experts while layer l computes
     float skip_miss = 0.0f;      // --skip-miss T: drop a VRAM-miss expert whose weight < T x the token's weight sum
+    bool f16_q8 = false;         // --f16-q8: compressor / indexer F16 matrices as Q8_0 (VRAM + bandwidth)
     std::string dense_requant;   // q4_k | q5_k | q6_k: requantize the big Q8_0 dense matrices at load   // cache-aware routing: + this to the selection score of VRAM-resident experts   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
 };
 
@@ -136,6 +137,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--chunk-mmq") a.chunk_mmq = true;
         else if (k == "--chunk-prestage") a.chunk_prestage = true;
         else if (k == "--skip-miss") a.skip_miss = (float) std::atof(next().c_str());
+        else if (k == "--f16-q8") a.f16_q8 = true;
         else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (!a.ids_csv.empty() || !a.ids_file.empty());
@@ -208,6 +210,7 @@ int main(int argc, char** argv) {
     dc.comp_cap_max = ctx / 4 + 2;
     dc.mtp_path = a.mtp;
     dc.prefill_chunk = a.prefill_chunk;
+    dc.f16_q8 = a.f16_q8;
     if (a.prefill_chunk > 0 && !a.mtp.empty()) {
         std::fprintf(stderr, "ds4_generate: --prefill-chunk does not fill the MTP window yet; drop --mtp or the chunk\n");
         return 2;

@@ -52,6 +52,8 @@ struct Ds4DenseConfig {
     /// Prompt chunks: the most tokens one prefill_* pass may carry (0 = no chunked prefill).  The chunk's hand-off
     /// tensors and graph buffers are allocated at the first prefill_begin and freed by prefill_release.
     int64_t        prefill_chunk = 0;
+    /// Off-CPU: the compressor / indexer F16 matrices as Q8_0 (router and hyper-connection mixers stay F16).
+    bool           f16_q8 = false;
 };
 
 /// One-token decode of the DS4 dense half.  Not thread-safe; one instance decodes one sequence.

@@ -127,9 +127,19 @@ bool requant_target(const std::string & n) {
 // `prefix` non-empty: only the tensors whose name starts with it (the MTP file: its own block - its token_embd and
 // output duplicate the trunk's), plus those named in `alias` (file name -> store name: the MTP file's own hc_head
 // weights, which differ from the trunk's).  A second call appends to the same store.
+// --f16-q8: the F16 attention-side matrices that are big and not precision-critical (compressors, indexer query and
+// projection: ~0.9 GiB F16, ~2 ms/token of F16 matvecs).  The router (ffn_gate_inp) and the hyper-connection mixers
+// stay F16: they pick experts and drive the Sinkhorn mix.
+bool f16_q8_target(const std::string & n) {
+    for (const char * s : { "attn_compressor_kv.weight", "attn_compressor_gate.weight", "indexer_compressor_kv.weight",
+                            "indexer_compressor_gate.weight", "indexer.attn_q_b.weight", "indexer.proj.weight" })
+        if (n.size() > std::strlen(s) && n.compare(n.size() - std::strlen(s), std::string::npos, s) == 0) return true;
+    return false;
+}
+
 bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, bool skip_experts, int requant,
                   std::string & err, const std::string & prefix = "",
-                  const std::map<std::string, std::string> & alias = {}) {
+                  const std::map<std::string, std::string> & alias = {}, bool f16_q8 = false) {
     if (!w.ctx) {
         ggml_init_params ip = { /*mem_size*/ 256ull * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
         w.ctx = ggml_init(ip);
@@ -188,6 +198,8 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, b
             // goes through cuBLAS on CUDA, whose first use loads its kernels into VRAM after --slots auto has sized the
             // expert cache (cudaGraphInstantiate OOM with --mtp, 2026-10-07)
             else if (ty == GGML_TYPE_BF16 && ti.shape.size() >= 2 && ne[0] % 32 == 0)
+                ty = GGML_TYPE_Q8_0;
+            else if (f16_q8 && ty == GGML_TYPE_F16 && ti.shape.size() >= 2 && ne[0] % 32 == 0 && f16_q8_target(ti.name))
                 ty = GGML_TYPE_Q8_0;
             ggml_tensor * t = ggml_new_tensor(w.ctx, ty, (int) ti.shape.size(), ne);
             if (!t) { err = "cannot create " + ti.name; return false; }
@@ -1104,7 +1116,7 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
     if (!(err = ds4_read_geometry(*im.model, im.g)).empty()) return false;
     if (!(err = check_ds4_model(*im.model, im.g)).empty()) return false;
     if (!load_weights(*im.model, im.backend, im.w, cfg.skip_routed_experts,
-                      ggml_backend_is_cpu(im.backend) ? -1 : cfg.requant_type, err)) return false;
+                      ggml_backend_is_cpu(im.backend) ? -1 : cfg.requant_type, err, "", {}, cfg.f16_q8)) return false;
     im.n_trunk = im.g.n_layer();
     if (!cfg.mtp_path.empty()) {   // the MTP head: its own GGUF, block blk.<n_trunk>
         im.mtp_model = std::make_unique<GgufModel>(GgufModel::open(cfg.mtp_path));
