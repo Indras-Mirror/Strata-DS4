@@ -1181,3 +1181,49 @@ measurements are queued as `bench/ds4-2026-10-08/batch25.sh` (~20 min: CUDA mini
 - CUDA mini-fixture arm: it aborted on the fused op (unsupported mini dims) -> c2a64a1 gates the op on
   `ggml_backend_supports_op`; with that, tame matches the s25 CUDA baseline to the digit (0.99912037).
 - **Recommended long-context decode flags now:** `--comp-type iq4_nl --icomp-q8` (DS4_FUSED_IDX is default).
+
+## 36. Dense-half op cuts, and the nsys answer: the dense half is kernel time, not launch gaps (2026-10-09)
+
+GPU shared with strata-glm (alternating <=10-12 min slots over relay).  All cuts CPU-gated bit-exact (swa16 40/40,
+tame 63/63 `--multi 2,3,1,4`; chunk ppl 64.9626 / 65.2775 at chunks 0/7/33/60) and mutation-tested.
+
+- **18af46f** `flat2`: a CONT of an already-contiguous tensor (matmul/rope/set_rows results, a permute that only
+  moves a size-1 axis) becomes a reshape; **`DS4_OVL_GATHER`** (default on): the CSA overlap compressor gathers its
+  prev/cur state halves with one `get_rows` over half-rows (host writes `2*slot` / `2*slot+1` into `i_idx_state` for
+  CSA layers) instead of whole rows + 4 strided conts + 2 concats; the gate taps' `attn_raw` cont + 2 copies now only
+  run with `gate_taps`.  Mutations of the decode and chunk half-row fills caught (cos 0.981 FAIL, ppl 64.9385).
+- **283b06b** one F16 cast serves K and V (K == V; it was two identical casts per layer per token);
+  `GGML_HINT_SRC0_IS_HADAMARD` on the rotation matmul (as llama-impl.h - ggml-cuda runs its FWHT kernel; the matrix
+  is the same Sylvester Hadamard, CPU ignores the hint).
+- **eb6436b** the `DS4_VIS_DEV` mask from a persistent `-i` ramp + F32 `i_nvis`: add/step/log instead of
+  cast/arange/repeat/repeat/sub/step/log (7 -> 3 kernels per compressed layer per token).  Off-by-one ramp caught.
+- Census (mini tame, CPU graph): CSA decode layer **121 -> 107** compute ops (no block completes), **161 -> 130**
+  (a block completes).
+
+**Real model, p600 + 128, standard flags + `--comp-type iq4_nl --icomp-q8` (b28):**
+
+| binary | decode | attention+router | experts | hit | ppl |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| dec2 (before) | 24.96 tok/s | 15.51 ms | 20.50 | 82.3% | 10.5713 |
+| dec4 (all cuts) | 24.51 tok/s | **14.74 ms** | 21.98 | 81.4% | 10.5803 |
+
+b27 (without the standard flags) gave the same direction: 16.50 -> 16.01 ms, ppl identical to 4 decimals.
+Attention+router **-0.77 ms (-5%)**; the total moved with the experts column (hit rate / timing noise), and the
+ppl difference is inside the ~0.2 run-to-run band (the FWHT hint also changes CUDA rounding of the rotated rows).
+
+**nsys (b28-nsys, `--cuda-graph-trace=node`, 16-token prompt + 48; csv summaries committed, .nsys-rep/.sqlite not):**
+per decode token (the window holds 2 flash-attn per layer per token - the counts below are already per token):
+
+- GPU kernel time **~16.4 ms per ~41 ms token**: the GPU is idle ~60% of the token (the expert phase is CPU pool +
+  PCIe bound, attention waits for it and vice versa).
+- dense side **~14.3 ms of kernels** vs attention+router + predict + finish wall ~17.6 ms un-profiled: **the dense
+  half is kernel time, the launch/sync gaps are only ~2-3 ms.**
+- `mul_mat_vec_q` **~7.0 ms** (~510/token; Q6_K dense + Q8_0 `--f16-q8` matrices) = the weight-read floor.
+- **~4,300 kernels averaging <3 us (~1.3 us each) = ~5.5 ms**: the fusion budget.  Each op removed per layer is
+  worth ~0.06 ms/token (43 layers x 1.3 us).  Biggest small-op families: rms_norm 390/tok (2.7 us, 1.05 ms),
+  bin_bcast add/mul ~790/tok (0.9 ms), quantize_q8_1 510/tok (0.53 ms - one per quantized matvec, so reusing one
+  q8_1 of `xn` across its 7 matvecs would save ~6 per CSA layer), sigmoid/unary 460/tok (0.4 ms), scale 280/tok.
+- flash-attn 0.48 ms/token, lightning indexer (WMMA) 0.1 ms, argsort 0.33 ms: attention proper is cheap now.
+
+Reading: the remaining dense-side headroom is ~3-5 ms (small kernels + gaps) on top of a ~7 ms floor; the bigger
+lever is the expert half (20-22 ms: PCIe ~11-12, CPU pool ~10 at an ~82% hit rate).
