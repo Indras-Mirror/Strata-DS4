@@ -1072,3 +1072,29 @@ the decode loop, which is exactly how s20 already shows 64+-token chunks as "the
 variable.  So the raw-window blocking of addendum 3 keeps its bit-exact chunk gate (run it with `DS4_CPU_FA_REF=1`,
 as chunks >= 64 already require); the earlier "it can no longer hold" was wrong.  Off-CPU the same change is
 flop-bound and simply faster.
+
+## 33. Long-context step (b), first cut: the compressed K caches as Q8_0 cost +0.49% ppl (2026-10-08)
+
+`--comp-q8` (c1036b4) stores `comp` - the CSA/HCA compressed-row K cache - as Q8_0 instead of F32, written by
+ggml's quantized `set_rows` and read back dequantized (`get_rows`, including the masked prefill path).  Interleaved
+A/B on the real model, p600 + 128 greedy, the s21 decode config, `--ppl` (`bench/ds4-2026-10-08/batch23.sh`):
+
+| arm | ppl | decode |
+| --- | ---: | ---: |
+| F32 | **10.4520** / **10.4520** | 25.14 / 25.31 tok/s |
+| Q8_0 | **10.5031** / **10.5031** | 25.30 / 25.04 tok/s |
+
+**+0.051 ppl = +0.49%** for the swap, speed unchanged (it is a memory saving, not a speed lever).  For scale: this is
+half the ppl cost of `--route-bias 0.05` (+1.1%), and at 256K the same swap returns ~3.5 GB of VRAM - ~560 expert
+slots, ~25% more cache - which is the expert half of the s31 20+ arithmetic.  Two further readings:
+
+- **The two arms are each reproducible to four decimals** (10.4520, 10.4520 / 10.5031, 10.5031) - so s26's
+  "reproducible" holds *within one binary*, and the b20-vs-b23 gap (10.6065 then vs 10.4520 now, same flags) is a
+  *binary* difference: s23's span change moved `--slots auto` from 2442 to 2450 slots, and the expert split that
+  results is what moves ppl there.  Read a ppl comparison inside one batch, never across binaries.
+- `--comp-q8` is only *usable* because the compressed keys are Hadamard-rotated before storage (the indexer's own
+  rotation is unconditional for DSV4, s22/s9): rotating decorrelates the row, so its Q8_0 blocks are benign.  The
+  indexer's `icomp` is still F32 in this cut; quantizing it too would add ~0.7 GB at 256K for the same 1/4 ratio.
+
+NOT yet done: `icomp` as Q8_0, and the long-context A/B (the ppl cost is context-independent, but the *slot* gain
+needs a 256K run to show up).
