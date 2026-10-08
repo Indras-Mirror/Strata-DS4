@@ -562,3 +562,50 @@ token `gpu_run`; `--verify`'s multi-token passes neither swap nor refresh recenc
 Not tested: `test_ds4_dense --cuda` with reuse; `--verify` on CUDA; nsys. The load-time "dense compute buffers"
 report (one gallocr arena per graph, none shared: 43 layers x capacity variants x pass sizes) is in the source but
 the GPU binary used by batch 1 predates it - next GPU run prints it; if it is GiB-scale, sharing arenas buys slots.
+
+## 20. Chunked prefill: ~20 -> 392 tok/s; VRAM LRU decode 19.6 -> 22.3 tok/s (2026-10-08 evening, `bench/ds4-2026-10-08/`)
+
+All real-model runs through memguard (`q.sh`, binaries snapshotted in `bench/ds4-2026-10-08/bin/`).
+
+**VRAM LRU (fb3a315 + MiMo's e61d69b) on DS4** (p600, 128 tokens, `--arena-skip-resident --arena-gib 58`):
+hit 70.4 -> **84.1%**, experts 29.3 -> 23.1 ms/token, decode 19.57 -> **22.29 tok/s**, ppl 10.46.
+`DS4_CHECK_LRU=1`: 6000 swaps byte-checked against the file, 0 bad. `--arena-skip-resident` alone: file tier 0,
+19.15-19.57 tok/s.
+
+**Chunked prefill (`--prefill-chunk N`, ae0afd1..b7b5913).** Ds4Dense `prefill_*` = the decode graph builders in a
+chunk mode: built per (layer, chunk), run once on one shared gallocr, dropped; chunk-sized hand-off tensors swapped
+in for the build; rings keep their decode size (a chunk reads [ring | its rows], writes back its last rows). Expert
+side: `run_chunk` (MiMo's), VRAM cache opened after the prompt (`defer_cache`).
+CPU gate: chunks 1..33 bit-identical to the decode loop (logits rows, ppl, tokens) on mini tame + swa16; 64/70
+differ only through ggml-cpu's tiled flash-attn (>= 64 queries) - bit-identical with `DS4_CPU_FA_REF=1`. Mutation
+(write-back slots off by one) caught.
+
+| run (2998- or 5996-token prompt, chunk 4096, full 70 GiB arena, --vram-lru) | prefill tok/s |
+|---|---|
+| decode-loop prefill (before) | ~18-21 |
+| p3000, `--arena-skip-resident` (VRAM-seed experts re-read from NVMe each chunk: 28 GB at 3 GB/s) | 163 |
+| p3000, full arena, MMVQ | 184 |
+| p3000, MMQ (clamped swiglu), no ppl | 259 |
+| p6000, MMQ | 333 |
+| p6000, MMQ, pinned host hand-offs | 349 |
+| p6000, MMQ, routed sums device-to-device | 368 |
+| p6000, MMQ + `--chunk-prestage` (layer l+1's experts DMA while layer l computes) | **392** |
+
+What each step fixed (nsys `bench/ds4-2026-10-08/nsys/`):
+- `--arena-skip-resident` must NOT be used with chunked prefill: the deferred cache leaves its 2.2k experts in
+  neither VRAM nor RAM during the prompt.
+- Cache seed 8.0 -> 0.8 s: MiMo's queued/threaded seed for uniform slots too (`DS4_SERIAL_SEED=1` = old).
+- MMQ never ran for DS4: every layer clamps SwiGLU at 10 (MMQ path skipped clamped layers) and the build lacked
+  `STRATA_MMQ_KQUANTS=ON` (Q2_K down). `mmq::swiglu_clamp` (new, additive) + reconfigure: expert kernels 2.96 -> 0.48 s.
+  MMQ ppl 6.39-6.41 vs MMVQ 6.3825 on p3000 (int8 activations; stream-k reduction order follows launch grouping).
+- Indexer `ggml_top_k` on CUDA = cub once per query row (~63k x 3 launches per 3K chunk): batched argsort in chunk
+  graphs off-CPU (ties among ReLU zeros may pick differently; ppl unchanged 6.4052).
+- Every H2D between layers queues behind the prestage DMA on the copy engine (FIFO): pinned buffers, then the tier
+  writes the routed sums straight into the dense chunk tensor (`run_chunk_dev`): finish 3.3 -> 0.1 s.
+- Prestage correctness: MMVQ + prestage p3000 ppl 6.3825 == MMVQ without (same bytes).
+
+Where the 15.3 s for 5996 tokens goes now: experts 8.4 s (DMA-bound: ~74 GB per chunk at ~13-19 GB/s; file tier
+2.9 GB at ~2 GB/s), dense 4.8 s (attention+router; GPU work ~1.2 s per chunk - host graph build, gallocr regrowth
+~590 cudaMalloc, raw window computed as one masked [SWA+n-1, n] attention), seed 0.8 s.
+Not done: chunked prefill with `--mtp` (MTP window), decode after a 6K prompt is 16 tok/s (fewer slots: longer
+context reserves more graph VRAM; hit 66%) - look at that next.

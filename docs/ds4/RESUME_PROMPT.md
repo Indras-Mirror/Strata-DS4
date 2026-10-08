@@ -11,6 +11,17 @@ RTX 4090 24 GB + Ryzen 7 5700X (8c, AVX2 only) + 90 GB DDR4. Public repo: https:
 Another session works on MiMo in `~/AI/Strata-MiMo` (branch `mimo`) - don't touch it; you share the GPU lock.
 Written 2026-10-07 at commit `83c5324` (end of a CPU-only session that did the whole CPU queue - FINDINGS s14-18).
 
+## UPDATE 2026-10-08 evening (FINDINGS s20) - supersedes the block below where they differ
+- Best decode config: `--vram-lru` (+ `--arena-skip-resident --arena-gib 58` when NOT using chunked prefill):
+  22.3 tok/s p600. Best prefill: `--prefill-chunk 4096 --chunk-mmq --chunk-prestage --vram-lru`, full
+  `--arena-gib 70`: 392 tok/s on 5996 tokens (decode-loop prefill was ~20). build-ds4-gpu needs
+  `-DSTRATA_MMQ_KQUANTS=ON` (now configured). Chunked prefill refuses `--mtp` (MTP window not filled yet).
+- Queue full runs with `bench/ds4-2026-10-08/q.sh <log> <args>` (env: DS4_BIN snapshot, Q_PROMPT, Q_N, Q_PPL=
+  to drop --ppl). Snapshot binaries in bench/ds4-2026-10-08/bin/ so rebuilding never changes a queued run.
+- Next: (1) decode after long prompts (16 tok/s at 6K: slots/graph VRAM), (2) dense chunk overhead (host graph
+  build, gallocr regrowth, raw window as one masked attention), (3) MTP window in chunked prefill, then --verify on
+  CUDA, (4) README numbers. Push to ds4 only when Mal says.
+
 ## UPDATE 2026-10-08 (read this first; FINDINGS s19)
 - Branch `deepseek4` +4 commits (not pushed): `a215ff1` MiMo tier port, `fb3a315` --vram-lru/--arena-adapt/
   --arena-skip-resident for DS4, `7efdf88` CUDA-graph reuse (attention+router 22.3 -> 17.9 ms), + docs.
