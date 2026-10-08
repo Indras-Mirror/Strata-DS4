@@ -645,6 +645,8 @@ struct B {
 // per-query window mask, the compressed keys are the cache after every token of the pass wrote its row, with a
 // per-query visibility mask (a block completed by token t is visible to tokens > t, never the reverse).  The
 // compressor rings take every token's state before any gather; each token gathers its own `ring` slots.
+static bool sparse_on();   // DS4_SPARSE, defined with the other switches below
+
 static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_t n, Ds4Dense::Impl::Layer & L,
                                bool emit = true) {
     Ds4Dense::Impl::Var var;
@@ -716,6 +718,7 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
     if (cap > 0) {
         ggml_tensor * comp_k = nullptr;
         ggml_tensor * cmask = nullptr;
+        ggml_tensor * sel = nullptr;   // sparse CSA (one-token decode): the compressed rows attention gathers
         ggml_tensor * state_pos = first(L.i_state_pos, n);
         ggml_tensor * comp_pos  = first(L.i_comp_pos, n);
         ggml_tensor * slot_st   = im.pf ? nullptr : first(L.i_slot_state, n);   // chunk: tail_into uses its own
@@ -822,7 +825,20 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             ggml_tensor * m = ggml_set_rows(gc, a, zv, tk);                     // query j's indices into slice j
             m = ggml_view_4d(gc, m, m->ne[1], m->ne[2], 1, 1, m->nb[2], m->nb[3], m->nb[3], 0);
             m = ggml_add(gc, m, var.vis);
-            cmask = ggml_cast(gc, m, GGML_TYPE_F16);
+            if (n == 1 && !im.pf && sparse_on()) {
+                // DS4_SPARSE (default): attend to the indexer's rows only - gather them instead of masking every block
+                // (attention cost stops growing with the context).  The selected-and-visible rows come out of one
+                // argsort of [mask - i * 1e-6], i.e. in ascending block order - the order the masked flash-attention
+                // visits its unmasked keys, so the CPU result is the same bits.  The tail (if fewer than ntk rows are
+                // visible) is masked rows, gathered with their -inf.
+                ggml_tensor * m1 = ggml_reshape_1d(gc, ggml_cont(gc, m), cap);
+                ggml_tensor * ramp = ggml_scale(gc, ggml_arange(gc, 0.0f, (float) cap, 1.0f), -1.0e-6f);
+                sel = ggml_view_1d(gc, ggml_argsort(gc, ggml_add(gc, m1, ramp), GGML_SORT_ORDER_DESC), ntk, 0);
+                ggml_tensor * msel = ggml_get_rows(gc, ggml_reshape_2d(gc, m1, 1, cap), sel);   // [1, ntk]
+                cmask = ggml_cast(gc, ggml_reshape_2d(gc, msel, ntk, 1), GGML_TYPE_F16);
+            } else {
+                cmask = ggml_cast(gc, m, GGML_TYPE_F16);
+            }
         } else {
             // HCA: one block == `ratio` consecutive tokens, no overlap (ds4_ref attention():603-622)
             ggml_tensor * st_kv = ggml_mul_mat(gc, b.BL(il, "attn_compressor_kv.weight"), xn);
@@ -860,8 +876,13 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
 
         ggml_tensor * comp2 = comp_k ? ggml_set_rows(gc, L.comp, ggml_cont_2d(gc, comp_k, DH, n), first(L.i_slot_comp, n))
                                      : L.comp;   // !emit: no block completes here
-        ggml_tensor * comp_src = ggml_view_2d(gc, comp2, DH, cap, comp2->nb[1], 0);
-        k_all = ggml_concat(gc, k_all, ggml_reshape_3d(gc, comp_src, DH, 1, cap), 2);
+        if (sel) {   // sparse: the gathered rows (ascending block order)
+            ggml_tensor * rows = ggml_get_rows(gc, comp2, sel);                 // [DH, ntk]
+            k_all = ggml_concat(gc, k_all, ggml_reshape_3d(gc, rows, DH, 1, rows->ne[1]), 2);
+        } else {
+            ggml_tensor * comp_src = ggml_view_2d(gc, comp2, DH, cap, comp2->nb[1], 0);
+            k_all = ggml_concat(gc, k_all, ggml_reshape_3d(gc, comp_src, DH, 1, cap), 2);
+        }
         mask = ggml_concat(gc, mask, cmask, 0);                              // [n_raw + cap, n]
     }
 
@@ -1370,6 +1391,12 @@ static Ds4Dense::Impl::Var * attn_var(Ds4Dense::Impl & im, int il, int64_t cap, 
         if (v.cap == cap && v.n == n && v.emit == emit) return &v;
     build_attn(im, il, cap, n, L, emit);
     return &L.vars.back();
+}
+
+// DS4_SPARSE (default on): one-token CSA attention gathers the indexer's top rows instead of masking all blocks
+static bool sparse_on() {
+    static const bool on = [] { const char * e = std::getenv("DS4_SPARSE"); return !e || std::atoi(e) != 0; }();
+    return on;
 }
 
 // DS4_COMP_SKIP (default on): a one-token pass that completes no compressed block skips the pooled row (FINDINGS s21)
