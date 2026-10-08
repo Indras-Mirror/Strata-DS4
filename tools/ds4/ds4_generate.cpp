@@ -76,6 +76,7 @@ struct Args {
     int prefill_chunk = 0;       // --prefill-chunk N: the prompt in chunks of N tokens (0 = through the decode loop)
     bool chunk_mmq = false;      // --chunk-mmq: prompt chunks' streamed experts through MMQ (int8 tensor cores)
     bool chunk_prestage = false; // --chunk-prestage: stream layer l+1's experts while layer l computes
+    float skip_miss = 0.0f;      // --skip-miss T: drop a VRAM-miss expert whose weight < T x the token's weight sum
     std::string dense_requant;   // q4_k | q5_k | q6_k: requantize the big Q8_0 dense matrices at load   // cache-aware routing: + this to the selection score of VRAM-resident experts   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
 };
 
@@ -134,6 +135,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--prefill-chunk") a.prefill_chunk = std::atoi(next().c_str());
         else if (k == "--chunk-mmq") a.chunk_mmq = true;
         else if (k == "--chunk-prestage") a.chunk_prestage = true;
+        else if (k == "--skip-miss") a.skip_miss = (float) std::atof(next().c_str());
         else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (!a.ids_csv.empty() || !a.ids_file.empty());
@@ -246,6 +248,7 @@ int main(int argc, char** argv) {
     mc.defer_cache = defer_seed;
     mc.chunk_mmq = a.chunk_mmq;
     mc.chunk_prestage = a.chunk_prestage;
+    mc.skip_miss = a.skip_miss;
     if (!tier.init(a.model, mc, err)) { std::fprintf(stderr, "ds4_generate: tier init: %s\n", err.c_str()); return 1; }
     if (!a.profile.empty() && !mc.cpu_only &&
         !(defer_seed ? tier.build_arena_from_routes(a.profile, 512, err) : tier.seed_from_routes(a.profile, err))) {
@@ -650,6 +653,9 @@ int main(int argc, char** argv) {
                  100.0 * (double) st.hits / look, (double) st.prefetched_useful / dec_steps,
                  (double) st.prefetch_issued / dec_steps, 100.0 * (double) st.cpu / look,
                  100.0 * (double) st.pcie / look, (long long) st.file_tier);
+    if (a.skip_miss > 0)
+        std::fprintf(stderr, "skip-miss %.3f: %.2f experts/pass dropped (%.1f%% of lookups)\n", a.skip_miss,
+                     (double) st.skipped / dec_steps, 100.0 * (double) st.skipped / look);
     if (a.vram_lru || a.arena_adapt || st.file_tier > 0)
         std::fprintf(stderr, "tier moves: vram_lru swaps %.2f/pass (demoted %lld), arena swaps %lld, file reads %.2f "
                              "ms/pass\n", (double) st.vram_swaps / dec_steps, (long long) st.vram_demotes,

@@ -1187,6 +1187,20 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
         }
     }
     st.prefetched_useful = npf_hit;
+    // skip_miss: a miss with a small gate weight is dropped - its 6.75 MB never moves (wloc = the weights the sum uses)
+    float wloc[kMaxParts];
+    for (int64_t k = 0; k < K; ++k) wloc[k] = w6[k];
+    if (im.cfg.skip_miss > 0.0f && nc > 0) {
+        double ws = 0;
+        for (int64_t k = 0; k < K; ++k) ws += (double) w6[k];
+        int keep = 0;
+        for (int i = 0; i < nc; ++i) {
+            const int32_t k = cpu_i[i];
+            if ((double) w6[k] < (double) im.cfg.skip_miss * ws) { wloc[k] = 0.0f; ++st.skipped; }
+            else cpu_i[keep++] = k;
+        }
+        nc = keep;
+    }
     mark(0);
 
     // The PCIe share of the misses, with the replay's error-diffused budget AND its eligibility rule: the DMA
@@ -1549,9 +1563,10 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
     for (int64_t i = 0; i < H; ++i) {
         double s = 0;
         for (int64_t k = 0; k < K; ++k) {
+            if (wloc[k] == 0.0f) continue;   // a dropped miss: its parts row was never computed (0 * NaN is NaN)
             const float* p = cpu_k[k] ? im.parts.data() + (size_t) k * (size_t) H
                                       : gpu_parts + (size_t) k * (size_t) H;
-            s += (double) w6[k] * (double) p[(size_t) i];
+            s += (double) wloc[k] * (double) p[(size_t) i];
         }
         out[i] = (float) s;
     }
@@ -2503,6 +2518,7 @@ void Ds4MoeStats::add(const Ds4MoeStats& o) {
     arena_swaps += o.arena_swaps;
     vram_swaps += o.vram_swaps;
     vram_demotes += o.vram_demotes;
+    skipped += o.skipped;
     gap_ms += o.gap_ms;
     hit_ms += o.hit_ms;
     pcie_ms += o.pcie_ms;

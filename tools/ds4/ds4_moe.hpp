@@ -221,6 +221,9 @@ struct Ds4MoeConfig {
     /// Prompt chunks: while layer l's experts compute (and the caller runs layer l+1's dense half), DMA layer l+1's
     /// arena experts into the other device half, which is then sized to a whole layer.  Off with arena_adapt.
     bool chunk_prestage = false;
+    /// Decode (run): a routed expert that is a VRAM miss and weighs less than `skip_miss` x the token's weight sum is
+    /// dropped (not fetched, contributes 0).  Hits are never dropped.  0 = off.  A quality trade: measure ppl.
+    float skip_miss = 0.0f;
     /// Decode (MiMo and DS4): a PCIe-share miss (and a prefetched expert the routing used) takes
     /// the least-recently-used VRAM slot of its layer instead of a staging buffer, so the cache follows the
     /// conversation (route_probe sim, 1800 slots: static 40.5% held-out hit, LRU 61.6%; FINDINGS s16).  Same math per
@@ -247,9 +250,10 @@ struct Ds4MoeStats {
     int64_t arena_swaps = 0;        ///< arena_adapt: file-tier experts moved into the arena
     int64_t vram_swaps = 0;         ///< vram_lru: misses / prefetches moved into a VRAM slot
     int64_t vram_demotes = 0;       ///< ...of which the victim went back to the arena (it had no arena copy)
+    int64_t skipped = 0;            ///< skip_miss: low-weight misses dropped
 
     void add(const Ds4MoeStats& o);
-    int64_t lookups() const { return hits + cpu + pcie; }
+    int64_t lookups() const { return hits + cpu + pcie + skipped; }
 };
 
 /// The tier's private state, defined in ds4_moe.cpp.  It carries the CUDA members in a CUDA build and none in a
