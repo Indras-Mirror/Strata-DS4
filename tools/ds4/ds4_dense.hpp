@@ -147,6 +147,13 @@ public:
     bool prefill_end();
     /// Frees the chunk tensors and the shared graph buffer (VRAM back for the expert cache).
     void prefill_release();
+    /// A host buffer of prefill_chunk * n_embd floats for the routed sums prefill_finish takes - pinned on CUDA, so
+    /// the expert tier writes and prefill_finish uploads without pageable staging.  Valid until prefill_release.
+    float * prefill_routed_buffer();
+    /// The chunk's routed-sum tensor on the device (prefill_chunk * n_embd floats, token-major), or NULL on the CPU
+    /// backend.  An expert tier on the same device can write the sums there; prefill_finish(il, nullptr) then skips
+    /// the host upload (which would queue behind the tier's expert DMAs on the copy engine).
+    void * prefill_routed_device();
     const float * tap_attn_raw(int il) const;
     const float * tap_attn_out(int il) const;
     const float * tap_l_last  (int il) const;

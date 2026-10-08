@@ -256,8 +256,14 @@ struct Ds4Dense::Impl {
         ggml_tensor * i_slot_raw = nullptr, * i_idx_raw = nullptr, * i_mask_raw = nullptr;
         PfRatio r4, r128;
     } P;
-    std::vector<uint8_t> pf_out_host;    // router output blocks [fn | ids | wts] x n
-    std::vector<float>   pf_fn;          // ffn_norm rows of the chunk (token-major)
+    // host side of a chunk: router output blocks [fn | ids | wts] x n, the ffn_norm rows the expert tier reads and the
+    // routed sums it writes - pinned when the backend has a host buffer type (CUDA): pageable copies are staged by
+    // the driver in pieces that queue behind the tier's expert DMAs on the one host-to-device copy engine
+    ggml_backend_buffer_t pf_hbuf = nullptr;
+    std::vector<uint8_t> pf_hvec;        // the same, pageable (CPU backend)
+    uint8_t * pf_out_host = nullptr;
+    float *   pf_fn = nullptr;
+    float *   pf_routed = nullptr;
     void pf_free() {
         if (pf_allo) ggml_gallocr_free(pf_allo);
         if (pf_buf) ggml_backend_buffer_free(pf_buf);
@@ -265,8 +271,10 @@ struct Ds4Dense::Impl {
         if (pf_ctx) ggml_free(pf_ctx);
         pf_allo = nullptr; pf_buf = nullptr; pf_obuf = nullptr; pf_ctx = nullptr; P = PfSet();
         std::vector<uint8_t>().swap(pf_meta);
-        std::vector<uint8_t>().swap(pf_out_host);
-        std::vector<float>().swap(pf_fn);
+        if (pf_hbuf) ggml_backend_buffer_free(pf_hbuf);
+        pf_hbuf = nullptr;
+        std::vector<uint8_t>().swap(pf_hvec);
+        pf_out_host = nullptr; pf_fn = nullptr; pf_routed = nullptr;
     }
 
     // One graph allocator per graph, never a shared one.  ggml-alloc binds a tensor's data pointer once
@@ -735,7 +743,13 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
 
             // mask = -inf everywhere, 0 at each query's top-k rows, then ANDed with visibility
             const int64_t ntk = std::min<int64_t>(cap, im.IDXTOPK);
-            ggml_tensor * tk = ggml_cont(gc, ggml_top_k(gc, sc, (int) ntk));    // [ntk, n]
+            // chunk off-CPU: one batched argsort for every query row (ggml-cuda's top_k launches cub once per row: 3
+            // kernels x n rows x 21 CSA layers, ~63k launches for a 3K-token chunk).  The same top-k set except among
+            // exact ties (ReLU zeros), which cub breaks arbitrarily too; the CPU keeps top_k (no launch cost) so its
+            // chunk gate stays bit-exact against the decode loop
+            const bool batched_tk = im.pf && !ggml_backend_is_cpu(im.backend);
+            ggml_tensor * tk = ggml_cont(gc, batched_tk ? ggml_argsort_top_k(gc, sc, (int) ntk)
+                                                        : ggml_top_k(gc, sc, (int) ntk));   // [ntk, n]
             ggml_tensor * a = ggml_fill(gc, var.vis, NEG_INF);
             a = ggml_view_4d(gc, a, 1, cap, n, 1, a->nb[0], a->nb[1], a->nb[2], 0);
             ggml_tensor * zv = b.fill_f32({ 1, ntk, n }, 0.0f);
@@ -1705,8 +1719,21 @@ static bool pf_alloc(Ds4Dense::Impl & im) {
         ggml_backend_tensor_alloc(im.pf_obuf, P.o_i, base) != GGML_STATUS_SUCCESS) {
         im.err = "prefill: cannot place the router output blocks"; return false;
     }
-    im.pf_out_host.assign(ob, 0);
-    im.pf_fn.assign((size_t) (D * NP), 0.0f);
+    {
+        const size_t rows = (size_t) (D * NP) * sizeof(float), al = 256;
+        const size_t o_sz = (ob + al - 1) / al * al, r_sz = (rows + al - 1) / al * al, tot = o_sz + 2 * r_sz;
+        uint8_t * base = nullptr;
+        ggml_backend_buffer_type_t hbt = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(im.backend));
+        if (hbt && (im.pf_hbuf = ggml_backend_buft_alloc_buffer(hbt, tot)))
+            base = (uint8_t *) ggml_backend_buffer_get_base(im.pf_hbuf);
+        else {
+            im.pf_hvec.assign(tot, 0);
+            base = im.pf_hvec.data();
+        }
+        im.pf_out_host = base;
+        im.pf_fn = (float *) (base + o_sz);
+        im.pf_routed = (float *) (base + o_sz + r_sz);
+    }
     im.pf_allo = im.make_allo();
     if (!im.pf_allo) { im.err = "prefill: ggml_gallocr_new"; return false; }
     im.pf_meta.assign(64ull * 1024 * 1024, 0);
@@ -1849,18 +1876,18 @@ bool Ds4Dense::prefill_attn(int il, int * routed_ids, float * routed_w, const fl
     const int64_t cap = attn_cap(L, (int64_t) im.pf_pos0 + n - 1);
     return pf_run(im, &L, [&] { return build_attn(im, il, cap, n, L); }, [&] {
         const size_t ob = (size_t) im.o_blk;
-        ggml_backend_tensor_get(im.P.o_f, im.pf_out_host.data(), 0, ob * (size_t) n);
+        ggml_backend_tensor_get(im.P.o_f, im.pf_out_host, 0, ob * (size_t) n);
         for (int t = 0; t < n; ++t) {
-            const uint8_t * b0 = im.pf_out_host.data() + ob * (size_t) t;
+            const uint8_t * b0 = im.pf_out_host + ob * (size_t) t;
             const int32_t * ids = (const int32_t *) (b0 + im.o_ids_off);
             const float * wv = (const float *) (b0 + im.o_wts_off);
             for (int64_t i = 0; i < im.NUSED; ++i) {
                 routed_ids[t * im.NUSED + i] = ids[i];
                 routed_w[t * im.NUSED + i] = wv[i];
             }
-            std::memcpy(im.pf_fn.data() + (size_t) t * im.D, b0, (size_t) im.D * 4);
+            std::memcpy(im.pf_fn + (size_t) t * im.D, b0, (size_t) im.D * 4);
         }
-        if (ffn_norm_host) *ffn_norm_host = im.pf_fn.data();
+        if (ffn_norm_host) *ffn_norm_host = im.pf_fn;
         return true;
     }, "prefill_attn");
 }
@@ -1870,7 +1897,8 @@ bool Ds4Dense::prefill_finish(int il, const float * routed_sum) {
     if (il < 0 || il >= (int) im.ly.size() || im.pf_n <= 0) { im.err = "prefill_finish: bad layer / no chunk"; return false; }
     Impl::Layer & L = im.ly[(size_t) il];
     const int n = im.pf_n;
-    ggml_backend_tensor_set(im.P.routed_sum, routed_sum, 0, (size_t) (im.D * n) * 4);
+    if (routed_sum) ggml_backend_tensor_set(im.P.routed_sum, routed_sum, 0, (size_t) (im.D * n) * 4);
+    // (nullptr: the sums are already in P.routed_sum - see prefill_routed_device)
     return pf_run(im, &L, [&] { return build_finish(im, n, L); }, [] { return true; }, "prefill_finish");
 }
 
@@ -1893,6 +1921,19 @@ bool Ds4Dense::prefill_end() {
 }
 
 void Ds4Dense::prefill_release() { p_->pf_free(); }
+
+void * Ds4Dense::prefill_routed_device() {
+    Impl & im = *p_;
+    if (ggml_backend_is_cpu(im.backend)) return nullptr;
+    if (!im.pf_ctx && im.pf_cap > 0 && !pf_alloc(im)) return nullptr;
+    return im.P.routed_sum ? im.P.routed_sum->data : nullptr;
+}
+
+float * Ds4Dense::prefill_routed_buffer() {
+    Impl & im = *p_;
+    if (!im.pf_ctx && im.pf_cap > 0 && !pf_alloc(im)) return nullptr;
+    return im.pf_routed;
+}
 
 // taps: the LAST token of the most recent pass (for n = 1, the token)
 const float * Ds4Dense::tap_attn_out(int il) const {

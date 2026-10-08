@@ -147,6 +147,12 @@ struct Gpu {
     /// experts go through two device halves of `c_half` bytes (copy stream `s_cp` fills one while `s` computes
     /// the other); file-tier blobs are read into the matching pinned bounce half first.
     int64_t c_tok = 0, c_half = 0;
+    int64_t c_bhalf = 0;          ///< bytes of one pinned bounce half (file-tier reads); c_half may be larger (prestage)
+    /// Ds4MoeConfig::chunk_prestage: layer `c_pre_layer`'s arena experts `c_pre_e` (ascending ids, not VRAM-resident)
+    /// are DMA'd / being DMA'd into c_stage[c_pre_half] at stride `c_pre_sl`, event c_copied[c_pre_half]
+    int c_pre_layer = -1, c_pre_half = -1;
+    int64_t c_pre_sl = 0;
+    std::vector<int32_t> c_pre_e;
     void *c_w = nullptr, *c_out = nullptr;   ///< run_chunk: the top-k weights and the summed rows on the card
     void *c_x = nullptr, *c_xq = nullptr, *c_parts = nullptr, *c_scratch = nullptr, *c_ptr = nullptr,
          *c_start = nullptr, *c_ng = nullptr, *c_dst = nullptr, *c_tokv = nullptr, *c_stage[2] = {};
@@ -1777,8 +1783,57 @@ struct ChunkProf { double file_gb = 0, rd_busy = 0; double wall = 0, file = 0, f
 ChunkProf g_cprof;
 bool chunk_prof() { static const bool on = [] { const char* e = std::getenv("MIMO_CHUNK_PROF"); return e && *e == '1'; }(); return on; }
 
+// The stride run_chunk gives a streamed blob in a device half (BL, or BL rounded to whole blocks of every type when
+// the layer runs on MMQ) - the same rule as in gpu_run_chunk, for chunk_prestage
+int64_t chunk_stride(Ds4MoeImpl& im, int64_t layer) {
+    const int64_t BL = im.bl[(size_t) layer];
+#if defined(DS4_MOE_MMQ)
+    Gpu& gp = *im.gpu;
+    namespace mmq = strata::prefill::mmq;
+    const strata::kernels::NativeExpertLayout& GL = gp.gll[(size_t) layer];
+    const int gt = GL.gu_type, ut = GL.up_type >= 0 ? GL.up_type : GL.gu_type, dt = GL.d_type;
+    if (!im.cfg.chunk_mmq || !mmq::built()) return BL;
+    if (!(mmq::fits(gt, GL.n_ff) && mmq::fits(ut, GL.n_ff) && mmq::fits(dt, GL.n_embd) && GL.up_off % 2 == 0 &&
+          GL.down_off % 2 == 0)) return BL;
+    int64_t lcm = 16;
+    auto gcd = [](int64_t a, int64_t b) { while (b) { const int64_t t = a % b; a = b; b = t; } return a; };
+    for (int t : {gt, ut, dt}) {
+        const int64_t tsz = (int64_t) mmq::matrix_bytes(t, 1, 256);
+        lcm = lcm / gcd(lcm, tsz) * tsz;
+    }
+    const int64_t SL = (BL + lcm - 1) / lcm * lcm;
+    return SL - BL > 1048576 - 4096 ? BL : SL;
+#else
+    return BL;
+#endif
+}
+
+// chunk_prestage: DMA `layer`'s arena experts that are not VRAM-resident, ascending ids, into device half `h` at the
+// run_chunk stride; run_chunk(layer) then only waits for c_copied[h].  The half must hold them all (else: skip).
+void chunk_prestage(Ds4MoeImpl& im, int64_t layer, int h) {
+    Gpu& gp = *im.gpu;
+    gp.c_pre_layer = -1;
+    if (!im.g.routed(layer) || !gp.s_cp) return;
+    const int64_t BL = im.bl[(size_t) layer], SL = chunk_stride(im, layer), NX = im.g.n_experts;
+    std::vector<int32_t> es;
+    for (int64_t e = 0; e < NX; ++e) {
+        if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;
+        if (gp.arena.ptr(layer, e)) es.push_back((int32_t) e);
+    }
+    if (es.empty() || (int64_t) es.size() * SL > gp.c_half) return;
+    ck(cudaStreamWaitEvent(gp.s_cp, gp.c_used[h], 0), "prestage wait used");
+    for (size_t i = 0; i < es.size(); ++i)
+        ck(cudaMemcpyAsync((uint8_t*) gp.c_stage[h] + i * (size_t) SL, gp.arena.ptr(layer, es[i]), (size_t) BL,
+                           cudaMemcpyHostToDevice, gp.s_cp), "prestage dma");
+    ck(cudaEventRecord(gp.c_copied[h], gp.s_cp), "prestage copied");
+    gp.c_pre_layer = (int) layer;
+    gp.c_pre_half = h;
+    gp.c_pre_sl = SL;
+    gp.c_pre_e = std::move(es);
+}
+
 bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* w, const float* x_host,
-                   float* out) {
+                   float* out, void* out_dev = nullptr) {
     Gpu& gp = *im.gpu;
     const bool prof = chunk_prof();
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> kev;   // prof: one pair per grouped launch
@@ -1809,6 +1864,10 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         const char* mib = std::getenv("MIMO_CHUNK_STAGE_MIB");
         gp.c_half = (int64_t) (mib ? std::atoll(mib) : 1024) * 1048576;
         gp.c_half = std::max<int64_t>(gp.c_half, im.blob);
+        gp.c_bhalf = gp.c_half;   // the pinned bounce halves keep this size
+        // prestage: one device half holds a whole layer (every expert at the MMQ stride, <= blob + 1 MiB each)
+        if (im.cfg.chunk_prestage)
+            gp.c_half = std::max<int64_t>(gp.c_half, im.g.n_experts * (im.blob + 1048576));
         const int64_t ng = im.g.n_experts;
         ck(cudaMalloc(&gp.c_ptr, sizeof(unsigned long long) * (size_t) ng), "c_ptr");
         ck(cudaMalloc(&gp.c_start, sizeof(int32_t) * (size_t) (ng + 1)), "c_start");
@@ -1818,7 +1877,7 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
             // zeroed once, so whatever MMQ reads past a blob decodes to finite numbers (llama.cpp zero-pads too)
             ck(cudaMalloc(&gp.c_stage[h], (size_t) gp.c_half + 1048576), "c_stage");
             ck(cudaMemset(gp.c_stage[h], 0, (size_t) gp.c_half + 1048576), "c_stage zero");
-            ck(cudaMallocHost((void**) &gp.c_bounce[h], (size_t) gp.c_half), "c_bounce");
+            ck(cudaMallocHost((void**) &gp.c_bounce[h], (size_t) gp.c_bhalf), "c_bounce");
             ck(cudaEventCreateWithFlags(&gp.c_copied[h], cudaEventDisableTiming), "ev");
             ck(cudaEventCreateWithFlags(&gp.c_used[h], cudaEventDisableTiming), "ev");
             ck(cudaEventRecord(gp.c_used[h], gp.s), "ev");
@@ -2041,12 +2100,50 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
     // ---- streamed experts: arena ones, then the file tier, in batches that fit one device half.  File-tier blobs
     // are read by a background pool into pinned slots (both bounce halves, `cap` blobs; more = waves) from here on;
     // a batch waits only for the blobs it DMAs.
-    std::vector<int32_t> stream_e(order[1]);
+    // chunk_prestage: this layer's arena experts may already sit in a device half (issued by the previous call)
+    std::vector<int32_t> arena_e(order[1]);
+    int h0 = 0;   // the first half the batch loop below uses
+    bool used_pre = false;
+    if (gp.c_pre_layer == (int) layer && gp.c_pre_sl == SL) {
+        std::vector<int32_t> pidx((size_t) NX, -1);
+        for (size_t i = 0; i < gp.c_pre_e.size(); ++i) pidx[(size_t) gp.c_pre_e[i]] = (int32_t) i;
+        std::vector<int32_t> es, rest;
+        std::vector<unsigned long long> ps;
+        for (int32_t e : order[1]) {
+            if (pidx[(size_t) e] < 0) { rest.push_back(e); continue; }
+            es.push_back(e);
+            ps.push_back((unsigned long long) ((uint8_t*) gp.c_stage[gp.c_pre_half] + (size_t) pidx[(size_t) e] * (size_t) SL));
+            ent_str += cnt[(size_t) e];
+        }
+        if (!es.empty()) {
+            ck(cudaStreamWaitEvent(gp.s, gp.c_copied[gp.c_pre_half], 0), "wait prestaged");
+            // runs adjacent in the entry order AND in the half (strided: one MMQ launch per run)
+            std::vector<int32_t> re;
+            std::vector<unsigned long long> rp;
+            for (size_t q = 0; q < es.size(); ++q) {
+                if (!re.empty() && (first[(size_t) re.back()] + cnt[(size_t) re.back()] != first[(size_t) es[q]] ||
+                                    rp.back() + (unsigned long long) SL != ps[q])) {
+                    launch(re, rp);
+                    re.clear();
+                    rp.clear();
+                }
+                re.push_back(es[q]);
+                rp.push_back(ps[q]);
+            }
+            launch(re, rp);
+            ck(cudaEventRecord(gp.c_used[gp.c_pre_half], gp.s), "used prestaged");
+            used_pre = true;
+        }
+        arena_e = std::move(rest);
+        h0 = 1 - gp.c_pre_half;
+    }
+    gp.c_pre_layer = -1;
+    std::vector<int32_t> stream_e(arena_e);
     stream_e.insert(stream_e.end(), order[2].begin(), order[2].end());
     for (int32_t e : stream_e) ent_str += cnt[(size_t) e];
-    const size_t nA = order[1].size(), nF = order[2].size();
+    const size_t nA = arena_e.size(), nF = order[2].size();
     const int64_t per_half = std::max<int64_t>(1, gp.c_half / SL);
-    const size_t slots_half = (size_t) std::max<int64_t>(1, gp.c_half / BL), cap = 2 * slots_half;
+    const size_t slots_half = (size_t) std::max<int64_t>(1, gp.c_bhalf / BL), cap = 2 * slots_half;
     auto slot_ptr = [&](size_t k) { return gp.c_bounce[(k % cap) / slots_half] + ((k % cap) % slots_half) * (size_t) BL; };
     std::vector<std::atomic<int>> ready(nF);
     for (auto& r : ready) r.store(0, std::memory_order_relaxed);
@@ -2076,9 +2173,11 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         t_rd0 = now_ms();
         start_wave();
     }
+    int h_last = used_pre ? 1 - h0 : -1;
     for (size_t b0 = 0, bi = 0; b0 < stream_e.size(); b0 += (size_t) per_half, ++bi) {
         const size_t b1 = std::min(stream_e.size(), b0 + (size_t) per_half);
-        const int h = (int) (bi & 1);
+        const int h = (int) ((h0 + bi) & 1);
+        h_last = h;
         // the half is free once the kernel that last read it is done
         ck(cudaStreamWaitEvent(gp.s_cp, gp.c_used[h], 0), "wait used");
         std::vector<int32_t> es;
@@ -2086,7 +2185,7 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         for (size_t i = b0; i < b1; ++i) {
             const uint8_t* src;
             if (i < nA) {
-                src = gp.arena.ptr(layer, stream_e[i]);
+                src = gp.arena.ptr(layer, stream_e[i]);   // (arena_e: not prestaged)
             } else {
                 const size_t k = i - nA;
                 if (k >= wave_end) {   // a new wave reuses the slots: every DMA out of them must be done first
@@ -2132,14 +2231,28 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         g_cprof.file_gb += (double) nF * (double) BL / 1e9;
     }
 
+    // ---- chunk_prestage: the next routed layer's arena experts stream in while this layer computes and the caller
+    // runs the next dense half (the half this call did not use last; its kernels finish before the DMA starts) ----
+    if (im.cfg.chunk_prestage && !im.cfg.arena_adapt && gp.arena.base) {
+        int64_t nl = layer;
+        for (int64_t k = 0; k < im.g.n_layers; ++k) {
+            nl = (nl + 1) % im.g.n_layers;
+            if (im.g.routed(nl)) break;
+        }
+        chunk_prestage(im, nl, h_last >= 0 ? 1 - h_last : 0);
+    }
+
     // ---- outputs: the top-k mix on the card, n rows back ----
     ck(cudaMemcpyAsync(gp.c_w, w, sizeof(float) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_w");
     strata::kernels::weighted_rows_sum((const float*) gp.c_parts, (const float*) gp.c_w, (int) K, H, n,
                                        (float*) gp.c_out, gp.s);
-    ck(cudaMemcpyAsync(gp.c_hparts, gp.c_out, (size_t) n * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "out d2h");
+    if (out_dev)   // straight into the caller's device tensor (no host round trip)
+        ck(cudaMemcpyAsync(out_dev, gp.c_out, (size_t) n * (size_t) H * 4, cudaMemcpyDeviceToDevice, gp.s), "out d2d");
+    else
+        ck(cudaMemcpyAsync(gp.c_hparts, gp.c_out, (size_t) n * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "out d2h");
     const double ts = now_ms();
     ck(cudaStreamSynchronize(gp.s), "chunk sync");
-    std::memcpy(out, gp.c_hparts, (size_t) n * (size_t) H * 4);
+    if (!out_dev) std::memcpy(out, gp.c_hparts, (size_t) n * (size_t) H * 4);
     if (prof) {
         g_cprof.sync += now_ms() - ts;
         for (size_t i = 0; i < kev.size(); ++i) {
@@ -2240,7 +2353,9 @@ void Ds4MoeTier::release_chunk() {
     gp.c_hparts = nullptr;
     for (int i = 0; i < 2; ++i) gp.c_copied[i] = gp.c_used[i] = nullptr;
     gp.s_cp = nullptr;
-    gp.c_tok = gp.c_half = 0;
+    gp.c_tok = gp.c_half = gp.c_bhalf = 0;
+    gp.c_pre_layer = gp.c_pre_half = -1;
+    gp.c_pre_e.clear();
     gp.free_mmq();
 #endif
 }
@@ -2256,6 +2371,15 @@ bool Ds4MoeTier::run_chunk(int64_t layer, int n, const int32_t* ids, const float
     for (int t = 0; t < n; ++t)
         if (!run(layer, ids + t * K, w + t * K, x + (size_t) t * H, out + (size_t) t * H)) return false;
     return true;
+}
+
+bool Ds4MoeTier::run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev) {
+    if (!im_->inited || !ids || !w || !x || !out_dev || n < 1) return false;
+    if (!im_->g.routed(layer)) return false;
+#if defined(DS4_MOE_CUDA)
+    if (im_->gpu && !im_->cfg.cpu_only) return gpu_run_chunk(*im_, layer, n, ids, w, x, nullptr, out_dev);
+#endif
+    return false;
 }
 
 bool Ds4MoeTier::run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out) {

@@ -75,6 +75,7 @@ struct Args {
     bool arena_skip = false;     // --arena-skip-resident: the VRAM seed's experts stay out of the host arena
     int prefill_chunk = 0;       // --prefill-chunk N: the prompt in chunks of N tokens (0 = through the decode loop)
     bool chunk_mmq = false;      // --chunk-mmq: prompt chunks' streamed experts through MMQ (int8 tensor cores)
+    bool chunk_prestage = false; // --chunk-prestage: stream layer l+1's experts while layer l computes
     std::string dense_requant;   // q4_k | q5_k | q6_k: requantize the big Q8_0 dense matrices at load   // cache-aware routing: + this to the selection score of VRAM-resident experts   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
 };
 
@@ -132,6 +133,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--arena-skip-resident") a.arena_skip = true;
         else if (k == "--prefill-chunk") a.prefill_chunk = std::atoi(next().c_str());
         else if (k == "--chunk-mmq") a.chunk_mmq = true;
+        else if (k == "--chunk-prestage") a.chunk_prestage = true;
         else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (!a.ids_csv.empty() || !a.ids_file.empty());
@@ -243,6 +245,7 @@ int main(int argc, char** argv) {
     const bool defer_seed = a.prefill_chunk > 0 && !mc.cpu_only && !a.profile.empty();
     mc.defer_cache = defer_seed;
     mc.chunk_mmq = a.chunk_mmq;
+    mc.chunk_prestage = a.chunk_prestage;
     if (!tier.init(a.model, mc, err)) { std::fprintf(stderr, "ds4_generate: tier init: %s\n", err.c_str()); return 1; }
     if (!a.profile.empty() && !mc.cpu_only &&
         !(defer_seed ? tier.build_arena_from_routes(a.profile, 512, err) : tier.seed_from_routes(a.profile, err))) {
@@ -396,7 +399,10 @@ int main(int argc, char** argv) {
         const int NP = a.prefill_chunk;
         std::vector<int> cids((size_t) (NP * top_k));
         std::vector<int32_t> cids32((size_t) (NP * top_k));
-        std::vector<float> cw((size_t) (NP * top_k)), crouted((size_t) NP * (size_t) n_embd);
+        std::vector<float> cw((size_t) (NP * top_k));
+        float* crouted = dense.prefill_routed_buffer();   // pinned on CUDA
+        void* croute_dev = mc.cpu_only ? nullptr : dense.prefill_routed_device();   // the tier writes the sums there
+        if (!crouted) { std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str()); return 1; }
         const int LR = 16;   // logits rows per head call (ppl)
         std::vector<float> lrows;
         double t_dense = 0, t_exp = 0, t_attn = 0, t_head = 0;
@@ -415,12 +421,13 @@ int main(int argc, char** argv) {
                 }
                 double t1 = now_ms(); t_dense += t1 - t0; t_attn += t1 - t0; t0 = t1;
                 for (int k = 0; k < n * top_k; ++k) cids32[(size_t) k] = cids[(size_t) k];
-                if (!tier.run_chunk(l, n, cids32.data(), cw.data(), fn, crouted.data())) {
+                if (!(croute_dev ? tier.run_chunk_dev(l, n, cids32.data(), cw.data(), fn, croute_dev)
+                                 : tier.run_chunk(l, n, cids32.data(), cw.data(), fn, crouted))) {
                     std::fprintf(stderr, "ds4_generate: tier.run_chunk refused at layer %d\n", l);
                     return 1;
                 }
                 t1 = now_ms(); t_exp += t1 - t0; t0 = t1;
-                if (!dense.prefill_finish(l, crouted.data())) {
+                if (!dense.prefill_finish(l, croute_dev ? nullptr : crouted)) {
                     std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str());
                     return 1;
                 }
