@@ -80,6 +80,10 @@ struct Args {
     bool f16_q8 = false;         // --f16-q8: compressor / indexer F16 matrices as Q8_0 (VRAM + bandwidth)
     int mtp_keep = 0;            // --mtp-keep K: the MTP draft computes only its K heaviest routed experts (0 = all)
     bool comp_q8 = false;        // --comp-q8: the compressed-row K caches (comp) as Q8_0 instead of F32 (s22 (b))
+    std::string comp_type;       // --comp-type f32|q8_0|q5_0|q4_0|iq4_nl (s34 ladder; 4/5-bit rotate by default)
+    int comp_rot = -1;           // --comp-rot 0|1: force the Hadamard rotation of comp rows on/off (-1 = auto)
+    bool icomp_q8 = false;       // --icomp-q8: the lightning indexer's key cache as Q8_0
+    bool comp_host = false;      // --comp-host: comp in pinned host RAM, read zero-copy (CUDA)
     std::string dense_requant;   // q4_k | q5_k | q6_k: requantize the big Q8_0 dense matrices at load   // cache-aware routing: + this to the selection score of VRAM-resident experts   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
 };
 
@@ -142,6 +146,10 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--f16-q8") a.f16_q8 = true;
         else if (k == "--mtp-keep") a.mtp_keep = std::atoi(next().c_str());
         else if (k == "--comp-q8") a.comp_q8 = true;
+        else if (k == "--comp-type") a.comp_type = next();
+        else if (k == "--comp-rot") a.comp_rot = std::atoi(next().c_str());
+        else if (k == "--icomp-q8") a.icomp_q8 = true;
+        else if (k == "--comp-host") a.comp_host = true;
         else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (!a.ids_csv.empty() || !a.ids_file.empty());
@@ -216,6 +224,15 @@ int main(int argc, char** argv) {
     dc.prefill_chunk = a.prefill_chunk;
     dc.f16_q8 = a.f16_q8;
     dc.comp_q8 = a.comp_q8;
+    if (!a.comp_type.empty()) {
+        const std::string t = a.comp_type;
+        dc.comp_type = t == "f32" ? GGML_TYPE_F32 : t == "q8_0" ? GGML_TYPE_Q8_0 : t == "q5_0" ? GGML_TYPE_Q5_0
+                     : t == "q4_0" ? GGML_TYPE_Q4_0 : t == "iq4_nl" ? GGML_TYPE_IQ4_NL : -1;
+        if (dc.comp_type < 0) { std::fprintf(stderr, "ds4_generate: --comp-type f32|q8_0|q5_0|q4_0|iq4_nl\n"); return 2; }
+    }
+    dc.comp_rot = a.comp_rot;
+    dc.icomp_q8 = a.icomp_q8;
+    dc.comp_host = a.comp_host;
     if (a.prefill_chunk > 0 && !a.mtp.empty()) {
         std::fprintf(stderr, "ds4_generate: --prefill-chunk does not fill the MTP window yet; drop --mtp or the chunk\n");
         return 2;

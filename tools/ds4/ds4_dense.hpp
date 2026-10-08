@@ -58,7 +58,17 @@ struct Ds4DenseConfig {
     /// VRAM back for the expert cache at 256K (s22 (b) - they are F32 in the state today).  Rows are written with
     /// ggml's quantized set_rows and read back dequantized (get_rows), so this is lossy by construction: judge it on
     /// real-model ppl, not on the CPU bit-exact gate.  The indexer's `icomp` stays F32 in this cut.
-    bool           comp_q8 = false;
+    bool           comp_q8 = false;   ///< = comp_type Q8_0 (kept for the CLI's --comp-q8)
+    /// The compressed-row K cache's ggml type (0 = F32; Q8_0 / Q4_0 / IQ4_NL / Q5_0 tested).  Overrides comp_q8 when
+    /// non-zero.  4/5-bit types want `comp_rot`: rows are Walsh-Hadamard rotated (128-blocks) before quantizing and
+    /// rotated back after the gather - the rotation is orthonormal and self-inverse, so only the rounding changes.
+    int            comp_type = 0;
+    int            comp_rot = -1;     ///< -1 = auto (on below 8 bits), 0 / 1 = forced
+    /// The lightning indexer's key cache (`icomp`) as Q8_0 (scored by a quantized mul_mat; already Hadamard-rotated).
+    bool           icomp_q8 = false;
+    /// The compressed-row K cache in pinned host RAM, read zero-copy over PCIe (CUDA only; s22 (e)).  Decode gathers a
+    /// fixed top-512 rows per CSA layer, so the cost is constant in the context; the VRAM goes to the expert cache.
+    bool           comp_host = false;
 };
 
 /// One-token decode of the DS4 dense half.  Not thread-safe; one instance decodes one sequence.

@@ -269,6 +269,9 @@ struct Ds4Dense::Impl {
     int             in_n   = 0;         // ... and the pass's token count
     int             cur_tid = -1;       // the token id in i_tid
     ggml_backend_buffer_t sbuf = nullptr;
+    ggml_context *  hctx = nullptr;     // --comp-host: the compressed K caches' own context ...
+    ggml_backend_buffer_t hbuf = nullptr;   // ... in a pinned host buffer, read zero-copy by the device
+    bool            comp_rot = false;   // comp rows Hadamard-rotated around their quantization
     ggml_context *  gctx = nullptr;     // graph node structs (data comes from the gallocrs)
     std::string     err;
 
@@ -458,6 +461,8 @@ struct Ds4Dense::Impl {
         for (ggml_gallocr_t a : allo_mtp_head) free_allo(a);
         if (shared_allo) ggml_gallocr_free(shared_allo);
         if (sbuf) ggml_backend_buffer_free(sbuf);
+        if (hbuf) ggml_backend_buffer_free(hbuf);
+        if (hctx) ggml_free(hctx);
         if (ibuf) ggml_backend_buffer_free(ibuf);
         if (obuf) ggml_backend_buffer_free(obuf);
         if (ictx) ggml_free(ictx);
@@ -651,6 +656,7 @@ struct B {
 static bool sparse_on();   // DS4_SPARSE, defined with the other switches below
 static bool vis_dev_on();  // DS4_VIS_DEV, ditto
 static int64_t idx_block_n(int64_t n);   // DS4_IDX_BLOCK, ditto
+static int64_t raw_block_n(int64_t n);   // DS4_RAW_BLOCK, ditto
 
 static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_t n, Ds4Dense::Impl::Layer & L,
                                bool emit = true) {
@@ -716,8 +722,9 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
         raw_src = ggml_get_rows(gc, ggml_concat(gc, L.raw, kv2, 1), first(L.i_idx_raw, n_raw));
         tail_into(L.raw, kv2, im.RAW, L.i_slot_raw);
     }
-    ggml_tensor * k_all = ggml_reshape_3d(gc, raw_src, DH, 1, n_raw);             // token axis on ne2 (ds4_ref layout)
-    ggml_tensor * mask = ggml_reshape_2d(gc, first(L.i_mask_raw, n_raw * n), n_raw, n);
+    ggml_tensor * k_raw = ggml_reshape_3d(gc, raw_src, DH, 1, n_raw);             // token axis on ne2 (ds4_ref layout)
+    ggml_tensor * m_raw = ggml_reshape_2d(gc, first(L.i_mask_raw, n_raw * n), n_raw, n);
+    ggml_tensor * k_cmp = nullptr, * m_cmp = nullptr;   // the compressed keys [DH, 1, rows] and their mask [rows, n]
 
     // ---- compressed keys -------------------------------------------------------------
     if (cap > 0) {
@@ -819,7 +826,8 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             iw = ggml_scale(gc, iw, 1.0f / std::sqrt((float) (im.IDXK * im.IDXH)));
 
             ggml_tensor * qp = ggml_permute(gc, iq, 0, 2, 1, 3);            // [idx_k, n, idx_h]
-            ggml_tensor * kp = ggml_permute(gc, lid_src, 0, 2, 1, 3);       // [idx_k, cap, 1]
+            ggml_tensor * kp = icomp2->type == GGML_TYPE_F32 ? ggml_permute(gc, lid_src, 0, 2, 1, 3)   // [idx_k, cap, 1]
+                             : ggml_view_2d(gc, icomp2, im.IDXK, cap, icomp2->nb[1], 0);   // --icomp-q8: same rows
             // score[c,t] = sum_h relu(sum_k lid_k[k,c] * iq[k,h,t]) * iw[h,t].  The mul_mat's result is
             // [cap, n, idx_h] and the relu / head weight / sum need idx_h on ne[0], so the permute + cont
             // materialises a second tensor of that size: cap * n * 64 floats.  At a 64K prompt (cap 16384) that is
@@ -915,37 +923,76 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             cmask = ggml_cast(gc, var.vis, GGML_TYPE_F16);
         }
 
-        ggml_tensor * comp2 = comp_k ? ggml_set_rows(gc, L.comp, ggml_cont_2d(gc, comp_k, DH, n), first(L.i_slot_comp, n))
+        // comp_rot: rotate each row before it is rounded into the cache, and back after it is read (H = H^-1)
+        ggml_tensor * comp2 = comp_k ? ggml_set_rows(gc, L.comp, im.comp_rot ? b.hadamard(ggml_cont_2d(gc, comp_k, DH, n), im.rot)
+                                                                            : ggml_cont_2d(gc, comp_k, DH, n),
+                                                     first(L.i_slot_comp, n))
                                      : L.comp;   // !emit: no block completes here
         if (sel) {   // sparse: the gathered rows (ascending block order)
             ggml_tensor * rows = ggml_get_rows(gc, comp2, sel);                 // [DH, ntk]
-            k_all = ggml_concat(gc, k_all, ggml_reshape_3d(gc, rows, DH, 1, rows->ne[1]), 2);
+            if (im.comp_rot) rows = b.hadamard(rows, im.rot);
+            k_cmp = ggml_reshape_3d(gc, rows, DH, 1, rows->ne[1]);
         } else {
             // a raw view of the cache works only while it is F32: a quantized comp needs the dequantizing gather
             ggml_tensor * comp_src = L.i_idx_all ? ggml_get_rows(gc, comp2, first(L.i_idx_all, cap))
                                                  : ggml_view_2d(gc, comp2, DH, cap, comp2->nb[1], 0);
-            k_all = ggml_concat(gc, k_all, ggml_reshape_3d(gc, comp_src, DH, 1, cap), 2);
+            if (im.comp_rot) comp_src = b.hadamard(comp_src, im.rot);
+            k_cmp = ggml_reshape_3d(gc, comp_src, DH, 1, cap);
         }
-        mask = ggml_concat(gc, mask, cmask, 0);                              // [n_raw + cap, n]
+        m_cmp = cmask;
     }
 
     // ---- attention --------------------------------------------------------------------
     // ggml-cuda has a flash-attn kernel for d_head 512 only when the key count is a multiple of FATTN_KQ_STRIDE
     // (256) - llama.cpp pads its KV cache to that.  Off-CPU, pad with zero keys masked -inf: they get exactly zero
     // weight.  The CPU path (the one verified bit-exact against ds4_ref) is left as it was.
-    if (!ggml_backend_is_cpu(im.backend)) {
-        const int64_t n_kv = k_all->ne[2], pad = (256 - n_kv % 256) % 256;
-        if (pad) {
-            k_all = ggml_pad(gc, k_all, 0, 0, (int) pad, 0);
-            mask = ggml_concat(gc, mask, ggml_cast(gc, b.fill_f32({ pad, n }, NEG_INF), GGML_TYPE_F16), 0);
+    //
+    // DS4_RAW_BLOCK (FINDINGS s31 addendum 3): a query's raw window is SWA keys, but one flash-attn over all n queries
+    // makes each of them visit the whole union window (SWA + n - 1 keys, all but SWA masked) - 33x the raw work at a
+    // 4096 chunk.  Blocks of nb queries attend [their union window (SWA + nb - 1) | the compressed rows] instead, and
+    // the outputs are concatenated.  Query t sees union rows [t, t + SWA), so block [t0, t0 + nb) needs rows
+    // [t0, t0 + SWA + nb - 1).  The dropped keys were all masked for every query of the block, and the reference
+    // flash-attn (DS4_CPU_FA_REF=1) skips -inf keys, so the chunk gate stays bit-exact.  n <= block (decode, verify,
+    // small chunks) builds the identical single-call graph.
+    auto attend = [&](ggml_tensor * qb, ggml_tensor * kb, ggml_tensor * mb, int64_t nq) {
+        if (!ggml_backend_is_cpu(im.backend)) {
+            const int64_t n_kv = kb->ne[2], pad = (256 - n_kv % 256) % 256;
+            if (pad) {
+                kb = ggml_pad(gc, kb, 0, 0, (int) pad, 0);
+                mb = ggml_concat(gc, mb, ggml_cast(gc, b.fill_f32({ pad, nq }, NEG_INF), GGML_TYPE_F16), 0);
+            }
+        }
+        ggml_tensor * qp = ggml_permute(gc, qb, 0, 2, 1, 3);                 // [DH, nq, NH]
+        ggml_tensor * kp = ggml_permute(gc, kb, 0, 2, 1, 3);
+        ggml_tensor * kf = ggml_cast(gc, kp, GGML_TYPE_F16);
+        ggml_tensor * vf = ggml_cast(gc, kp, GGML_TYPE_F16);
+        ggml_tensor * o = ggml_flash_attn_ext(gc, qp, kf, vf, mb, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(o, b.BL(il, "attn_sinks.weight"));   // [DH, NH, nq]
+        return o;
+    };
+    const int64_t RB = raw_block_n(n);
+    ggml_tensor * out = nullptr;
+    if (RB >= n) {
+        ggml_tensor * k_all = k_cmp ? ggml_concat(gc, k_raw, k_cmp, 2) : k_raw;
+        ggml_tensor * mask  = m_cmp ? ggml_concat(gc, m_raw, m_cmp, 0) : m_raw;   // [n_raw + cap, n]
+        out = attend(q, k_all, mask, n);
+    } else {
+        for (int64_t t0 = 0; t0 < n; t0 += RB) {
+            const int64_t nb = std::min<int64_t>(RB, n - t0), nw = SWA + nb - 1;
+            ggml_tensor * kb = ggml_cont(gc, ggml_view_3d(gc, k_raw, DH, 1, nw, k_raw->nb[1], k_raw->nb[2],
+                                                          (size_t) t0 * k_raw->nb[2]));
+            ggml_tensor * mb = ggml_cont(gc, ggml_view_2d(gc, m_raw, nw, nb, m_raw->nb[1],
+                                                          (size_t) t0 * m_raw->nb[1] + (size_t) t0 * m_raw->nb[0]));
+            if (k_cmp) {
+                kb = ggml_concat(gc, kb, k_cmp, 2);
+                mb = ggml_concat(gc, mb, ggml_cont(gc, ggml_view_2d(gc, m_cmp, m_cmp->ne[0], nb, m_cmp->nb[1],
+                                                                    (size_t) t0 * m_cmp->nb[1])), 0);
+            }
+            ggml_tensor * qb = ggml_view_3d(gc, q, DH, NH, nb, q->nb[1], q->nb[2], (size_t) t0 * q->nb[2]);
+            ggml_tensor * ob = attend(qb, kb, mb, nb);
+            out = out ? ggml_concat(gc, out, ob, 2) : ob;
         }
     }
-    ggml_tensor * qp = ggml_permute(gc, q, 0, 2, 1, 3);                      // [DH, n, NH]
-    ggml_tensor * kp = ggml_permute(gc, k_all, 0, 2, 1, 3);
-    ggml_tensor * kf = ggml_cast(gc, kp, GGML_TYPE_F16);
-    ggml_tensor * vf = ggml_cast(gc, kp, GGML_TYPE_F16);
-    ggml_tensor * out = ggml_flash_attn_ext(gc, qp, kf, vf, mask, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
-    ggml_flash_attn_ext_add_sinks(out, b.BL(il, "attn_sinks.weight"));     // out [DH, NH, n]
 
     // the gate's attn_raw tap: ds4_ref dumps the raw flash-attn output *before* the de-RoPE
     // (its attn_csa_lid / attn_hca probe is named at the flash-attn result, not after rope_back)
@@ -1235,6 +1282,21 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
         };
         auto on1 = [&](ggml_type ty, int64_t n0) { return ggml_new_tensor_1d(im.ictx, ty, n0); };
         const int64_t NT = kNtMax;
+        // the compressed K cache: type, rotation, and (--comp-host) a separate context placed in pinned host RAM
+        const ggml_type comp_ty = cfg.comp_type != 0 ? (ggml_type) cfg.comp_type
+                                : cfg.comp_q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F32;
+        const bool comp_quant = comp_ty != GGML_TYPE_F32;
+        im.comp_rot = cfg.comp_rot >= 0 ? cfg.comp_rot != 0
+                    : comp_ty == GGML_TYPE_Q4_0 || comp_ty == GGML_TYPE_IQ4_NL || comp_ty == GGML_TYPE_Q5_0;
+        ggml_backend_buffer_type_t comp_hbt = nullptr;
+        if (cfg.comp_host && !ggml_backend_is_cpu(im.backend))
+            comp_hbt = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(im.backend));
+        if (comp_hbt) {
+            ggml_init_params iph = { /*mem_size*/ 1ull * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
+            im.hctx = ggml_init(iph);
+            if (!im.hctx) { err = "ggml_init(comp host) failed"; return false; }
+        }
+        ggml_context * comp_ctx = im.hctx ? im.hctx : im.sctx;
 
         im.x_state    = nt3(GGML_TYPE_F32, im.D, im.HC, NT);
         im.routed_sum = nt2(GGML_TYPE_F32, im.D, NT);
@@ -1286,12 +1348,13 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
                 // comp_q8 (s22 (b)): the compressed-row K cache as Q8_0 - ~0.65 GB per 32K tokens back for the
                 // expert cache at 256K.  Written by ggml's quantized set_rows, read back dequantized (get_rows),
                 // so it is lossy by construction; the default F32 path is untouched.
-                L.comp  = nt2(cfg.comp_q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F32, im.DH, L.comp_max + 1);
-                if (cfg.comp_q8) L.i_idx_all = nt1(GGML_TYPE_I32, L.comp_max + 1);
+                // comp_type (s33/s34): Q8_0 / 4-bit / --comp-host - see Ds4DenseConfig
+                L.comp  = ggml_new_tensor_2d(comp_ctx, comp_ty, im.DH, L.comp_max + 1);
+                if (comp_quant) L.i_idx_all = nt1(GGML_TYPE_I32, L.comp_max + 1);
                 L.st_kv = nt2(GGML_TYPE_F32, L.sdim, L.ring_sz);
                 L.st_sc = nt2(GGML_TYPE_F32, L.sdim, L.ring_sz);
                 if (L.csa) {
-                    L.icomp  = nt2(GGML_TYPE_F32, im.IDXK, L.comp_max + 1);
+                    L.icomp  = nt2(cfg.icomp_q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F32, im.IDXK, L.comp_max + 1);
                     L.ist_kv = nt2(GGML_TYPE_F32, 2 * im.IDXK, L.ring_sz);   // CSA: ring == 2 * ratio
                     L.ist_sc = nt2(GGML_TYPE_F32, 2 * im.IDXK, L.ring_sz);
                 }
@@ -1305,6 +1368,12 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
             }
         }
         if (any_csa) im.rot = nt2(GGML_TYPE_F32, im.IDXK, im.IDXK);
+        if (im.comp_rot && (!im.rot || im.DH % im.IDXK != 0)) { err = "--comp-rot needs the indexer rotation"; return false; }
+        if (im.hctx) {
+            im.hbuf = ggml_backend_alloc_ctx_tensors_from_buft(im.hctx, comp_hbt);
+            if (!im.hbuf) { err = "cannot allocate the compressed K caches in pinned host RAM"; return false; }
+            ggml_backend_buffer_clear(im.hbuf, 0);
+        }
 
         im.sbuf = ggml_backend_alloc_ctx_tensors_from_buft(im.sctx, ggml_backend_get_default_buffer_type(im.backend));
         if (!im.sbuf) { err = "cannot allocate the persistent decode state"; return false; }
@@ -1473,6 +1542,13 @@ static bool vis_dev_on() {
 // DS4_IDX_BLOCK (default 64, 0 = all queries at once): how many queries the lightning indexer's [cap, query, 64]
 // score tensor is computed for at a time - the tensor that otherwise blocks every long prompt (FINDINGS s24).
 // Queries are independent here, so the value is the same; only n > block changes the graph at all.
+// DS4_RAW_BLOCK (default 64, 0 = all queries in one flash-attn): how many queries attend together over their union raw
+// window (build_attn's attention section).  n <= block builds the single-call graph.
+static int64_t raw_block_n(int64_t n) {
+    static const int64_t blk = [] { const char * e = std::getenv("DS4_RAW_BLOCK"); return e ? (int64_t) std::atoi(e) : (int64_t) 64; }();
+    return blk > 0 ? blk : n;
+}
+
 static int64_t idx_block_n(int64_t n) {
     static const int64_t blk = [] { const char * e = std::getenv("DS4_IDX_BLOCK"); return e ? (int64_t) std::atoi(e) : (int64_t) 64; }();
     return blk > 0 && blk < n ? blk : n;
