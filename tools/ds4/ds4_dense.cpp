@@ -231,6 +231,44 @@ struct Ds4Dense::Impl {
     ggml_context *  gctx = nullptr;     // graph node structs (data comes from the gallocrs)
     std::string     err;
 
+    // ---- prompt chunks (prefill_*).  While `pf` is set the builders build a chunk graph: the rings are read as
+    // [ring | the chunk's own rows] and written back with the chunk's last rows, the gate taps are skipped and the
+    // graph is not registered.  pf_swap() points the decode hand-off / input tensors at the chunk-sized ones in P for
+    // the duration of one build (the graph keeps the pointers it was built with).
+    bool    pf = false;
+    int64_t pf_cap = 0;                  // Ds4DenseConfig::prefill_chunk
+    int     pf_pos0 = 0, pf_n = 0;       // the chunk begun by prefill_begin
+    int64_t pf_row0 = 0;                 // build_head in pf mode: first row of the chunk
+    ggml_context * pf_ctx = nullptr;     // the chunk tensors (P)
+    ggml_backend_buffer_t pf_buf = nullptr;
+    ggml_backend_buffer_t pf_obuf = nullptr;   // the chunk's router output blocks (o_f / o_i alias one buffer)
+    ggml_gallocr_t pf_allo = nullptr;    // one allocator for every chunk graph: each is built, run once and dropped
+    std::vector<uint8_t> pf_meta;        // the chunk graph's node structs (one reused buffer)
+    ggml_tensor * pf_logits = nullptr;   // the last chunk head graph's output
+    struct PfRatio {                     // per compress ratio (4 = CSA, 128 = HCA): the layers of a ratio share inputs
+        ggml_tensor * i_slot_comp = nullptr, * i_slot_state = nullptr, * i_comp_pos = nullptr, * i_state_pos = nullptr,
+                    * i_idx_state = nullptr, * vis_full = nullptr;
+    };
+    struct PfSet {
+        ggml_tensor * x_state = nullptr, * routed_sum = nullptr, * i_tid = nullptr, * i_emb = nullptr, * i_pos = nullptr;
+        ggml_tensor * hap = nullptr, * post_f = nullptr, * comb_f = nullptr, * shexp = nullptr, * o_f = nullptr,
+                    * o_i = nullptr;
+        ggml_tensor * i_slot_raw = nullptr, * i_idx_raw = nullptr, * i_mask_raw = nullptr;
+        PfRatio r4, r128;
+    } P;
+    std::vector<uint8_t> pf_out_host;    // router output blocks [fn | ids | wts] x n
+    std::vector<float>   pf_fn;          // ffn_norm rows of the chunk (token-major)
+    void pf_free() {
+        if (pf_allo) ggml_gallocr_free(pf_allo);
+        if (pf_buf) ggml_backend_buffer_free(pf_buf);
+        if (pf_obuf) ggml_backend_buffer_free(pf_obuf);
+        if (pf_ctx) ggml_free(pf_ctx);
+        pf_allo = nullptr; pf_buf = nullptr; pf_obuf = nullptr; pf_ctx = nullptr; P = PfSet();
+        std::vector<uint8_t>().swap(pf_meta);
+        std::vector<uint8_t>().swap(pf_out_host);
+        std::vector<float>().swap(pf_fn);
+    }
+
     // One graph allocator per graph, never a shared one.  ggml-alloc binds a tensor's data pointer once
     // and skips re-binding it on later allocations, while a reserve triggered by a *different* graph
     // frees and reallocates the chunks it had bound - a shared allocator therefore leaves the tensors of
@@ -341,6 +379,7 @@ struct Ds4Dense::Impl {
     ggml_gallocr_t allo_head[kNtMax + 1] = {};
 
     ~Impl() {
+        pf_free();
         for (Var & v : all_vars()) if (v.allo) ggml_gallocr_free(v.allo);
         for (Layer & L : ly) {
             if (L.allo_predict) ggml_gallocr_free(L.allo_predict);
@@ -586,8 +625,23 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
     kv = b.rope(kv, pos, DHR, n_ctx, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
 
     // ---- raw sliding-window ring ------------------------------------------------------
-    ggml_tensor * raw2 = ggml_set_rows(gc, L.raw, ggml_cont_2d(gc, kv, DH, n), first(L.i_slot_raw, n));
-    ggml_tensor * raw_src = ggml_get_rows(gc, raw2, first(L.i_idx_raw, n_raw));   // [DH, n_raw] oldest -> newest
+    // chunk (im.pf): the window gathers from [ring | the chunk's keys]; the ring gets the chunk's last keys after
+    // everything else has read it (`wb`, expanded last - ggml runs the nodes in this order)
+    std::vector<ggml_tensor *> wb;
+    auto tail_into = [&](ggml_tensor * ring, ggml_tensor * rows2, int64_t ring_sz, ggml_tensor * slots) {
+        const int64_t k = std::min<int64_t>(n, ring_sz);
+        ggml_tensor * last = ggml_view_2d(gc, rows2, rows2->ne[0], k, rows2->nb[1], (size_t) (n - k) * rows2->nb[1]);
+        wb.push_back(ggml_set_rows(gc, ring, last, first(slots, k)));
+    };
+    ggml_tensor * raw_src = nullptr;
+    if (!im.pf) {
+        ggml_tensor * raw2 = ggml_set_rows(gc, L.raw, ggml_cont_2d(gc, kv, DH, n), first(L.i_slot_raw, n));
+        raw_src = ggml_get_rows(gc, raw2, first(L.i_idx_raw, n_raw));   // [DH, n_raw] oldest -> newest
+    } else {
+        ggml_tensor * kv2 = ggml_cont_2d(gc, kv, DH, n);
+        raw_src = ggml_get_rows(gc, ggml_concat(gc, L.raw, kv2, 1), first(L.i_idx_raw, n_raw));
+        tail_into(L.raw, kv2, im.RAW, L.i_slot_raw);
+    }
     ggml_tensor * k_all = ggml_reshape_3d(gc, raw_src, DH, 1, n_raw);             // token axis on ne2 (ds4_ref layout)
     ggml_tensor * mask = ggml_reshape_2d(gc, first(L.i_mask_raw, n_raw * n), n_raw, n);
 
@@ -597,7 +651,7 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
         ggml_tensor * cmask = nullptr;
         ggml_tensor * state_pos = first(L.i_state_pos, n);
         ggml_tensor * comp_pos  = first(L.i_comp_pos, n);
-        ggml_tensor * slot_st   = first(L.i_slot_state, n);
+        ggml_tensor * slot_st   = im.pf ? nullptr : first(L.i_slot_state, n);   // chunk: tail_into uses its own
         ggml_tensor * idx_st    = first(L.i_idx_state, L.ring * n);   // [ring] per token, flat (get_rows takes 1-D)
         var.vis = ggml_view_2d(gc, L.vis_full, cap, n, (size_t) cap * sizeof(float), 0);
 
@@ -610,8 +664,18 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
                 ggml_tensor * ape = ggml_get_rows(gc, b.BL(il, pfx + "_ape.weight"), state_pos);
                 st_sc = ggml_add(gc, st_sc, ape);
 
-                ggml_tensor * rkv = ggml_set_rows(gc, ring_kv, ggml_cont_2d(gc, st_kv, 2 * head_dim, n), slot_st);
-                ggml_tensor * rsc = ggml_set_rows(gc, ring_sc, ggml_cont_2d(gc, st_sc, 2 * head_dim, n), slot_st);
+                ggml_tensor * skv = ggml_cont_2d(gc, st_kv, 2 * head_dim, n);
+                ggml_tensor * ssc = ggml_cont_2d(gc, st_sc, 2 * head_dim, n);
+                ggml_tensor * rkv, * rsc;
+                if (!im.pf) {
+                    rkv = ggml_set_rows(gc, ring_kv, skv, slot_st);
+                    rsc = ggml_set_rows(gc, ring_sc, ssc, slot_st);
+                } else {   // [ring | the chunk's states]; the ring gets the chunk's last states afterwards
+                    rkv = ggml_concat(gc, ring_kv, skv, 1);
+                    rsc = ggml_concat(gc, ring_sc, ssc, 1);
+                    tail_into(ring_kv, skv, L.ring_sz, L.i_slot_state);
+                    tail_into(ring_sc, ssc, L.ring_sz, L.i_slot_state);
+                }
                 ggml_tensor * rows_kv = ggml_reshape_3d(gc, ggml_get_rows(gc, rkv, idx_st), 2 * head_dim, 2 * ratio, n);
                 ggml_tensor * rows_sc = ggml_reshape_3d(gc, ggml_get_rows(gc, rsc, idx_st), 2 * head_dim, 2 * ratio, n);
 
@@ -686,8 +750,18 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             ggml_tensor * ape = ggml_get_rows(gc, b.BL(il, "attn_compressor_ape.weight"), state_pos);
             st_sc = ggml_add(gc, st_sc, ape);
 
-            ggml_tensor * rkv = ggml_set_rows(gc, L.st_kv, ggml_cont_2d(gc, st_kv, DH, n), slot_st);
-            ggml_tensor * rsc = ggml_set_rows(gc, L.st_sc, ggml_cont_2d(gc, st_sc, DH, n), slot_st);
+            ggml_tensor * skv = ggml_cont_2d(gc, st_kv, DH, n);
+            ggml_tensor * ssc = ggml_cont_2d(gc, st_sc, DH, n);
+            ggml_tensor * rkv, * rsc;
+            if (!im.pf) {
+                rkv = ggml_set_rows(gc, L.st_kv, skv, slot_st);
+                rsc = ggml_set_rows(gc, L.st_sc, ssc, slot_st);
+            } else {
+                rkv = ggml_concat(gc, L.st_kv, skv, 1);
+                rsc = ggml_concat(gc, L.st_sc, ssc, 1);
+                tail_into(L.st_kv, skv, L.ring_sz, L.i_slot_state);
+                tail_into(L.st_sc, ssc, L.ring_sz, L.i_slot_state);
+            }
             ggml_tensor * rows_kv = ggml_reshape_3d(gc, ggml_get_rows(gc, rkv, idx_st), DH, ratio, n);
             ggml_tensor * rows_sc = ggml_reshape_3d(gc, ggml_get_rows(gc, rsc, idx_st), DH, ratio, n);
             ggml_tensor * values = ggml_cont(gc, ggml_permute(gc, rows_kv, 1, 0, 2, 3));   // [ratio, DH, n]
@@ -794,10 +868,11 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
     ggml_tensor * c_pf  = ggml_cpy(gc, post_f, cols2(L.post_f, HC));   // [HC, n], a strided view of mixes
     ggml_tensor * c_cf  = ggml_cpy(gc, ggml_reshape_3d(gc, comb_f, HC, HC, n), cols3(L.comb_f, HC, HC));
     ggml_tensor * c_sh  = ggml_cpy(gc, ggml_reshape_2d(gc, shexp, D, n), cols2(L.shexp, D));
-    ggml_tensor * c_ar  = ggml_cpy(gc, attn_raw, cols2(L.t_attn_raw, NH * DH));
-    ggml_tensor * c_at  = ggml_cpy(gc, ggml_reshape_2d(gc, attn_out, D, n), cols2(L.t_attn, D));
+    ggml_tensor * c_ar  = im.pf ? nullptr : ggml_cpy(gc, attn_raw, cols2(L.t_attn_raw, NH * DH));
+    ggml_tensor * c_at  = im.pf ? nullptr : ggml_cpy(gc, ggml_reshape_2d(gc, attn_out, D, n), cols2(L.t_attn, D));
 
-    for (ggml_tensor * t : { c_fn, c_hap, c_pf, c_cf, c_sh, c_ar, c_at }) ggml_build_forward_expand(gf, t);
+    for (ggml_tensor * t : { c_fn, c_hap, c_pf, c_cf, c_sh }) ggml_build_forward_expand(gf, t);
+    if (!im.pf) for (ggml_tensor * t : { c_ar, c_at }) ggml_build_forward_expand(gf, t);   // gate taps (decode only)
     ggml_build_forward_expand(gf, selected);
     ggml_build_forward_expand(gf, wts);
     ggml_build_forward_expand(gf, ggml_cpy(gc, selected,   // [NUSED, n], a top-k view: strided for n > 1
@@ -805,6 +880,8 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
     ggml_build_forward_expand(gf, ggml_cpy(gc, ggml_reshape_2d(gc, wts, im.NUSED, n),
                                            ggml_view_2d(gc, L.o_f, im.NUSED, n, ob, (size_t) im.o_wts_off)));
 
+    for (ggml_tensor * t : wb) ggml_build_forward_expand(gf, t);   // chunk ring write-backs, after every read
+    if (im.pf) return gf;   // a chunk graph: run once by the caller, not registered
     var.gf = gf;
     var.allo = im.make_allo();   // one arena per graph variant; see Impl::make_allo
     L.vars.push_back(var);
@@ -830,6 +907,7 @@ static ggml_cgraph * build_finish(Ds4Dense::Impl & im, int64_t n, Ds4Dense::Impl
 
     ggml_build_forward_expand(gf, ggml_cpy(gc, ll3, ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1],
                                                                  im.x_state->nb[2], 0)));
+    if (im.pf) return gf;   // a chunk graph: no l_last tap, not registered
     ggml_build_forward_expand(gf, ggml_cpy(gc, ll3, ggml_view_3d(gc, L.t_llast, D, HC, n, L.t_llast->nb[1],
                                                                  L.t_llast->nb[2], 0)));
     L.gf_finish[n] = gf;
@@ -887,7 +965,8 @@ static ggml_cgraph * build_head(Ds4Dense::Impl & im, int64_t n, bool mtp = false
     B b { &im, gc, &im.g };
     const int64_t D = im.D, HC = im.HC;
 
-    ggml_tensor * xin = ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1], im.x_state->nb[2], 0);
+    ggml_tensor * xin = ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1], im.x_state->nb[2],
+                                     im.pf ? (size_t) im.pf_row0 * im.x_state->nb[2] : 0);   // chunk: rows row0..
     ggml_tensor * flat = ggml_reshape_2d(gc, xin, HC * D, n);
     ggml_tensor * flat_norm = ggml_rms_norm(gc, flat, (float) im.g.rms_eps);
     static const bool trunk_hc = [] { const char * e = std::getenv("DS4_MTP_TRUNK_HC"); return e && *e && *e != '0'; }();
@@ -903,7 +982,8 @@ static ggml_cgraph * build_head(Ds4Dense::Impl & im, int64_t n, bool mtp = false
     ggml_tensor * lg = ggml_mul_mat(gc, im.w.get("output.weight"), rn);
     ggml_set_output(lg);
     ggml_build_forward_expand(gf, lg);
-    (mtp ? im.mtp_logits_t : im.logits_t)[n] = lg;
+    if (im.pf) im.pf_logits = lg;
+    else (mtp ? im.mtp_logits_t : im.logits_t)[n] = lg;
     return gf;
 }
 
@@ -934,6 +1014,7 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
     Impl & im = *p_;
     im.path = model_path;
     im.n_threads = cfg.n_threads;
+    im.pf_cap = std::max<int64_t>(0, cfg.prefill_chunk);
 
     im.backend = cfg.backend;
     if (!im.backend) {
@@ -942,6 +1023,9 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
         if (!im.backend) { err = "cannot create a CPU backend"; return false; }
     }
     if (ggml_backend_is_cpu(im.backend)) ggml_backend_cpu_set_n_threads(im.backend, im.n_threads);
+    // DS4_CPU_FA_REF=1: ggml-cpu's reference flash-attn for any query count (its tiled kernel takes >= 64 queries and
+    // rounds differently) - the chunk gate uses it to show 64+-token chunks are the decode math exactly
+    if (ggml_backend_is_cpu(im.backend) && std::getenv("DS4_CPU_FA_REF")) ggml_backend_cpu_set_use_ref(im.backend, true);
 
     im.model = std::make_unique<GgufModel>(GgufModel::open(model_path));
     if (im.model->size() == 0) { err = "cannot open " + model_path; return false; }
@@ -1564,6 +1648,251 @@ bool Ds4Dense::mtp_logits_n(int n, const float ** out, int * n_vocab) {
     if (n_vocab) *n_vocab = (int) im.g.vocab_size;
     return true;
 }
+
+// ================================================================== prompt chunks (prefill_*)
+
+static const Ds4Dense::Impl::Layer * pf_layer_of_ratio(const Ds4Dense::Impl & im, int64_t ratio) {
+    for (const auto & L : im.ly) if (L.ratio == ratio) return &L;
+    return nullptr;
+}
+
+static Ds4Dense::Impl::PfRatio * pf_ratio_set(Ds4Dense::Impl & im, int64_t ratio) {
+    return ratio == 4 ? &im.P.r4 : ratio == 128 ? &im.P.r128 : nullptr;
+}
+
+// the chunk-sized hand-off and input tensors (P) + the shared graph allocator, at the first prefill_begin
+static bool pf_alloc(Ds4Dense::Impl & im) {
+    const int64_t NP = im.pf_cap, D = im.D, HC = im.HC;
+    ggml_init_params ip = { /*mem_size*/ 64ull * ggml_tensor_overhead(), /*mem_buffer*/ nullptr, /*no_alloc*/ true };
+    im.pf_ctx = ggml_init(ip);
+    if (!im.pf_ctx) { im.err = "prefill: ggml_init"; return false; }
+    ggml_context * c = im.pf_ctx;
+    auto& P = im.P;
+    P.x_state    = ggml_new_tensor_3d(c, GGML_TYPE_F32, D, HC, NP);
+    P.routed_sum = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NP);
+    P.i_tid      = ggml_new_tensor_1d(c, GGML_TYPE_I32, NP);
+    P.i_emb      = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NP);
+    P.i_pos      = ggml_new_tensor_1d(c, GGML_TYPE_I32, NP);
+    P.hap        = ggml_new_tensor_3d(c, GGML_TYPE_F32, D, HC, NP);
+    P.post_f     = ggml_new_tensor_2d(c, GGML_TYPE_F32, HC, NP);
+    P.comb_f     = ggml_new_tensor_3d(c, GGML_TYPE_F32, HC, HC, NP);
+    P.shexp      = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NP);
+    P.i_slot_raw = ggml_new_tensor_1d(c, GGML_TYPE_I32, im.RAW);
+    P.i_idx_raw  = ggml_new_tensor_1d(c, GGML_TYPE_I32, im.SWA - 1 + NP);
+    P.i_mask_raw = ggml_new_tensor_1d(c, GGML_TYPE_F16, (im.SWA - 1 + NP) * NP);
+    for (int64_t r : { (int64_t) 4, (int64_t) 128 }) {
+        const Ds4Dense::Impl::Layer * L = pf_layer_of_ratio(im, r);
+        if (!L) continue;
+        Ds4Dense::Impl::PfRatio & R = *pf_ratio_set(im, r);
+        R.i_slot_comp  = ggml_new_tensor_1d(c, GGML_TYPE_I32, NP);
+        R.i_slot_state = ggml_new_tensor_1d(c, GGML_TYPE_I32, L->ring_sz);
+        R.i_comp_pos   = ggml_new_tensor_1d(c, GGML_TYPE_I32, NP);
+        R.i_state_pos  = ggml_new_tensor_1d(c, GGML_TYPE_I32, NP);
+        R.i_idx_state  = ggml_new_tensor_1d(c, GGML_TYPE_I32, L->ring * NP);
+        R.vis_full     = ggml_new_tensor_1d(c, GGML_TYPE_F32, L->comp_max * NP);
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(im.backend);
+    im.pf_buf = ggml_backend_alloc_ctx_tensors_from_buft(c, buft);
+    if (!im.pf_buf) { im.err = "prefill: cannot allocate the chunk tensors"; return false; }
+    // router output blocks: the decode layout (o_blk bytes per token), o_f and o_i alias the same bytes
+    const size_t ob = (size_t) im.o_blk * (size_t) NP;
+    im.pf_obuf = ggml_backend_buft_alloc_buffer(buft, ob + 256);
+    if (!im.pf_obuf) { im.err = "prefill: cannot allocate the router output blocks"; return false; }
+    P.o_f = ggml_new_tensor_1d(c, GGML_TYPE_F32, (int64_t) (ob / 4));
+    P.o_i = ggml_new_tensor_1d(c, GGML_TYPE_I32, (int64_t) (ob / 4));
+    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(im.pf_obuf);
+    if (ggml_backend_tensor_alloc(im.pf_obuf, P.o_f, base) != GGML_STATUS_SUCCESS ||
+        ggml_backend_tensor_alloc(im.pf_obuf, P.o_i, base) != GGML_STATUS_SUCCESS) {
+        im.err = "prefill: cannot place the router output blocks"; return false;
+    }
+    im.pf_out_host.assign(ob, 0);
+    im.pf_fn.assign((size_t) (D * NP), 0.0f);
+    im.pf_allo = im.make_allo();
+    if (!im.pf_allo) { im.err = "prefill: ggml_gallocr_new"; return false; }
+    im.pf_meta.assign(64ull * 1024 * 1024, 0);
+    return true;
+}
+
+// point the decode tensors the builders use at the chunk's (and back: swapping twice restores)
+static void pf_swap(Ds4Dense::Impl & im, Ds4Dense::Impl::Layer * L) {
+    auto& P = im.P;
+    std::swap(im.x_state, P.x_state); std::swap(im.routed_sum, P.routed_sum);
+    std::swap(im.i_tid, P.i_tid); std::swap(im.i_emb, P.i_emb); std::swap(im.i_pos, P.i_pos);
+    if (!L) return;
+    std::swap(L->hap, P.hap); std::swap(L->post_f, P.post_f); std::swap(L->comb_f, P.comb_f);
+    std::swap(L->shexp, P.shexp); std::swap(L->o_f, P.o_f); std::swap(L->o_i, P.o_i);
+    std::swap(L->i_slot_raw, P.i_slot_raw); std::swap(L->i_idx_raw, P.i_idx_raw); std::swap(L->i_mask_raw, P.i_mask_raw);
+    if (Ds4Dense::Impl::PfRatio * R = pf_ratio_set(im, L->ratio)) {
+        std::swap(L->i_slot_comp, R->i_slot_comp); std::swap(L->i_slot_state, R->i_slot_state);
+        std::swap(L->i_comp_pos, R->i_comp_pos); std::swap(L->i_state_pos, R->i_state_pos);
+        std::swap(L->i_idx_state, R->i_idx_state); std::swap(L->vis_full, R->vis_full);
+    }
+}
+
+// build one chunk graph (pf mode), run it once on the shared allocator, `after` reads its outputs, drop it.  Built
+// fresh each time (uid 0): ggml-cuda runs a graph whose nodes changed directly, without capturing it.
+template <class Build, class After>
+static bool pf_run(Ds4Dense::Impl & im, Ds4Dense::Impl::Layer * L, Build build, After after, const char * what) {
+    ggml_init_params ip = { im.pf_meta.size(), im.pf_meta.data(), /*no_alloc*/ true };
+    ggml_context * tc = ggml_init(ip);
+    if (!tc) { im.err = std::string(what) + ": ggml_init"; return false; }
+    ggml_context * keep = im.gctx;
+    im.gctx = tc;
+    im.pf = true;
+    pf_swap(im, L);
+    ggml_cgraph * gf = build();
+    pf_swap(im, L);
+    im.pf = false;
+    im.gctx = keep;
+    bool ok = gf && ggml_gallocr_alloc_graph(im.pf_allo, gf) &&
+              ggml_backend_graph_compute(im.backend, gf) == GGML_STATUS_SUCCESS;
+    if (!ok) im.err = std::string(what) + ": chunk graph failed";
+    else ok = after();
+    ggml_free(tc);
+    return ok;
+}
+
+bool Ds4Dense::prefill_begin(const int * tids, int n, int pos0) {
+    Impl & im = *p_;
+    if (im.pf_cap <= 0) { im.err = "prefill: Ds4DenseConfig::prefill_chunk is 0"; return false; }
+    if (im.il_mtp >= 0) { im.err = "prefill: chunked prefill does not fill the MTP window (not implemented)"; return false; }
+    if (n < 1 || n > im.pf_cap || pos0 < 0) { im.err = "prefill: chunk size/position out of range"; return false; }
+    if (!im.pf_ctx && !pf_alloc(im)) return false;
+    auto& P = im.P;
+    const int64_t pos_last = (int64_t) pos0 + n - 1;
+    for (const Impl::Layer & L : im.ly)
+        if (L.ratio != 0 && pos_last / L.ratio >= L.comp_max) { im.err = "prefill: beyond the compressed cache capacity"; return false; }
+
+    // the decode input span on the device (the chunk graphs read the route bias from it); decode re-uploads after
+    ggml_backend_tensor_set(im.i_span, im.in_host.data(), 0, im.in_host.size());
+    im.in_pos = -1;
+
+    std::vector<int32_t> t32((size_t) n), p32((size_t) n);
+    im.host_emb.resize((size_t) (im.D * n));
+    for (int t = 0; t < n; ++t) {
+        const int tid = tids[t];
+        if (tid < 0 || tid >= im.g.vocab_size) { im.err = "token id out of range"; return false; }
+        t32[(size_t) t] = tid;
+        p32[(size_t) t] = pos0 + t;
+        const uint8_t * row = im.embd_data + (size_t) tid * im.embd_row;
+        float * dst = im.host_emb.data() + (size_t) t * im.D;
+        if (im.embd_type == GGML_TYPE_F32) std::memcpy(dst, row, (size_t) im.D * 4);
+        else ggml_get_type_traits((ggml_type) im.embd_type)->to_float(row, dst, im.D);
+    }
+    ggml_backend_tensor_set(P.i_tid, t32.data(), 0, t32.size() * 4);
+    ggml_backend_tensor_set(P.i_pos, p32.data(), 0, p32.size() * 4);
+    ggml_backend_tensor_set(P.i_emb, im.host_emb.data(), 0, im.host_emb.size() * 4);
+
+    // a ring row of position tok: before the chunk -> its slot in the ring, inside it -> ring_sz + (tok - pos0)
+    auto ext = [&](int64_t tok, int64_t ring_sz) -> int32_t {
+        return (int32_t) (tok < pos0 ? ((tok % ring_sz) + ring_sz) % ring_sz : ring_sz + (tok - pos0));
+    };
+    auto tail = [&](int64_t ring_sz) {   // ring slots of the chunk's last min(n, ring_sz) positions
+        const int64_t k = std::min<int64_t>(n, ring_sz);
+        std::vector<int32_t> v((size_t) k);
+        for (int64_t j = 0; j < k; ++j) v[(size_t) j] = (int32_t) ((pos0 + n - k + j) % ring_sz);
+        return v;
+    };
+    {   // raw window (the same for every layer)
+        const int64_t n_raw = im.SWA + n - 1;
+        std::vector<int32_t> idx((size_t) n_raw);
+        std::vector<ggml_fp16_t> msk((size_t) (n_raw * n));
+        const ggml_fp16_t h0 = ggml_fp32_to_fp16(0.0f), hinf = ggml_fp32_to_fp16(NEG_INF);
+        for (int64_t i = 0; i < n_raw; ++i) {
+            const int64_t tok = (int64_t) pos0 - im.SWA + 1 + i;
+            idx[(size_t) i] = ext(tok, im.RAW);
+            for (int t = 0; t < n; ++t) {
+                const int64_t pt = (int64_t) pos0 + t;
+                msk[(size_t) (t * n_raw + i)] = tok >= 0 && tok <= pt && tok > pt - im.SWA ? h0 : hinf;
+            }
+        }
+        const std::vector<int32_t> sl = tail(im.RAW);
+        ggml_backend_tensor_set(P.i_idx_raw, idx.data(), 0, idx.size() * 4);
+        ggml_backend_tensor_set(P.i_mask_raw, msk.data(), 0, msk.size() * 2);
+        ggml_backend_tensor_set(P.i_slot_raw, sl.data(), 0, sl.size() * 4);
+    }
+    for (int64_t r : { (int64_t) 4, (int64_t) 128 }) {   // compressed layers: the same per ratio
+        const Impl::Layer * L = pf_layer_of_ratio(im, r);
+        if (!L) continue;
+        Impl::PfRatio & R = *pf_ratio_set(im, r);
+        const int64_t cap = attn_cap(*L, pos_last);
+        std::vector<int32_t> sp((size_t) n), cpp((size_t) n), sc((size_t) n), sidx((size_t) (L->ring * n));
+        std::vector<float> vis((size_t) (cap * n), NEG_INF);
+        for (int t = 0; t < n; ++t) {
+            const int64_t pt = (int64_t) pos0 + t, bl = pt / r;
+            sp[(size_t) t]  = (int32_t) (pt % r);
+            cpp[(size_t) t] = (int32_t) (r * bl);
+            const bool later_same = t + 1 < n && (pt + 1) / r == bl;   // a later token of the chunk owns the row
+            sc[(size_t) t]  = (int32_t) (later_same ? L->comp_max : bl);
+            for (int64_t i = 0; i < L->ring; ++i) sidx[(size_t) (t * L->ring + i)] = ext(pt - L->ring + 1 + i, L->ring_sz);
+            const int64_t nv = (pt + 1) / r;
+            for (int64_t i = 0; i < nv && i < cap; ++i) vis[(size_t) (t * cap + i)] = 0.0f;
+        }
+        const std::vector<int32_t> ss = tail(L->ring_sz);
+        ggml_backend_tensor_set(R.i_state_pos, sp.data(), 0, sp.size() * 4);
+        ggml_backend_tensor_set(R.i_comp_pos, cpp.data(), 0, cpp.size() * 4);
+        ggml_backend_tensor_set(R.i_slot_comp, sc.data(), 0, sc.size() * 4);
+        ggml_backend_tensor_set(R.i_idx_state, sidx.data(), 0, sidx.size() * 4);
+        ggml_backend_tensor_set(R.i_slot_state, ss.data(), 0, ss.size() * 4);
+        ggml_backend_tensor_set(R.vis_full, vis.data(), 0, vis.size() * 4);
+    }
+    im.pf_pos0 = pos0;
+    im.pf_n = n;
+    return pf_run(im, nullptr, [&] { return build_init(im, n); }, [] { return true; }, "prefill_begin");
+}
+
+bool Ds4Dense::prefill_attn(int il, int * routed_ids, float * routed_w, const float ** ffn_norm_host) {
+    Impl & im = *p_;
+    if (il < 0 || il >= (int) im.ly.size() || im.pf_n <= 0) { im.err = "prefill_attn: bad layer / no chunk"; return false; }
+    Impl::Layer & L = im.ly[(size_t) il];
+    const int n = im.pf_n;
+    const int64_t cap = attn_cap(L, (int64_t) im.pf_pos0 + n - 1);
+    return pf_run(im, &L, [&] { return build_attn(im, il, cap, n, L); }, [&] {
+        const size_t ob = (size_t) im.o_blk;
+        ggml_backend_tensor_get(im.P.o_f, im.pf_out_host.data(), 0, ob * (size_t) n);
+        for (int t = 0; t < n; ++t) {
+            const uint8_t * b0 = im.pf_out_host.data() + ob * (size_t) t;
+            const int32_t * ids = (const int32_t *) (b0 + im.o_ids_off);
+            const float * wv = (const float *) (b0 + im.o_wts_off);
+            for (int64_t i = 0; i < im.NUSED; ++i) {
+                routed_ids[t * im.NUSED + i] = ids[i];
+                routed_w[t * im.NUSED + i] = wv[i];
+            }
+            std::memcpy(im.pf_fn.data() + (size_t) t * im.D, b0, (size_t) im.D * 4);
+        }
+        if (ffn_norm_host) *ffn_norm_host = im.pf_fn.data();
+        return true;
+    }, "prefill_attn");
+}
+
+bool Ds4Dense::prefill_finish(int il, const float * routed_sum) {
+    Impl & im = *p_;
+    if (il < 0 || il >= (int) im.ly.size() || im.pf_n <= 0) { im.err = "prefill_finish: bad layer / no chunk"; return false; }
+    Impl::Layer & L = im.ly[(size_t) il];
+    const int n = im.pf_n;
+    ggml_backend_tensor_set(im.P.routed_sum, routed_sum, 0, (size_t) (im.D * n) * 4);
+    return pf_run(im, &L, [&] { return build_finish(im, n, L); }, [] { return true; }, "prefill_finish");
+}
+
+bool Ds4Dense::prefill_logits(int row0, int nrows, float * out) {
+    Impl & im = *p_;
+    if (im.pf_n <= 0 || row0 < 0 || nrows < 1 || row0 + nrows > im.pf_n) { im.err = "prefill_logits: rows out of range"; return false; }
+    im.pf_row0 = row0;
+    return pf_run(im, nullptr, [&] { return build_head(im, nrows); }, [&] {
+        ggml_backend_tensor_get(im.pf_logits, out, 0, (size_t) (im.g.vocab_size * nrows) * 4);
+        return true;
+    }, "prefill_logits");
+}
+
+bool Ds4Dense::prefill_end() {
+    Impl & im = *p_;
+    im.pf_n = 0;
+    im.in_pos = -1;      // the decode inputs are uploaded again by the next attn_router
+    im.cur_tid = -1;
+    return true;
+}
+
+void Ds4Dense::prefill_release() { p_->pf_free(); }
 
 // taps: the LAST token of the most recent pass (for n = 1, the token)
 const float * Ds4Dense::tap_attn_out(int il) const {

@@ -73,6 +73,7 @@ struct Args {
     bool vram_lru = false;       // --vram-lru: misses / used prefetches take the layer's LRU VRAM slot (MiMo s16)
     bool arena_adapt = false;    // --arena-adapt: a file-tier read replaces the layer's LRU arena expert
     bool arena_skip = false;     // --arena-skip-resident: the VRAM seed's experts stay out of the host arena
+    int prefill_chunk = 0;       // --prefill-chunk N: the prompt in chunks of N tokens (0 = through the decode loop)
     std::string dense_requant;   // q4_k | q5_k | q6_k: requantize the big Q8_0 dense matrices at load   // cache-aware routing: + this to the selection score of VRAM-resident experts   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
 };
 
@@ -128,6 +129,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--vram-lru") a.vram_lru = true;
         else if (k == "--arena-adapt") a.arena_adapt = true;
         else if (k == "--arena-skip-resident") a.arena_skip = true;
+        else if (k == "--prefill-chunk") a.prefill_chunk = std::atoi(next().c_str());
         else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (!a.ids_csv.empty() || !a.ids_file.empty());
@@ -152,6 +154,12 @@ int sample(const float* logits, int n_vocab, float temp, std::mt19937_64& rng) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // ggml's DEBUG lines ("CUDA Graph id N reused", ~90 per token once graphs are reused) cost a stderr write each on
+    // the decode path; drop them unless DS4_GGML_DEBUG=1
+    if (!std::getenv("DS4_GGML_DEBUG"))
+        ggml_log_set([](ggml_log_level lv, const char* text, void*) {
+            if (lv != GGML_LOG_LEVEL_DEBUG) std::fputs(text, stderr);
+        }, nullptr);
     Args a;
     if (!parse(argc, argv, a)) { usage(); return 2; }
 
@@ -193,6 +201,11 @@ int main(int argc, char** argv) {
     const int64_t ctx = a.ctx > 0 ? a.ctx : (int64_t) prompt.size() + a.n_predict + 64;
     dc.comp_cap_max = ctx / 4 + 2;
     dc.mtp_path = a.mtp;
+    dc.prefill_chunk = a.prefill_chunk;
+    if (a.prefill_chunk > 0 && !a.mtp.empty()) {
+        std::fprintf(stderr, "ds4_generate: --prefill-chunk does not fill the MTP window yet; drop --mtp or the chunk\n");
+        return 2;
+    }
     std::fprintf(stderr, "context cap %lld tokens\n", (long long) ctx);
     std::string err;
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds4_generate: dense init: %s\n", err.c_str()); return 1; }
@@ -224,8 +237,12 @@ int main(int argc, char** argv) {
     mc.vram_lru = a.vram_lru;
     mc.arena_adapt = a.arena_adapt;
     mc.arena_skip_resident = a.arena_skip;
+    // chunked prefill: the arena now, the VRAM cache after the prompt (the chunks use that VRAM first)
+    const bool defer_seed = a.prefill_chunk > 0 && !mc.cpu_only && !a.profile.empty();
+    mc.defer_cache = defer_seed;
     if (!tier.init(a.model, mc, err)) { std::fprintf(stderr, "ds4_generate: tier init: %s\n", err.c_str()); return 1; }
-    if (!a.profile.empty() && !mc.cpu_only && !tier.seed_from_routes(a.profile, err)) {
+    if (!a.profile.empty() && !mc.cpu_only &&
+        !(defer_seed ? tier.build_arena_from_routes(a.profile, 512, err) : tier.seed_from_routes(a.profile, err))) {
         std::fprintf(stderr, "ds4_generate: profile: %s\n", err.c_str());
         return 1;
     }
@@ -371,7 +388,81 @@ int main(int argc, char** argv) {
     const double t_pf0 = now_ms();
     double nll = 0;
     int n_scored = 0;
-    for (size_t i = 0; i < prompt.size(); ++i) {
+    std::vector<float> first_logits;   // chunked prefill: the prompt's last row (the decode state holds no token yet)
+    if (a.prefill_chunk > 0) {
+        const int NP = a.prefill_chunk;
+        std::vector<int> cids((size_t) (NP * top_k));
+        std::vector<int32_t> cids32((size_t) (NP * top_k));
+        std::vector<float> cw((size_t) (NP * top_k)), crouted((size_t) NP * (size_t) n_embd);
+        const int LR = 16;   // logits rows per head call (ppl)
+        std::vector<float> lrows;
+        double t_dense = 0, t_exp = 0;
+        for (size_t c0 = 0; c0 < prompt.size(); c0 += (size_t) NP) {
+            const int n = (int) std::min<size_t>((size_t) NP, prompt.size() - c0);
+            if (!dense.prefill_begin(prompt.data() + c0, n, (int) c0)) {
+                std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str());
+                return 1;
+            }
+            for (int l = 0; l < n_layer; ++l) {
+                double t0 = now_ms();
+                const float* fn = nullptr;
+                if (!dense.prefill_attn(l, cids.data(), cw.data(), &fn)) {
+                    std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str());
+                    return 1;
+                }
+                double t1 = now_ms(); t_dense += t1 - t0; t0 = t1;
+                for (int k = 0; k < n * top_k; ++k) cids32[(size_t) k] = cids[(size_t) k];
+                if (!tier.run_chunk(l, n, cids32.data(), cw.data(), fn, crouted.data())) {
+                    std::fprintf(stderr, "ds4_generate: tier.run_chunk refused at layer %d\n", l);
+                    return 1;
+                }
+                t1 = now_ms(); t_exp += t1 - t0; t0 = t1;
+                if (!dense.prefill_finish(l, crouted.data())) {
+                    std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str());
+                    return 1;
+                }
+                t_dense += now_ms() - t0;
+            }
+            int nv = (int) dense.geom().vocab_size;
+            if (a.ppl) {   // rows whose next token is in the prompt
+                const int last = (int) std::min<size_t>((size_t) n, prompt.size() - 1 - c0);
+                for (int r0 = 0; r0 < last; r0 += LR) {
+                    const int nr = std::min(LR, last - r0);
+                    lrows.resize((size_t) nr * (size_t) nv);
+                    if (!dense.prefill_logits(r0, nr, lrows.data())) {
+                        std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str());
+                        return 1;
+                    }
+                    for (int r = 0; r < nr; ++r) {
+                        const float* l = lrows.data() + (size_t) r * nv;
+                        const float mx = *std::max_element(l, l + nv);
+                        double z = 0;
+                        for (int v = 0; v < nv; ++v) z += std::exp((double) (l[v] - mx));
+                        nll += (std::log(z) + mx) - l[prompt[c0 + (size_t) (r0 + r) + 1]];
+                        ++n_scored;
+                    }
+                }
+            }
+            if (c0 + (size_t) n == prompt.size()) {
+                first_logits.resize((size_t) nv);
+                if (!dense.prefill_logits(n - 1, 1, first_logits.data())) {
+                    std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str());
+                    return 1;
+                }
+            }
+            dense.prefill_end();
+        }
+        tier.release_chunk();
+        dense.prefill_release();
+        const double t_seed = now_ms();
+        if (defer_seed && !tier.seed_from_routes(a.profile, err)) {
+            std::fprintf(stderr, "ds4_generate: profile: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "prefill chunks of %d: dense %.0f ms, experts %.0f ms, cache seed %.0f ms -> %lld resident "
+                             "slots\n", NP, t_dense, t_exp, now_ms() - t_seed, (long long) tier.resident());
+    }
+    for (size_t i = 0; a.prefill_chunk <= 0 && i < prompt.size(); ++i) {
         if (!step(prompt[i], (int) i)) {
             std::fprintf(stderr, "ds4_generate: prefill failed at %zu: %s\n", i, dense.last_error().c_str());
             return 1;
@@ -453,7 +544,7 @@ int main(int argc, char** argv) {
         const double th0 = now_ms();
         if (!dense.logits(&lg, &n_vocab)) return 1;
         t_ph[4] += now_ms() - th0;
-        int cur = argmax(lg, n_vocab);
+        int cur = argmax(lg, n_vocab);   // (--verify needs --mtp: never after chunked prefill)
         dump_row(lg, n_vocab);
         emit(cur);
         if (!done && !mtp_draft(cur, pos - 1, &draft)) {
@@ -500,7 +591,9 @@ int main(int argc, char** argv) {
     }
     for (; !a.verify && n_gen < a.n_predict; ++n_gen) {
         const double th0 = now_ms();
-        const bool lok = dense.logits(&lg, &n_vocab);
+        bool lok = true;
+        if (n_gen == 0 && !first_logits.empty()) { lg = first_logits.data(); n_vocab = (int) first_logits.size(); }
+        else lok = dense.logits(&lg, &n_vocab);
         t_ph[4] += now_ms() - th0;
         if (!lok) { std::fprintf(stderr, "ds4_generate: logits: %s\n", dense.last_error().c_str()); return 1; }
         if (n_gen == 0 && !a.dump_logits.empty()) {
@@ -530,8 +623,9 @@ int main(int argc, char** argv) {
     const ds4::Ds4MoeStats st = tier.stats();
     const int dec_steps = a.verify ? std::max(1, n_passes) : std::max(1, n_gen - 1);   // forward passes run in decode
 
-    std::fprintf(stderr, "\nprefill: %zu tokens in %.2f s = %.2f tok/s (decode-loop prefill)\n", prompt.size(),
-                 pf_ms / 1000.0, 1000.0 * (double) prompt.size() / pf_ms);
+    std::fprintf(stderr, "\nprefill: %zu tokens in %.2f s = %.2f tok/s (%s)\n", prompt.size(),
+                 pf_ms / 1000.0, 1000.0 * (double) prompt.size() / pf_ms,
+                 a.prefill_chunk > 0 ? "chunked" : "decode-loop prefill");
     std::fprintf(stderr, "decode : %d tokens, %d forward passes in %.2f s = %.2f tok/s\n", n_gen, dec_steps,
                  dec_ms / 1000.0, 1000.0 * dec_steps / dec_ms);
     if (a.verify)   // the first token comes from the prefill's logits: the passes produced the other n_gen - 1

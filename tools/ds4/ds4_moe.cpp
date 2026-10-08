@@ -747,7 +747,7 @@ bool Ds4MoeTier::init(const Ds4MoeGeom& geom, Ds4BlobSource* blobs, const Ds4Moe
         std::memset(gp.h_dummy, 0, (size_t) im_->blob);
     }
     // a geometry whose blob size varies per layer opens its cache at the seed, sized to the ranked experts
-    if (!cfg.no_cache && cfg.slots > 0 && !im_->mixed_sizes) {
+    if (!cfg.no_cache && cfg.slots > 0 && !im_->mixed_sizes && !cfg.defer_cache) {   // defer_cache: opened at the seed
         std::vector<int64_t> sizes((size_t) cfg.slots, im_->blob);
         gp.cache.reset(new strata::core::ExpertCache());
         if (!gp.cache->open_sized(sizes, geom.n_layers, geom.n_experts, err)) return false;
@@ -941,6 +941,13 @@ bool Ds4MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
             im_->gpu->cache.reset(new strata::core::ExpertCache());
             if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
         }
+    }
+    // uniform blobs with defer_cache: the cache opens now (after the prompt chunks gave their VRAM back)
+    if (!im_->mixed_sizes && im_->cfg.defer_cache && im_->gpu && !im_->gpu->cache && !im_->cfg.no_cache &&
+        im_->cfg.slots > 0) {
+        std::vector<int64_t> sizes((size_t) im_->cfg.slots, im_->blob);
+        im_->gpu->cache.reset(new strata::core::ExpertCache());
+        if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
     }
     if (!im_->gpu || !im_->gpu->cache) return true;   // no cache: nothing to seed
     const int64_t want = std::min<int64_t>(im_->cfg.slots, im_->gpu->cache->full_slots());

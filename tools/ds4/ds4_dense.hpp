@@ -49,6 +49,9 @@ struct Ds4DenseConfig {
     /// The MTP (nextn) head's own GGUF (DeepSeek-V4-Flash-MTP-*.gguf): loads its block as layer n_layer() (an extra
     /// ratio-0 sliding-window layer, see mtp_begin).  Empty = no MTP head.
     std::string    mtp_path;
+    /// Prompt chunks: the most tokens one prefill_* pass may carry (0 = no chunked prefill).  The chunk's hand-off
+    /// tensors and graph buffers are allocated at the first prefill_begin and freed by prefill_release.
+    int64_t        prefill_chunk = 0;
 };
 
 /// One-token decode of the DS4 dense half.  Not thread-safe; one instance decodes one sequence.
@@ -128,6 +131,22 @@ public:
     /// now, so the VRAM they need is taken at load - not when the context first reaches a new capacity mid-run.
     /// `n_max` > 1 also reserves the multi-token variants up to that pass size.
     bool reserve_graphs(int n_max = 1);
+    // ---- prompt chunks: n <= Ds4DenseConfig::prefill_chunk tokens at positions pos0 .. pos0+n-1 ----
+    //   prefill_begin(tids, n, pos0)
+    //   for each layer il: prefill_attn(il, ids, w, &fn)   [ids/w n*n_expert_used token-major, fn n*n_embd]
+    //                      prefill_finish(il, routed)       [routed n*n_embd]
+    //   prefill_logits(row0, nrows, out) for any rows of the chunk, then prefill_end(); decoding continues at pos0+n.
+    // Same math as n one-token passes (the decode graphs with n columns); each graph is built for the chunk, run
+    // once on a shared allocator and dropped.  The rings keep their decode size: a chunk reads [ring | its own rows]
+    // and writes back its last rows.  Not with an MTP head (its window is not filled here).
+    bool prefill_begin(const int * tids, int n, int pos0);
+    bool prefill_attn(int il, int * routed_ids, float * routed_w, const float ** ffn_norm_host);
+    bool prefill_finish(int il, const float * routed_sum);
+    /// Logits of rows row0 .. row0+nrows-1 of the chunk into `out` (nrows * n_vocab floats, row-major).
+    bool prefill_logits(int row0, int nrows, float * out);
+    bool prefill_end();
+    /// Frees the chunk tensors and the shared graph buffer (VRAM back for the expert cache).
+    void prefill_release();
     const float * tap_attn_raw(int il) const;
     const float * tap_attn_out(int il) const;
     const float * tap_l_last  (int il) const;
