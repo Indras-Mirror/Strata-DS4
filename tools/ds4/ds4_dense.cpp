@@ -1316,7 +1316,9 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
 
     // ---- graph scaffolding -------------------------------------------------------------
     {
-        ggml_init_params ip = { /*mem_size*/ 256ull * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
+        // node structs of every graph variant (no tensor data): 256 MiB overflowed once --verify's 2-token variants
+        // joined the compressed-row-skip ones (2026-10-08); host pages are only touched as graphs are built
+        ggml_init_params ip = { /*mem_size*/ 1024ull * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
         im.gctx = ggml_init(ip);
         if (!im.gctx) { err = "ggml_init(graph) failed"; return false; }
         ggml_set_no_alloc(im.gctx, true);
