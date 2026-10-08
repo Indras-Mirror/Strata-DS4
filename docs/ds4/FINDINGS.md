@@ -725,6 +725,8 @@ long-context number to take.**  The blocked indexer must keep the chunk gate bit
 decode loop); the top-k among ReLU-zero ties is the thing to watch (the off-CPU batched argsort already accepts
 that class of difference, s20).
 
-Long prompts are ready for when it lands: `bench/ds4-2026-10-08/ctx/ctx{65536,131072,262144}.i32` (tokenized with
-`strata_tokenizer` from the repo's own sources + docs - 1.94M tokens available, so a 1M-token file too; feed with
-`ds4_generate --ids-file`).
+Long prompts are ready for when it lands: `bench/ds4-2026-10-08/ctx/ctx{65536,131072,262144}.i32`, written by
+`tools/ds4/make_ctx_prompts.py` (tokenizes the repo's OWN text - docs, tools, src, include; no third_party - with
+`strata_tokenizer`, so the prompt is real prose and code; 2.07M tokens of corpus, a 1M-token file is one
+`--sizes 1048576` away).  Feed with `ds4_generate --ids-file`.  The directory is git-ignored (regenerate, don't
+commit).

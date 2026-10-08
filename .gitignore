@@ -25,6 +25,7 @@ tools/ds4/route_probe
 tools/ds4/golden_dump
 bench/ds4-2026-10-05/goldens/
 bench/ds4-2026-10-05/profile-decode/
+bench/ds4-2026-10-08/ctx/
 
 # Pi harness metadata (local session state, not project source)
 *.sqlite
