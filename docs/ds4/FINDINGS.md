@@ -983,3 +983,21 @@ pattern forces on `[cap, n, 64]` (`cap*4096*64*4` bytes per layer per chunk = 8.
 kernel in one run, and the likely fix is either an F16/BF16 tensor-core path for the indexer scores (it is a
 *selection* score; the reference's own accuracy budget is far looser than the attention itself) or restructuring the
 permute so the `[cap, n, 64]` tensor is never materialised twice.  Do not start either before nsys says which.
+
+## 32. The llama.cpp long-context harness: llama-cli spins, use llama-server (2026-10-08)
+
+First attempt at the 64K comparison used `build-cu134/bin/llama-cli -f ctx65536.txt -n 128 -c 70000 -ngl 99 -cmoe
+--moe-expert-cache 40 --load-mode none -fa on -ctk q4_0 -ctv q4_0 --no-kv-offload --no-warmup`.  It read the whole
+model (86.7 GB of `/proc/<pid>/io` reads - the load finished) and then **sat in llama-cli's interactive loop**:
+with stdin at EOF it printed `> ` forever instead of running the file prompt once.  20 minutes, 234,421,087 log
+lines, 671 MB written to the NVMe, GPU 4%, `utime+stime` climbing at ~0.6 core, VRAM 21 GB allocated, **prefill
+never started**.  (Lesson for reading a "loaded but idle" process: `/proc/<pid>/io` + the log's *content*, not the
+spinner - the spinner had long since been buried by the spam.)
+
+Fix, and it is the better harness anyway: **`llama-server` + one raw `/completion` request**, which is how the
+16.34 tok/s bar of s3 was measured (`bench.sh`), so the comparison stays like-for-like - and `timings.prompt_n /
+prompt_per_second / predicted_n / predicted_per_second` come back in the response instead of being scraped from
+stderr.  `bench/ds4-2026-10-08/llamacpp-ctx.sh` now does that (same config B flags, `-c 70000`, the 64K document,
+128 tokens, a `kill -9` watchdog if MemAvailable drops under 3 GiB).  Cost of the detour: ~20 min of GPU time and
+671 MB of NVMe writes, and the peer session was waiting on that window - noted for the next harness decision: run a
+new binary's *smoke test* (a 64-token prompt) before queueing it for a 20-minute measurement.
