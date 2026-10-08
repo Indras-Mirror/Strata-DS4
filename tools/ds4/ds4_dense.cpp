@@ -648,6 +648,7 @@ struct B {
 // compressor rings take every token's state before any gather; each token gathers its own `ring` slots.
 static bool sparse_on();   // DS4_SPARSE, defined with the other switches below
 static bool vis_dev_on();  // DS4_VIS_DEV, ditto
+static int64_t idx_block_n(int64_t n);   // DS4_IDX_BLOCK, ditto
 
 static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_t n, Ds4Dense::Impl::Layer & L,
                                bool emit = true) {
@@ -817,15 +818,34 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
 
             ggml_tensor * qp = ggml_permute(gc, iq, 0, 2, 1, 3);            // [idx_k, n, idx_h]
             ggml_tensor * kp = ggml_permute(gc, lid_src, 0, 2, 1, 3);       // [idx_k, cap, 1]
-            ggml_tensor * kq = ggml_mul_mat(gc, kp, qp);                    // [cap, n, idx_h]
-            kq = ggml_cont(gc, ggml_permute(gc, kq, 2, 1, 0, 3));           // [idx_h, n, cap]
-            ggml_tensor * sc = ggml_relu(gc, kq);
-            sc = ggml_mul(gc, sc, ggml_reshape_4d(gc, iw, im.IDXH, n, 1, 1));
-            sc = ggml_sum_rows(gc, sc);                                     // [1, n, cap]
-            sc = ggml_cont(gc, ggml_permute(gc, sc, 2, 1, 0, 3));           // [cap, n, 1]
-            sc = ggml_reshape_2d(gc, sc, cap, n);
-
-            sc = ggml_add(gc, sc, var.vis);
+            // score[c,t] = sum_h relu(sum_k lid_k[k,c] * iq[k,h,t]) * iw[h,t].  The mul_mat's result is
+            // [cap, n, idx_h] and the relu / head weight / sum need idx_h on ne[0], so the permute + cont
+            // materialises a second tensor of that size: cap * n * 64 floats.  At a 64K prompt (cap 16384) that is
+            // 16 GiB and at 256K (cap 65536) 64 GiB, which is why no long prompt can be read at all (FINDINGS s24).
+            // DS4_IDX_BLOCK computes it in query blocks instead - a query's score depends only on its own iq/iw, so
+            // the result is the same bits, and the peak becomes cap * block * 64 instead of cap * n * 64.  For
+            // n <= block the loop runs once with `nb == n` and builds the identical graph, so decode, verify and
+            // every chunk up to the block size are byte-identical by construction (DS4_IDX_BLOCK=0 = all at once).
+            const int64_t QB = idx_block_n(n);
+            ggml_tensor * sc = nullptr;
+            for (int64_t t0 = 0; t0 < n; t0 += QB) {
+                const int64_t nb = std::min<int64_t>(QB, n - t0);
+                ggml_tensor * qpb = nb == n ? qp
+                    : ggml_view_3d(gc, qp, im.IDXK, nb, im.IDXH, qp->nb[1], qp->nb[2], (size_t) t0 * qp->nb[1]);
+                ggml_tensor * iwb = nb == n ? iw
+                    : ggml_view_2d(gc, iw, im.IDXH, nb, iw->nb[1], (size_t) t0 * iw->nb[1]);
+                ggml_tensor * kq = ggml_mul_mat(gc, kp, qpb);               // [cap, nb, idx_h]
+                kq = ggml_cont(gc, ggml_permute(gc, kq, 2, 1, 0, 3));       // [idx_h, nb, cap]
+                ggml_tensor * scb = ggml_relu(gc, kq);
+                scb = ggml_mul(gc, scb, ggml_reshape_4d(gc, iwb, im.IDXH, nb, 1, 1));
+                scb = ggml_sum_rows(gc, scb);                               // [1, nb, cap]
+                scb = ggml_cont(gc, ggml_permute(gc, scb, 2, 1, 0, 3));     // [cap, nb, 1]
+                scb = ggml_reshape_2d(gc, scb, cap, nb);
+                ggml_tensor * visb = nb == n ? var.vis
+                    : ggml_view_2d(gc, var.vis, cap, nb, var.vis->nb[1], (size_t) t0 * var.vis->nb[1]);
+                scb = ggml_add(gc, scb, visb);
+                sc = sc ? ggml_concat(gc, sc, scb, 1) : scb;
+            }
             var.dbg_isc = sc;
             ggml_set_output(sc);
 
@@ -1434,6 +1454,14 @@ static bool comp_skip_on() {
 static bool vis_dev_on() {
     static const bool on = [] { const char * e = std::getenv("DS4_VIS_DEV"); return !e || std::atoi(e) != 0; }();
     return on;
+}
+
+// DS4_IDX_BLOCK (default 64, 0 = all queries at once): how many queries the lightning indexer's [cap, query, 64]
+// score tensor is computed for at a time - the tensor that otherwise blocks every long prompt (FINDINGS s24).
+// Queries are independent here, so the value is the same; only n > block changes the graph at all.
+static int64_t idx_block_n(int64_t n) {
+    static const int64_t blk = [] { const char * e = std::getenv("DS4_IDX_BLOCK"); return e ? (int64_t) std::atoi(e) : (int64_t) 64; }();
+    return blk > 0 && blk < n ? blk : n;
 }
 
 // compressed-row capacity a pass whose last token sits at `pos_last` needs (0 for a ratio-0 layer)

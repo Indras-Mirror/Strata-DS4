@@ -791,3 +791,23 @@ non-VRAM expert host-resident, so the CPU/GPU split is deterministic), all four 
 significant figures and byte-identical generated tokens.  The "+-0.2 ppl / tokens diverge from token 3" caveat of
 s13 was measured on configs where the expert sourcing varies run to run; in this config a 2+2 interleaved A/B can
 resolve far smaller differences than the old noise floor suggested.
+
+## 27. Long-context step (d): the indexer in query blocks (2026-10-08)
+
+`s24`'s blocker: the lightning indexer's score tensor is `[cap, n, 64]` F32 (plus the permute+`cont` copy of it),
+so `cap * n * 64` floats - 16 GiB at a 64K prompt with chunk 4096, 64 GiB at 256K.  `DS4_IDX_BLOCK` (default 64,
+`0` = all at once) computes it for `DS4_IDX_BLOCK` queries at a time in `build_attn`'s CSA branch.  A query's score
+depends only on its own `iq`/`iw` (the reduction is over `idx_k` and over heads, never over queries), so the split
+is the same arithmetic per query; the peak drops from `cap * n * 64` to `cap * block * 64` (268 MiB per block at
+256K).  The mask is sliced with the same offset per block (`var.vis[:, t0:t0+nb]`), and the blocks are concatenated
+along the query axis.
+
+**For `n <= block` the loop runs once with `nb == n` and builds the identical node graph** - no extra view, no
+concat - so decode (n = 1), verify (n <= 4) and any chunk up to the block size are byte-identical *by construction*,
+not by agreement.  That also means the existing gates do not cover the blocked path, which is why the block size is
+the switch: the chunk gate is run with a chunk larger than the block.
+
+Gate (CPU, `ds4_generate --backend cpu --prefill-chunk 33` on mini tame, a 32-token prompt + 24 greedy,
+`DS4_DUMP_TOKLOGITS` against the decode-loop run): byte-identical tokens and logits at
+`DS4_IDX_BLOCK=8`, `16` and `64` (5, 3 and 1 blocks for the chunk).  The dense gates (swa16 40/40, tame 63/63,
+`--multi 2,3,1,4`) still PASS.
