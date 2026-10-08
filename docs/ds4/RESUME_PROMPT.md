@@ -1,3 +1,18 @@
+## RESUME HERE (2026-10-08 night, after a693545 pushed + 7 local commits) - read FINDINGS s20-s22 first
+State: decode **24.9 tok/s** (`--vram-lru --pf-b 0.7 --f16-q8 --arena-skip-resident --arena-gib 58`, quiet box),
+prefill up to **392 tok/s** at 6K (`--prefill-chunk 4096 --chunk-mmq --chunk-prestage --vram-lru`, full
+`--arena-gib 70`; never with --arena-skip-resident). Pushed to ds4/main up to a693545 (README there says 23-24);
+local commits after it: f16-q8, verify gctx fix, --mtp-keep, docs - push when Mal says.
+**Priority 1 = long context (Mal needs 250K-1M):** FINDINGS s22 plan (a)-(e): sparse top-512 CSA gather, Q8_0 (or
+TBQ4 from ~/AI/llama.cpp-master-rebase) compressed caches, device-side visibility, query-blocked prefill indexer, then
+caches in pinned RAM. Read b19-ctx*.log first. Then build long prompts and measure prefill/decode at 64K..256K.
+Priority 2 = speculative decode: `--mtp-keep 2` + VRAM LRU in run_multi + verify margin calibration; then DSpark.
+Tools: queue GPU runs with `bench/ds4-2026-10-08/q.sh <log> <args>` (env DS4_BIN=<snapshot in bench/ds4-2026-10-08/bin/>,
+Q_PROMPT, Q_N, Q_PPL= to drop --ppl); interleave A/B pairs (single runs swing ~1 tok/s); stop the wakeword daemon
+(`systemctl --user stop wakeword-daemon`) and ask Mal to pause video playback for clean numbers. MiMo session shares
+the GPU lock (relay name strata-mimo; never answered today). Never `pgrep -f`/kill a pattern that appears in your own
+command line (did it twice today); wait on PIDs.
+
 # Resume prompt: Strata for DeepSeek-V4-Flash
 
 Paste everything below the line into a fresh Claude Code session started in `~/AI/Strata-DS4`.

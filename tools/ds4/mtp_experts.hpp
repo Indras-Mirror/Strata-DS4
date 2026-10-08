@@ -37,13 +37,17 @@ struct MtpExperts {
     ggml_cgraph* gf = nullptr;
     ggml_tensor *t_x = nullptr, *t_id = nullptr, *t_w = nullptr, *out = nullptr;
     int64_t D = 0, K = 0;
+    int64_t KIN = 0;        ///< the router's top-k (entries run() receives)
+    /// > 0: only the `keep` highest-weight of the KIN routed experts are computed (a cheaper draft: the MTP head only
+    /// has to rank the next token).  Set before init.  0 = all.
+    int64_t keep = 0;
     std::vector<float> host;
 
     bool init(const std::string& path, int il, int64_t n_embd, int64_t topk, float clamp, int threads, std::string& err,
               bool resident = false) {
         model = std::make_unique<strata::GgufModel>(strata::GgufModel::open(path));
         if (model->size() != 1) { err = "MTP experts: cannot open " + path + " (single file expected)"; return false; }
-        D = n_embd; K = topk;
+        D = n_embd; KIN = topk; K = keep > 0 ? std::min<int64_t>(keep, topk) : topk;
         be = ggml_backend_cpu_init();
         ggml_backend_cpu_set_n_threads(be, threads);
         ggml_init_params ip = { 16 * 1024 * 1024, nullptr, true };
@@ -113,10 +117,17 @@ struct MtpExperts {
     }
     // ids/w: K entries; x: D floats -> out D floats (the weighted routed sum)
     bool run(const float* x, const int* ids, const float* w, float* o) {
-        std::vector<int32_t> iv(ids, ids + K);
+        std::vector<int32_t> iv(ids, ids + KIN);
+        std::vector<float> wv(w, w + KIN);
+        if (K < KIN) {   // keep the K heaviest (the weights stay as routed: the draft only needs the argmax)
+            std::vector<int> ord((size_t) KIN);
+            for (int64_t i = 0; i < KIN; ++i) ord[(size_t) i] = (int) i;
+            std::partial_sort(ord.begin(), ord.begin() + K, ord.end(), [&](int a, int b) { return w[a] > w[b]; });
+            for (int64_t i = 0; i < K; ++i) { iv[(size_t) i] = ids[ord[(size_t) i]]; wv[(size_t) i] = w[ord[(size_t) i]]; }
+        }
         ggml_backend_tensor_set(t_x, x, 0, (size_t) D * 4);
-        ggml_backend_tensor_set(t_id, iv.data(), 0, iv.size() * 4);
-        ggml_backend_tensor_set(t_w, w, 0, (size_t) K * 4);
+        ggml_backend_tensor_set(t_id, iv.data(), 0, (size_t) K * 4);
+        ggml_backend_tensor_set(t_w, wv.data(), 0, (size_t) K * 4);
         if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) return false;
         ggml_backend_tensor_get(out, o, 0, (size_t) D * 4);
         return true;

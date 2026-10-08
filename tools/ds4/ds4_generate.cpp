@@ -78,6 +78,7 @@ struct Args {
     bool chunk_prestage = false; // --chunk-prestage: stream layer l+1's experts while layer l computes
     float skip_miss = 0.0f;      // --skip-miss T: drop a VRAM-miss expert whose weight < T x the token's weight sum
     bool f16_q8 = false;         // --f16-q8: compressor / indexer F16 matrices as Q8_0 (VRAM + bandwidth)
+    int mtp_keep = 0;            // --mtp-keep K: the MTP draft computes only its K heaviest routed experts (0 = all)
     std::string dense_requant;   // q4_k | q5_k | q6_k: requantize the big Q8_0 dense matrices at load   // cache-aware routing: + this to the selection score of VRAM-resident experts   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
 };
 
@@ -138,6 +139,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--chunk-prestage") a.chunk_prestage = true;
         else if (k == "--skip-miss") a.skip_miss = (float) std::atof(next().c_str());
         else if (k == "--f16-q8") a.f16_q8 = true;
+        else if (k == "--mtp-keep") a.mtp_keep = std::atoi(next().c_str());
         else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (!a.ids_csv.empty() || !a.ids_file.empty());
@@ -267,6 +269,7 @@ int main(int argc, char** argv) {
     const int il_mtp = dense.mtp_layer();
     ds4::MtpExperts mtp_x;
     if (il_mtp >= 0) {
+        mtp_x.keep = a.mtp_keep;
         if (!mtp_x.init(a.mtp, il_mtp, dense.geom().n_embd, dense.geom().n_expert_used,
                         (float) dense.geom().swiglu_clamp_exp[(size_t) il_mtp], a.threads > 0 ? a.threads : 8, err,
                         a.mtp_resident)) {

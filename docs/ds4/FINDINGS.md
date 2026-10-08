@@ -630,3 +630,36 @@ MTP verify on CUDA (batch 17): 18.9 / 20.6 tok/s vs 24.9 plain - 1.61-1.67 token
 2.2x the experts (46 vs 21 ms), run_multi has no VRAM LRU, the verify graph margin costs ~170 slots (hit 83 -> 73%),
 drafts 10.6-13.7 ms (MTP experts on the CPU, even resident). Best case with all three fixed ~28 tok/s.
 Acceptance with the MTP's own hc_head, experts resident: 67.7% (drafts-only run), 60.8-68.4% under verify.
+
+## 22. MTP draft cost, vision, long context (2026-10-08 night) - the plan for the next session
+
+**MTP draft with only its K heaviest routed experts** (`--mtp-keep K`, b18, drafts-only, decode config + `--f16-q8
+--mtp-resident`): all 6 = 67.7% acceptance / 11.2 ms per draft; K=3 66.1% / 9.4; **K=2 64.6% / 6.1**; K=1 61.4% / 4.8.
+Verify (b17, all 6) was 18.9-20.6 tok/s vs 24.9 plain; to make it win: `--mtp-keep 2`, the multi-token tier path
+needs the VRAM LRU (run_multi has none: hit 83 -> 73%), and the verify VRAM margin (+1.0 GiB) is ~1 GiB too big
+("VRAM free at the end" 1.15-1.26 GiB in b17). Estimated pass ~19 + ~38 + ~6 + 4 ms for 1.6 tokens -> ~40 ms/token
+= break-even to +10%. DSpark (FINDINGS s7: mean accepted length 3.4 with blocks of 5 in llama.cpp) is the larger
+upside: estimate ~27 tok/s IF its 10.9 GB Q8_0 draft and >4-token verify passes fit - test after the context work.
+(File: /media/mal/SSD NVME/Models/huihui-DeepSeek-V4-Flash-0731-dspark-abliterated/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf.)
+
+**Vision**: the 0731 GGUF has no vision/projector tensors or metadata - text only.
+
+**Long context (Mal needs 250K, ideally 0.5-1M)**: the model declares context_length 1,048,576 (YaRN x16 over 64K).
+Our engine's walls, in order of size:
+1. Compressed caches are F32 in VRAM: CSA `comp` [512, ctx/4] + `icomp` [128, ctx/4] per CSA layer (21 layers) ->
+   ~0.65 GB per 32K tokens: 5.4 GB at 256K, 13.5 GB at 1M (taken from the expert cache's ~16 GB).
+2. `vis_full` (comp_max floats x kNtMax per compressed layer) is rebuilt on the host and uploaded every token: ~45 MB/token
+   at 256K. Build visibility on the device from i_pos instead.
+3. CSA decode attends to ALL compressed blocks with a mask (only top-512 unmasked): linear in context. The model's
+   design is a sparse gather of the indexer's top-512 rows -> constant cost per token.
+4. Chunked prefill's indexer materialises [cap, n, 64 heads] f32 (tens of GB at 256K): compute it in query blocks.
+Plan: (a) sparse top-512 gather for CSA attention; (b) caches in Q8_0 (vendored ggml: CUDA set_rows writes Q8_0,
+get_rows dequantizes) - or TBQ4: our llama.cpp forks already run DSV4 KV with TurboQuant
+(`~/AI/llama.cpp-master-rebase` branch master-rebase: ggml-turboq.c, ggml-cuda/tbq4-cuda.cuh, fattn-mma-tbq4*.cuh,
+src/llama-kv-cache-dsv4.cpp references TBQ) - port GGML_TYPE_TBQ4_0 + its set_rows/get_rows into third_party if Q8_0 is
+not enough; (c) device-side visibility; (d) query-blocked prefill indexer; (e) Strata-style: CSA caches in pinned RAM,
+GPU gathers 512 rows/layer/token over PCIe (~5 MB/token) -> 1M context with ~no VRAM. Gate (a)/(c)/(d) bit-exact on the
+CPU fixtures (same math), (b)/(e) by real-model ppl. Needs a long prompt: build a 64K/128K/256K token file from text
+(tools/ds4/ds4_chat.py has the tokenizer) and time prefill + decode at each.
+Batch 19 (`bench/ds4-2026-10-08/b19-ctx{65536,131072,262144}.log`, load at those --ctx with a short prompt) was running
+at handoff - read it first: it shows what loads today and how many expert slots remain.
