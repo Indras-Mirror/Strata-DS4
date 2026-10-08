@@ -625,6 +625,8 @@ struct B {
             ? ggml_reshape_2d(c, cur, n, ggml_nelements(cur) / n)
             : ggml_cont_2d(c, cur, n, ggml_nelements(cur) / n);
         res = ggml_mul_mat(c, rot_m, res);
+        // as llama-impl.h: ggml-cuda then runs its fast Walsh-Hadamard kernel instead of the matmul (the CPU ignores it)
+        ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
         return ggml_reshape_4d(c, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
     }
     // the compress-RoPE / raw-RoPE parameter set ds4_ref derives per layer
@@ -1007,9 +1009,8 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
         }
         ggml_tensor * qp = ggml_permute(gc, qb, 0, 2, 1, 3);                 // [DH, nq, NH]
         ggml_tensor * kp = ggml_permute(gc, kb, 0, 2, 1, 3);
-        ggml_tensor * kf = ggml_cast(gc, kp, GGML_TYPE_F16);
-        ggml_tensor * vf = ggml_cast(gc, kp, GGML_TYPE_F16);
-        ggml_tensor * o = ggml_flash_attn_ext(gc, qp, kf, vf, mb, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
+        ggml_tensor * kf = ggml_cast(gc, kp, GGML_TYPE_F16);   // K == V: one cast serves both (was two identical)
+        ggml_tensor * o = ggml_flash_attn_ext(gc, qp, kf, kf, mb, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
         ggml_flash_attn_ext_add_sinks(o, b.BL(il, "attn_sinks.weight"));   // [DH, NH, nq]
         return o;
     };
