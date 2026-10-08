@@ -1001,3 +1001,23 @@ stderr.  `bench/ds4-2026-10-08/llamacpp-ctx.sh` now does that (same config B fla
 128 tokens, a `kill -9` watchdog if MemAvailable drops under 3 GiB).  Cost of the detour: ~20 min of GPU time and
 671 MB of NVMe writes, and the peer session was waiting on that window - noted for the next harness decision: run a
 new binary's *smoke test* (a 64-token prompt) before queueing it for a 20-minute measurement.
+
+**s29 correction, and what the cross-layer LRU actually costs.**  `ExpertCache` already measured a *global* pool once
+and rejected it - `include/strata/core/expert_cache.hpp:145` "**R4.2g: GIVE EACH LAYER ITS OWN SLOTS. ROUND 328
+MEASURED WHY THE GLOBAL FORM CANNOT WORK**": with one shared counter handing out slots in arrival order, the first
+`n_slots` distinct `(layer, expert)` pairs are ~26 layers of *position 0*, so the cache never leaves the first
+position it sees - measured **1781/60000 = 2.97%** hit, against 21.4% for 8 slots/layer and 70.4% for 64.  The
+header also says eviction was deliberately left out ("it never evicts, because eviction policy is a measured
+question - R4.1's LFU-decay vs LRU sweep"), so that 2.97% is a global pool *without* eviction, not FreeToken's
+global LRU.  Two consequences for s29's suggestion:
+
+- DS4's cache is not the per-layer-partitioned form R4.2g describes: `set_per_layer_admission()` is **never called**
+  by the DS4 tools (grep: no hits), so seeding fills slots in *global profile order* (which is what s2 measured at
+  48-50% at 12 GB), and each layer then keeps the slot *set* it was seeded with - `replace()` is explicitly
+  "publish a **same-layer** replacement" (`expert_cache.hpp:138`).  Occupancy per layer is therefore **frozen at
+  seed time** and only the *contents* rotate.
+- A true cross-layer LRU means letting one layer's slots be taken by another when its experts are hotter - a change
+  to `ExpertCache`'s ownership model (`residency_` is a per-layer table, slots are addressed per layer) plus a
+  global victim search, inside a class shared with the Qwen and MiMo engines.  Per the standing rule that shared
+  files take only backward-compatible additions, this needs Mal's decision before it is written - the safe form is
+  an opt-in `--slots-global` mode so nothing that exists today changes behaviour.
