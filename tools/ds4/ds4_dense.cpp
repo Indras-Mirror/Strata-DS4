@@ -658,6 +658,7 @@ static bool vis_dev_on();  // DS4_VIS_DEV, ditto
 static int64_t idx_block_n(int64_t n);   // DS4_IDX_BLOCK, ditto
 static int64_t raw_block_n(int64_t n);   // DS4_RAW_BLOCK, ditto
 static bool fused_idx_on(bool cpu);     // DS4_FUSED_IDX, ditto
+static bool ovl_gather_on();            // DS4_OVL_GATHER, ditto
 
 static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_t n, Ds4Dense::Impl::Layer & L,
                                bool emit = true) {
@@ -682,6 +683,12 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
     const float crb = (float) im.g.compress_rope_base;
 
     auto first = [&](ggml_tensor * t, int64_t ne) { return ggml_view_1d(gc, t, ne, 0); };
+    // a 2-D view of `t`: a free reshape when it is already contiguous (most matmul / rope / set_rows results, and a
+    // permute that only moves a size-1 axis), a CONT copy otherwise.  Same bits either way; the copies were ~10 of the
+    // ~27 CONT nodes of a decode CSA layer (op census, s35).
+    auto flat2 = [&](ggml_tensor * t, int64_t ne0, int64_t ne1) {
+        return ggml_is_contiguous(t) ? ggml_reshape_2d(gc, t, ne0, ne1) : ggml_cont_2d(gc, t, ne0, ne1);
+    };
     ggml_tensor * pos = first(im.i_pos, n);
 
     // ---- attention hyper-connection -------------------------------------------------
@@ -716,10 +723,10 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
     };
     ggml_tensor * raw_src = nullptr;
     if (!im.pf) {
-        ggml_tensor * raw2 = ggml_set_rows(gc, L.raw, ggml_cont_2d(gc, kv, DH, n), first(L.i_slot_raw, n));
+        ggml_tensor * raw2 = ggml_set_rows(gc, L.raw, flat2(kv, DH, n), first(L.i_slot_raw, n));
         raw_src = ggml_get_rows(gc, raw2, first(L.i_idx_raw, n_raw));   // [DH, n_raw] oldest -> newest
     } else {
-        ggml_tensor * kv2 = ggml_cont_2d(gc, kv, DH, n);
+        ggml_tensor * kv2 = flat2(kv, DH, n);
         raw_src = ggml_get_rows(gc, ggml_concat(gc, L.raw, kv2, 1), first(L.i_idx_raw, n_raw));
         tail_into(L.raw, kv2, im.RAW, L.i_slot_raw);
     }
@@ -764,8 +771,8 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
                 ggml_tensor * ape = ggml_get_rows(gc, b.BL(il, pfx + "_ape.weight"), state_pos);
                 st_sc = ggml_add(gc, st_sc, ape);
 
-                ggml_tensor * skv = ggml_cont_2d(gc, st_kv, 2 * head_dim, n);
-                ggml_tensor * ssc = ggml_cont_2d(gc, st_sc, 2 * head_dim, n);
+                ggml_tensor * skv = flat2(st_kv, 2 * head_dim, n);
+                ggml_tensor * ssc = flat2(st_sc, 2 * head_dim, n);
                 ggml_tensor * rkv, * rsc;
                 if (!im.pf) {
                     rkv = ggml_set_rows(gc, ring_kv, skv, slot_st);
@@ -781,22 +788,33 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
                     tail_into(ring_kv, skv, L.ring_sz, L.i_slot_state);
                     tail_into(ring_sc, ssc, L.ring_sz, L.i_slot_state);
                 }
-                ggml_tensor * rows_kv = ggml_reshape_3d(gc, ggml_get_rows(gc, rkv, idx_st), 2 * head_dim, 2 * ratio, n);
-                ggml_tensor * rows_sc = ggml_reshape_3d(gc, ggml_get_rows(gc, rsc, idx_st), 2 * head_dim, 2 * ratio, n);
-
-                const size_t nb1 = rows_kv->nb[1], nb2 = rows_kv->nb[2];
-                const size_t cur_off = (size_t) ratio * nb1 + (size_t) head_dim * 4;
-                ggml_tensor * pkv = ggml_cont(gc, ggml_view_3d(gc, rows_kv, head_dim, ratio, n, nb1, nb2, 0));
-                ggml_tensor * ckv = ggml_cont(gc, ggml_view_3d(gc, rows_kv, head_dim, ratio, n, nb1, nb2, cur_off));
-                ggml_tensor * psc = ggml_cont(gc, ggml_view_3d(gc, rows_sc, head_dim, ratio, n, nb1, nb2, 0));
-                ggml_tensor * csc = ggml_cont(gc, ggml_view_3d(gc, rows_sc, head_dim, ratio, n, nb1, nb2, cur_off));
-                ggml_tensor * values = ggml_concat(gc, pkv, ckv, 1);          // [hd, 2*ratio, n]
-                ggml_tensor * scores = ggml_concat(gc, psc, csc, 1);
+                ggml_tensor * values, * scores;                               // [hd, 2*ratio, n]
+                if (ovl_gather_on()) {
+                    // DS4_OVL_GATHER (default on): the ring seen as [hd, 2 * slots] - state row s's prev half is
+                    // half-row 2s, its cur half 2s+1 - and the host index list already names the half each of the
+                    // 2*ratio gathered rows needs (2*slot for the first ratio, 2*slot+1 for the rest), so one
+                    // get_rows lands the values in place: the same bits as gather + 4 strided conts + 2 concats
+                    values = ggml_reshape_3d(gc, ggml_get_rows(gc, ggml_reshape_2d(gc, rkv, head_dim, 2 * rkv->ne[1]),
+                                                               idx_st), head_dim, 2 * ratio, n);
+                    scores = ggml_reshape_3d(gc, ggml_get_rows(gc, ggml_reshape_2d(gc, rsc, head_dim, 2 * rsc->ne[1]),
+                                                               idx_st), head_dim, 2 * ratio, n);
+                } else {
+                    ggml_tensor * rows_kv = ggml_reshape_3d(gc, ggml_get_rows(gc, rkv, idx_st), 2 * head_dim, 2 * ratio, n);
+                    ggml_tensor * rows_sc = ggml_reshape_3d(gc, ggml_get_rows(gc, rsc, idx_st), 2 * head_dim, 2 * ratio, n);
+                    const size_t nb1 = rows_kv->nb[1], nb2 = rows_kv->nb[2];
+                    const size_t cur_off = (size_t) ratio * nb1 + (size_t) head_dim * 4;
+                    ggml_tensor * pkv = ggml_cont(gc, ggml_view_3d(gc, rows_kv, head_dim, ratio, n, nb1, nb2, 0));
+                    ggml_tensor * ckv = ggml_cont(gc, ggml_view_3d(gc, rows_kv, head_dim, ratio, n, nb1, nb2, cur_off));
+                    ggml_tensor * psc = ggml_cont(gc, ggml_view_3d(gc, rows_sc, head_dim, ratio, n, nb1, nb2, 0));
+                    ggml_tensor * csc = ggml_cont(gc, ggml_view_3d(gc, rows_sc, head_dim, ratio, n, nb1, nb2, cur_off));
+                    values = ggml_concat(gc, pkv, ckv, 1);
+                    scores = ggml_concat(gc, psc, csc, 1);
+                }
                 values = ggml_cont(gc, ggml_permute(gc, values, 1, 0, 2, 3)); // [2*ratio, hd, n]
                 scores = ggml_cont(gc, ggml_permute(gc, scores, 1, 0, 2, 3));
                 ggml_tensor * wts = ggml_soft_max(gc, scores);
                 ggml_tensor * cc = ggml_sum_rows(gc, ggml_mul(gc, values, wts));
-                cc = ggml_cont(gc, ggml_permute(gc, cc, 1, 0, 2, 3));         // [hd, 1, n]
+                cc = ggml_reshape_3d(gc, cc, head_dim, 1, n);                 // [1, hd, n] -> [hd, 1, n]: same order
                 cc = b.rms_w(cc, b.BL(il, pfx + "_norm.weight"));
                 return b.rope_at(cc, comp_pos, DHR, head_dim - DHR, n_ctx, crb,
                                  freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
@@ -807,8 +825,8 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             // lightning indexer: compressed keys (post-WHT) + query, then top-k over the visible blocks, per query
             ggml_tensor * icomp2 = L.icomp;   // !emit: the block keys as they are (the current block is invisible)
             if (ggml_tensor * lk = overlap("indexer_compressor", im.IDXK, L.ist_kv, L.ist_sc)) {
-                ggml_tensor * lid_k = b.hadamard(ggml_cont(gc, lk), im.rot);
-                icomp2 = ggml_set_rows(gc, L.icomp, ggml_cont_2d(gc, lid_k, im.IDXK, n), first(L.i_slot_comp, n));
+                ggml_tensor * lid_k = b.hadamard(ggml_is_contiguous(lk) ? lk : ggml_cont(gc, lk), im.rot);
+                icomp2 = ggml_set_rows(gc, L.icomp, flat2(lid_k, im.IDXK, n), first(L.i_slot_comp, n));
             }
             // ds4_ref's lid_k is 3-D [idx_k, 1, n_blocks]; this 3-D view of the ring's first `cap`
             // columns has the same shape, so the permute below lands `cap` on ne[1] exactly like the
@@ -920,8 +938,8 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             ggml_tensor * ape = ggml_get_rows(gc, b.BL(il, "attn_compressor_ape.weight"), state_pos);
             st_sc = ggml_add(gc, st_sc, ape);
 
-            ggml_tensor * skv = ggml_cont_2d(gc, st_kv, DH, n);
-            ggml_tensor * ssc = ggml_cont_2d(gc, st_sc, DH, n);
+            ggml_tensor * skv = flat2(st_kv, DH, n);
+            ggml_tensor * ssc = flat2(st_sc, DH, n);
             ggml_tensor * rkv, * rsc;
             if (!im.pf) {
                 rkv = ggml_set_rows(gc, L.st_kv, skv, slot_st);
@@ -940,7 +958,7 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
                 ggml_tensor * scores = ggml_cont(gc, ggml_permute(gc, rows_sc, 1, 0, 2, 3));
                 ggml_tensor * wts = ggml_soft_max(gc, scores);
                 ggml_tensor * cc = ggml_sum_rows(gc, ggml_mul(gc, values, wts));  // [1, DH, n]
-                cc = ggml_cont(gc, ggml_permute(gc, cc, 1, 0, 2, 3));             // [DH, 1, n]
+                cc = ggml_reshape_3d(gc, cc, DH, 1, n);                           // [1, DH, n] -> [DH, 1, n]
                 cc = b.rms_w(cc, b.BL(il, "attn_compressor_norm.weight"));
                 comp_k = b.rope_at(cc, comp_pos, DHR, DH - DHR, n_ctx, crb,
                                    freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
@@ -949,8 +967,8 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
         }
 
         // comp_rot: rotate each row before it is rounded into the cache, and back after it is read (H = H^-1)
-        ggml_tensor * comp2 = comp_k ? ggml_set_rows(gc, L.comp, im.comp_rot ? b.hadamard(ggml_cont_2d(gc, comp_k, DH, n), im.rot)
-                                                                            : ggml_cont_2d(gc, comp_k, DH, n),
+        ggml_tensor * comp2 = comp_k ? ggml_set_rows(gc, L.comp, im.comp_rot ? b.hadamard(flat2(comp_k, DH, n), im.rot)
+                                                                            : flat2(comp_k, DH, n),
                                                      first(L.i_slot_comp, n))
                                      : L.comp;   // !emit: no block completes here
         if (sel) {   // sparse: the gathered rows (ascending block order)
@@ -1021,7 +1039,9 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
 
     // the gate's attn_raw tap: ds4_ref dumps the raw flash-attn output *before* the de-RoPE
     // (its attn_csa_lid / attn_hca probe is named at the flash-attn result, not after rope_back)
-    ggml_tensor * attn_raw = ggml_cont_2d(gc, out, NH * DH, n);
+    // (decode with gate_taps only: it and the t_attn copy were ~3 nodes per layer every token for nobody)
+    const bool taps = !im.pf && !L.host_attn_raw.empty();
+    ggml_tensor * attn_raw = taps ? ggml_cont_2d(gc, out, NH * DH, n) : nullptr;
 
     // de-RoPE then grouped output LoRA
     out = ggml_reshape_3d(gc, out, DH, NH, n);
@@ -1032,7 +1052,7 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
     if (ggml_n_dims(wo_a) == 2) wo_a = ggml_reshape_3d(gc, wo_a, OGD, OL, OG);
     ggml_tensor * oa = ggml_mul_mat(gc, wo_a, out);                          // [OL, n, OG]
     oa = ggml_permute(gc, oa, 0, 2, 1, 3);
-    oa = ggml_cont_2d(gc, oa, OL * OG, n);
+    oa = flat2(oa, OL * OG, n);   // n == 1: the permute only moved a size-1 axis
     ggml_tensor * attn_out = ggml_mul_mat(gc, b.BL(il, "attn_output_b.weight"), oa);   // [D, n]
 
     // ---- feed-forward hyper-connection -------------------------------------------------
@@ -1088,11 +1108,11 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
     ggml_tensor * c_pf  = ggml_cpy(gc, post_f, cols2(L.post_f, HC));   // [HC, n], a strided view of mixes
     ggml_tensor * c_cf  = ggml_cpy(gc, ggml_reshape_3d(gc, comb_f, HC, HC, n), cols3(L.comb_f, HC, HC));
     ggml_tensor * c_sh  = ggml_cpy(gc, ggml_reshape_2d(gc, shexp, D, n), cols2(L.shexp, D));
-    ggml_tensor * c_ar  = im.pf ? nullptr : ggml_cpy(gc, attn_raw, cols2(L.t_attn_raw, NH * DH));
-    ggml_tensor * c_at  = im.pf ? nullptr : ggml_cpy(gc, ggml_reshape_2d(gc, attn_out, D, n), cols2(L.t_attn, D));
+    ggml_tensor * c_ar  = taps ? ggml_cpy(gc, attn_raw, cols2(L.t_attn_raw, NH * DH)) : nullptr;
+    ggml_tensor * c_at  = taps ? ggml_cpy(gc, ggml_reshape_2d(gc, attn_out, D, n), cols2(L.t_attn, D)) : nullptr;
 
     for (ggml_tensor * t : { c_fn, c_hap, c_pf, c_cf, c_sh }) ggml_build_forward_expand(gf, t);
-    if (!im.pf) for (ggml_tensor * t : { c_ar, c_at }) ggml_build_forward_expand(gf, t);   // gate taps (decode only)
+    if (taps) for (ggml_tensor * t : { c_ar, c_at }) ggml_build_forward_expand(gf, t);   // gate taps (decode only)
     ggml_build_forward_expand(gf, selected);
     ggml_build_forward_expand(gf, wts);
     ggml_build_forward_expand(gf, ggml_cpy(gc, selected,   // [NUSED, n], a top-k view: strided for n > 1
@@ -1573,6 +1593,14 @@ static bool fused_idx_on(bool cpu) {
     return v < 0 ? !cpu : v != 0;
 }
 
+// DS4_OVL_GATHER (default on): the CSA overlap compressor gathers its prev/cur state halves with one get_rows over
+// half-rows (the host writes 2*slot / 2*slot+1 into i_idx_state for CSA layers) instead of whole rows + 4 strided
+// conts + 2 concats.  DS4_OVL_GATHER=0 restores the old graph and host indices for an A/B (same bits).
+static bool ovl_gather_on() {
+    static const bool on = [] { const char * e = std::getenv("DS4_OVL_GATHER"); return !e || std::atoi(e) != 0; }();
+    return on;
+}
+
 // DS4_RAW_BLOCK (default 64, 0 = all queries in one flash-attn): how many queries attend together over their union raw
 // window (build_attn's attention section).  n <= block builds the single-call graph.
 static int64_t raw_block_n(int64_t n) {
@@ -1735,9 +1763,11 @@ bool Ds4Dense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
                 const bool later_same = t + 1 < n && (pt + 1) / Ly.ratio == bl;
                 sc[(size_t) t]  = (int32_t) (later_same ? Ly.comp_max : bl);
                 ss[(size_t) t]  = (int32_t) (pt % Ly.ring_sz);    // token slot in the compressor state ring
+                const bool half = Ly.csa && ovl_gather_on();   // DS4_OVL_GATHER: half-row indices
                 for (int64_t i = 0; i < Ly.ring; ++i) {
                     const int64_t tok = pt - Ly.ring + 1 + i;
-                    sidx[(size_t) (t * Ly.ring + i)] = (int32_t) (((tok % Ly.ring_sz) + Ly.ring_sz) % Ly.ring_sz);
+                    const int32_t slot = (int32_t) (((tok % Ly.ring_sz) + Ly.ring_sz) % Ly.ring_sz);
+                    sidx[(size_t) (t * Ly.ring + i)] = half ? 2 * slot + (i >= Ly.ratio ? 1 : 0) : slot;
                 }
                 const int64_t nv = (pt + 1) / Ly.ratio;           // complete blocks query t may see
                 if (vdev) nvis[(size_t) t] = (int32_t) nv;
@@ -2152,7 +2182,11 @@ bool Ds4Dense::prefill_begin(const int * tids, int n, int pos0) {
             cpp[(size_t) t] = (int32_t) (r * bl);
             const bool later_same = t + 1 < n && (pt + 1) / r == bl;   // a later token of the chunk owns the row
             sc[(size_t) t]  = (int32_t) (later_same ? L->comp_max : bl);
-            for (int64_t i = 0; i < L->ring; ++i) sidx[(size_t) (t * L->ring + i)] = ext(pt - L->ring + 1 + i, L->ring_sz);
+            const bool half = L->csa && ovl_gather_on();   // DS4_OVL_GATHER: half-row indices
+            for (int64_t i = 0; i < L->ring; ++i) {
+                const int32_t slot = ext(pt - L->ring + 1 + i, L->ring_sz);
+                sidx[(size_t) (t * L->ring + i)] = half ? 2 * slot + (i >= r ? 1 : 0) : slot;
+            }
             const int64_t nv = (pt + 1) / r;
             if (vis_dev_on()) nvis[(size_t) t] = (int32_t) nv;
             else for (int64_t i = 0; i < nv && i < cap; ++i) vis[(size_t) (t * cap + i)] = 0.0f;
