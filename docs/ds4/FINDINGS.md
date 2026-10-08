@@ -609,3 +609,24 @@ Where the 15.3 s for 5996 tokens goes now: experts 8.4 s (DMA-bound: ~74 GB per 
 ~590 cudaMalloc, raw window computed as one masked [SWA+n-1, n] attention), seed 0.8 s.
 Not done: chunked prefill with `--mtp` (MTP window), decode after a 6K prompt is 16 tok/s (fewer slots: longer
 context reserves more graph VRAM; hit 66%) - look at that next.
+
+## 21. Decode 23.3 -> 24.9 tok/s; MTP verify measured on CUDA - slower (2026-10-08 night, `bench/ds4-2026-10-08/`)
+
+Interleaved A/B pairs (same binary, env/flag toggled) - single runs swing ~1 tok/s:
+- Shared decode graph arena (923a293): 554 MiB -> 2.7 MiB of compute buffers at p600 (1.26 GiB -> 7 MiB at 6K
+  context), +120 slots, hit +1.7 points, decode 23.28/22.59 -> 23.80/23.97.
+- Compressed-row skip (9f86095): attention+router 16.4 -> 15.5 ms/token (all runs), ppl 10.55, decode within noise.
+- `--f16-q8` (9eb00ee): +60 slots, attention 15.6 -> 15.2 ms, ppl unchanged (10.46-10.52 -> 10.50-10.52).
+- `--pf-b 0.7` (batch 11): 57 -> 28 prefetches/token at 85% hit (the unused ones held the H2D copy engine) +5%.
+- `--skip-miss` 0.05 within noise; 0.10 +5% ppl (not recommended).
+- Best config now (quiet box): `--vram-lru --pf-b 0.7 --f16-q8 --arena-skip-resident --arena-gib 58` = **24.85 /
+  24.94 tok/s** (2442 slots, hit 83.4%, attention 15.0 ms, experts 21 ms).
+
+Dense half on the GPU (nsys `--cuda-graph-trace=node`, dec-nodes): 15.5 ms/token of kernels in ~5,500 launches:
+Q6_K matvecs 5.5 ms (258), F16 matvecs 2.2 ms (375, now partly Q8_0), ~5,000 small ops at ~1.3 us. Fusion is the
+remaining lever there.
+
+MTP verify on CUDA (batch 17): 18.9 / 20.6 tok/s vs 24.9 plain - 1.61-1.67 tokens/pass, but the 2-token pass reads
+2.2x the experts (46 vs 21 ms), run_multi has no VRAM LRU, the verify graph margin costs ~170 slots (hit 83 -> 73%),
+drafts 10.6-13.7 ms (MTP experts on the CPU, even resident). Best case with all three fixed ~28 tok/s.
+Acceptance with the MTP's own hc_head, experts resident: 67.7% (drafts-only run), 60.8-68.4% under verify.
