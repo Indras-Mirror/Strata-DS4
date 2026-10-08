@@ -17,7 +17,10 @@ Q8_0; (3) `--comp-q8` at 128K (its ppl cost is measured, its slot gain is not); 
 obtained** (killed to free the GPU; one command: `bash bench/ds4-2026-10-08/llamacpp-ctx.sh`); (5) 256K end to end
 (`ctx/ctx262144.i32` is built, never run - use `--vram-margin 2.0`, s30); (6) **the cross-layer LRU needs Mal's
 decision** (it changes `ExpertCache`'s slot ownership, a class shared with Qwen/MiMo; the additive form is an opt-in
-`--slots-global`). Sparse CSA gather (17cab42) and the long-prompt builder (`tools/ds4/make_ctx_prompts.py` ->
+`--slots-global`). **KV quantization/streaming (s34):** `icomp` as Q8_0, then `comp`+`icomp` in pinned RAM (constant ~11 MB/token -
+the decode gather is a fixed 512 rows, so streaming is free for us in a way it is not for Qwen's dense KV), then
+TBQ4 - which needs a Hadamard rotation before rounding (llama.cpp's DSV4 already stores TBQ3/TBQ4 in all four
+caches; `DSV4_CTK_COMP=tbq4_0` prices it without a port). Sparse CSA gather (17cab42) and the long-prompt builder (`tools/ds4/make_ctx_prompts.py` ->
 `bench/ds4-2026-10-08/ctx/ctx{N}.i32`, +`.txt`, git-ignored) are done.
 Priority 2 = speculative decode: `--mtp-keep 2` + VRAM LRU in run_multi + verify margin calibration; then DSpark.
 Tools: queue GPU runs with `bench/ds4-2026-10-08/q.sh <log> <args>` (env DS4_BIN=<snapshot in bench/ds4-2026-10-08/bin/>,
