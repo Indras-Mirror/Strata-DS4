@@ -51,6 +51,41 @@ Chunked prefill is longer-prompt-faster: each chunk streams every expert of ever
 the cost per token falls as the chunk fills. It uses MMQ (int8 tensor cores) for the expert products, so perplexity
 moves by ~0.3% (6.38 -> 6.39-6.41 on the 3K prompt); without `--chunk-mmq` it is the decode math.
 
+**Long context** (2026-10-08/09)
+
+Measured up to a 128K-token real document (chunked prefill 4096); 256K loads and decodes. DeepSeek-V4's
+compressed sparse attention makes long context cheap in principle - each CSA layer attends to a fixed 512 compressed
+blocks chosen by its lightning indexer - but the indexer itself scores every block, and that was the cost that grew:
+
+| position | prefill | attention+router per token, before -> now | decode before | decode now |
+| --- | ---: | ---: | ---: | ---: |
+| 600 | (decode loop) | 15.5 ms -> 15.9 ms | 25.0 tok/s | 23.7-25.3 tok/s |
+| 16,384 | 466 tok/s | 28.7 ms -> - | 12.7 tok/s | not re-measured yet |
+| 131,072 | 248 tok/s | 48.1 / 38.2 ms -> **17.1-18.7 ms** | 10.4 tok/s | **19.0-22.4 tok/s** (probe, upper bound) |
+| 262,144 | - | -> 18.5 ms | - | **21.8 tok/s** (probe, upper bound) |
+
+- "Now" = the fused lightning-indexer kernel (one CUDA kernel for score + ReLU + head weights + mask instead of a
+  ~9-op chain with two `[blocks x 64]` copies, on by default off-CPU) and an O(512) instead of O(blocks) sparse row
+  selection. The attention column is real; the "now" decode totals come from a `--pos-offset` probe (decoding at a deep
+  position over empty caches), whose expert hit rate is a short prompt's (~80%) rather than a long document's
+  (53-63% measured), so a real 128K document will land between the two columns. A real-document re-run is next.
+- Prefill at 128K was 73% dense-half time; query-blocked raw-window attention (`DS4_RAW_BLOCK`) is in but its long
+  prefill timing is not measured yet.
+
+**Compressed KV cache options** (the CSA/HCA compressed-key caches; quality on the 600-token prompt):
+
+| `--comp-type` | bytes vs F32 | perplexity |
+| --- | ---: | ---: |
+| `f32` (default) | 1x | 10.4468 |
+| `q8_0` + `--icomp-q8` | ~0.27x | 10.5031 (+0.54%) |
+| **`iq4_nl` + `--icomp-q8`** (recommended for long context) | ~0.14x | **10.5090 (+0.60%)** |
+| `q4_0` + `--icomp-q8` | ~0.14x | 10.5358 (+0.85%) |
+
+Below 8 bits the rows are Walsh-Hadamard rotated (128-blocks) before rounding and after the gather (`--comp-rot`
+forces it either way); that is why 4-bit costs barely more than 8-bit here. At 256K the 4-bit caches give back a few
+GB of VRAM, i.e. a few hundred more expert slots. `--comp-host` keeps the cache in pinned RAM (zero-copy reads); it
+works, but at 256K it costs ~3 ms/token for +62 slots - only worth it beyond ~512K.
+
 The first token's logits match llama.cpp's (same top-1; KL 0.03-0.10, which is the difference between the GPU's and
 the CPU's 8-bit activation rounding).
 
@@ -109,7 +144,9 @@ Useful flags: `--slots N|auto` (VRAM expert cache), `--arena-gib` (pinned RAM ar
 `--pcie F` (share of misses sent over PCIe), `--pf-b` (predicted prefetch per layer), `--dense-requant q4_k|q5_k|q6_k`,
 `--vram-lru` (misses take the layer's least-recently-used VRAM slot), `--arena-skip-resident` (the VRAM-seeded
 experts stay out of the RAM arena), `--prefill-chunk N` / `--chunk-mmq` / `--chunk-prestage` (prefill),
-`--route-bias D` and `--skip-miss T` (lossy, see below), `--mtp FILE [--verify]` (DeepSeek-V4's MTP draft head:
+`--comp-type f32|q8_0|q5_0|q4_0|iq4_nl` / `--icomp-q8` / `--comp-rot 0|1` / `--comp-host` (compressed KV cache,
+see above), `--pos-offset N` (decode-timing probe at a deep position, no prefill), `--route-bias D` and
+`--skip-miss T` (lossy, see below), `--mtp FILE [--verify]` (DeepSeek-V4's MTP draft head:
 63% acceptance measured; `--verify` is CPU-tested, not yet tuned on CUDA, and chunked prefill does not fill the MTP
 window yet), `--ppl` (perplexity of the prompt), `--dump-logits`, `--temp`, `--ctx`.
 
@@ -138,8 +175,12 @@ resolve toward the cache. It trades quality for speed - measured: 0.05 → +9% d
 
 - **MTP verification on CUDA**: the head drafts at 63% acceptance here (74-93% reported elsewhere); at that rate
   depth 1 is worth ~+10%, deeper drafts lose (each costs ~9 ms and more expert reads).
-- Decode after long prompts (16 tok/s at 6K context: the hit rate falls to ~63%) and the dense half's ~5,000 small
-  kernels per token (attention+router is ~15.5 ms against a ~6 ms weight-read floor).
+- Long-context decode on a real document (the probe numbers above are an upper bound): the expert hit rate falls to
+  53-63% on long documents; a cross-layer expert cache is the candidate fix.
+- The dense half's ~4,500 small kernels per token (attention+router is ~15.5 ms against a ~6 ms weight-read floor).
+  In progress: 2026-10-09 cut a CSA layer from 121 to ~107 kernels per token (161 -> 130 when a block completes;
+  attention+router 16.5 -> 16.0 ms in the first A/B), all bit-exact on the CPU gates; an nsys profile decides what
+  is kernel time and what is launch gaps.
 - DSpark (0731's native 5-token drafter) and n-gram drafting on the same verification path.
 - A server (OpenAI-compatible) and a merge back into a single multi-model Strata; a MiMo-V2.6-Flash engine is next.
 
