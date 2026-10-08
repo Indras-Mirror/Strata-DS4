@@ -94,6 +94,18 @@ __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ 
     h[i] = g / (1.0f + __expf(-g)) * u;
 }
 
+// DeepSeek-V4's SwiGLU clamp, exactly as the native expert kernels apply it (iq_kernels.cu): gate <= lim, |up| <= lim
+__global__ void swiglu_clamp_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int64_t n_ff,
+                                    bool interleaved, float lim) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * n_ff) return;
+    const int64_t r = i / n_ff, k = i % n_ff;
+    const float* row = gu + r * 2 * n_ff;
+    const float g = fminf(interleaved ? row[2 * k] : row[k], lim);
+    const float u = fminf(fmaxf(interleaved ? row[2 * k + 1] : row[n_ff + k], -lim), lim);
+    h[i] = g / (1.0f + __expf(-g)) * u;
+}
+
 __global__ void iota_kernel(int32_t* dst, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = (int32_t) i;
@@ -260,6 +272,12 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
     if (rows <= 0) return;
     swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved);
     ck(cudaGetLastError(), "swiglu");
+}
+
+void swiglu_clamp(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, float limit, void* stream) {
+    if (rows <= 0) return;
+    swiglu_clamp_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved, limit);
+    ck(cudaGetLastError(), "swiglu_clamp");
 }
 
 void iota(int32_t* dst, int64_t n, void* stream) {

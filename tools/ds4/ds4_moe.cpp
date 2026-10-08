@@ -966,8 +966,9 @@ bool Ds4MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
             v = -2 - r++;   // rank 0 -> -2 (most recent of the seeds), the last seeded -> the oldest
         }
     };
-    if (im_->mixed_sizes) {
-        // MiMo: the same admissions in the same order, but the copies overlap - arena blobs queued straight from the
+    if (im_->mixed_sizes || !std::getenv("DS4_SERIAL_SEED")) {
+        // MiMo (and DS4 since 2026-10-08: the serial seed below took 8 s for 2226 slots after chunked prefill): the
+        // same admissions in the same order, but the copies overlap - arena blobs queued straight from the
         // pinned arena, file-tier blobs read by 8 threads into pinned buffers (the serial seed read one blob at a time:
         // ~7 s for ~1850 experts after a prompt).  Same slots, same bytes.
         strata::core::ExpertCache& cache = *im_->gpu->cache;
@@ -1838,7 +1839,7 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         int8_t& ok = gp.m_ok[(size_t) layer];
         if (ok < 0) {
             ok = mmq::fits(gt, GL.n_ff) && mmq::fits(ut, GL.n_ff) && mmq::fits(dt, GL.n_embd) &&
-                 !std::isfinite(GL.swiglu_limit) && GL.up_off % 2 == 0 && GL.down_off % 2 == 0;
+                 GL.up_off % 2 == 0 && GL.down_off % 2 == 0;   // a finite swiglu_limit: mmq::swiglu_clamp
             if (!ok) std::fprintf(stderr, "ds4_moe: run_chunk: layer %lld stays on MMVQ (types %d/%d/%d)\n",
                                   (long long) layer, gt, ut, dt);
         }
@@ -1955,7 +1956,10 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         gp.m_ctx->run(p, gp.s);
         p.w = base + GL.up_off; p.type = ut; p.xq = ut != gt ? gp.m_xu : gp.m_xg; p.dst = (float*) gp.m_gu + FF;
         gp.m_ctx->run(p, gp.s);
-        mmq::swiglu((const float*) gp.m_gu, (float*) gp.m_h, R, FF, false, gp.s);
+        if (std::isfinite(GL.swiglu_limit))   // DeepSeek-V4 (every layer clamps at 10)
+            mmq::swiglu_clamp((const float*) gp.m_gu, (float*) gp.m_h, R, FF, false, GL.swiglu_limit, gp.s);
+        else
+            mmq::swiglu((const float*) gp.m_gu, (float*) gp.m_h, R, FF, false, gp.s);
         mmq::quantize((const float*) gp.m_h, nullptr, gp.m_xd, dt, FF, FF, R, gp.s);
         p.w = base + GL.down_off; p.type = dt; p.w_rows = H; p.w_cols = FF; p.xq = gp.m_xd;
         p.ids = (const int32_t*) gp.c_dst + r0; p.dst = (float*) gp.c_parts; p.ld_dst = H;
