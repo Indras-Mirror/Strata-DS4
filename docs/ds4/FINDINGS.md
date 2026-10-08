@@ -862,3 +862,47 @@ that would settle it is the scaling curve (attention+router should step up as ca
 the 16K/32K/128K points are measured next.  If it is the gather's argsort, the fix is to sort only the `ntk` = 512
 indices the indexer already selected (O(ntk log ntk)) instead of re-sorting the whole mask - but that must keep the
 ascending-block-order property the CPU bit-exactness gate checks against the masked path.
+
+## 29. External cross-check: FreeToken (arXiv 2608.16157) hits the same numbers for DSV4 (2026-10-08)
+
+FreeToken ["Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution"](https://arxiv.org/abs/2608.16157)
+(Yang et al., Aug 2026) is a serving stack for exactly our problem - it names the 284B model on a gaming desktop and
+reports DeepSeek-V4-Flash MXFP4 numbers.  Three parts of it bear on this engine.
+
+**1. It validates our tier, and suggests one concrete change.**  At equal capacity FreeToken misses "16% (Qwen3.6)
+and 39% (DSV4-Flash)" of decode expert reads against KTransformers' 41%/59% and llama.cpp's load-time static split
+62%/89%.  Our 64K run misses **39.3%** (hit 60.7%) - the same figure for the same model - but at 2196/11008 = 20%
+of the pool resident, where theirs is "11% of DSV4-Flash's pool at RTX 5090 capacity".  Their mechanism is a
+**single LRU residency space shared by all MoE layers** ("the remaining GPU memory becomes one elastic cache"),
+tracked per `(layer, expert)`, one slot holding all of a pair's tensors.  Ours is `--vram-lru` **per layer** (a miss
+takes the LRU slot *of its layer*, `fb3a315`).  s2's "+0.3 points for global over per-layer" was about *static
+profile ranking*, not recency - it does not test this - so a cross-layer LRU is worth measuring: it is the
+difference between 39% and (their) 39% at half the residency.  Cheap to try in `Ds4MoeTier`'s eviction policy.
+
+**2. A rule for the constant we hand-tuned.**  Their bandwidth-adaptive split derives the number of misses to fill
+over PCIe as `q* ~= m * B_P / B_H` (B_P = measured pinned transfer GB/s, B_H = measured host CPU expert GB/s),
+rounded per layer, identity left to the cache policy.  Table 1 measures a 4090 as (B_P, B_H) = **(25.1, 63.2)
+GB/s** -> q* ~= 0.40.  Our box measured (s12, `bw_contend.cu`) B_H ~= 23.3 and B_P ~= 23.7 GB/s (they share the
+DDR4 bus: both at once 29.9 GB/s), so the same rule gives q* ~= 0.5 - which is where `--pcie 0.55` was found by
+sweep.  So our constant is right for this host and the formula lets it be computed instead of swept; on a host with
+8-channel memory the same card would want 0.40, which is why the number is not a property of the 4090.
+
+**3. Their prefill is a PCIe-generation number, and their long-context decode is not a long-context number.**
+They stream an 8192-token chunk in 1.19-1.22 s (6.7k tok/s at 16K tokens) = the 64.4 GB pool at 52.7 GB/s, i.e. a
+PCIe 5.0 x16 ceiling; ours is PCIe 4.0 and measures ~17 GB/s of DMA (466 tok/s at 16K, 244 at 64K).  Their
+DSV4-Flash decode, 22-25 tok/s, is on a rented RTX **5090 (32 GB) server** host at agentic context - the paper gives
+no desktop tok/s for 284B and no long-context decode at all, so **our 13.1 tok/s at position 65536 remains the only
+long-context DSV4 number we know of**.  Their KV strategy at long context is *rebalancing* the VRAM split between
+KV pages and expert slots at runtime (no KV quantization) plus prefix-tree checkpoints - the opposite of our plan
+(b)/(e) (shrink the caches), which is the better fit for 1M context where the split is static anyway.
+
+**The 16K curve point, and a correction to s28's attribution.**  `b21-ctx16384.log`: prefill 16384 tokens in 35.15 s
+= **466.17 tok/s** (no `--ppl`; the 6K figure was 392, so the ppl readback really was the 64K slowdown), decode
+**12.71 tok/s**, attention+router **28.71 ms**, experts 45.22 ms (hit **54.3%**, slots 2304).  So attention+router
+against cap (256 at p600, 4096 here, 16384 at 64K) is 15.47 -> 28.71 -> 36.16 ms: **sub-linear, close to
+logarithmic in cap**, which fits the two `O(cap log cap)` sorts better than an `O(cap)` score computation - s28's
+"should step up as cap doubles" was a hypothesis, and the first point already refines it (the 32K point is running).
+The expert numbers at 16K are **confounded by content**: the first 16K tokens are `docs/ds4/*.md` (markdown prose),
+the 64K prompt is the whole corpus (prose + code), and the static profile seed scores differently on each - so the
+hit rate at 16K (54.3%) being *worse* than at 64K (60.7%) with *more* slots (2304 vs 2196) is a routing-distribution
+effect, not a context effect.  Compare decode across contexts only with the caveat, or use one prompt truncated.
