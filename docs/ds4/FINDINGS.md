@@ -931,3 +931,42 @@ grows with `cap` (`cap = next_pow2(pos/4+1)`: 8192 at 32K, 16384 at 64K, 32768 a
 `cap * n * 4` bytes each).  0.9 GiB was enough at 64K's 2196 slots by luck and not at 32K's 2255; `batch21b.sh`
 re-runs 32K and 128K with `--vram-margin 2.0`.  **A real fix, not a bigger constant:** `--slots auto` should size
 its margin from the capture the largest reachable `cap` needs, not a fixed GiB.
+
+## 31. The long-context scaling curve, and it says the attention side is now the bottleneck (2026-10-08)
+
+All points: chunked prefill 4096 + `--chunk-mmq --chunk-prestage --vram-lru --pf-b 0.7`, `--slots auto`, prompts
+are prefixes of the same corpus (`ctx/ctx<N>.i32`), 16 greedy tokens after the prompt.  p600 is the s21 config
+(`--arena-skip-resident --arena-gib 58`) via the b20 A/B.
+
+| position | prefill tok/s | decode tok/s | attention+router ms/tok | experts ms/tok | hit | slots | cap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 600 | 21.9 (decode loop) | **24.96** | 15.47 | 20.49 | 83.4% | 2442 | 256 |
+| 16,384 | **466.17** | 12.71 | 28.71 | 45.22 | 54.3% | 2304 | 4096 |
+| 32,768 | 435 (prefill only) | - (cudaGraphInstantiate OOM, s30) | - | - | - | 2255 | 8192 |
+| 65,536 | 244.55 with `--ppl` (~355 without) | 13.11 | 36.16 | 35.48 | 60.7% | 2196 | 16384 |
+| 131,072 | **247.81** | **10.38** | 48.13 | 43.81 | 54.2% | 2032 | 32768 |
+
+Readings:
+- **Decode is 25.0 -> 13.1 -> 10.4 tok/s from p600 to 128K.**  Usable, but the two halves of the token grow
+  differently: attention+router 15.47 -> 48.13 ms (x3.1) and experts 20.49 -> 43.81 ms (x2.1).
+- **attention+router grows *with the position* but not linearly in `cap`**: +13.2 ms for cap x16 (256 -> 4096),
+  +7.5 for x4 (-> 16384), +12.0 for x2 (-> 32768).  Whatever it is, it is per-token work that scales with the
+  compressed-row count: the indexer's `[cap, n, 64]` score tensor, the `[cap, n]` mask ops, and **two sorts of
+  `cap` elements per CSA layer per token** (the indexer's `top_k` and the sparse gather's `argsort`) - s28/s29's
+  unattributed candidate, now with a curve behind it instead of a guess.
+- **The expert column's hit rate is content-confounded and must not be read as a context effect.**  Each point is a
+  *different prefix* of the corpus (16K is `docs/ds4/*.md` markdown, 64K adds all the code), and the static profile
+  seed scores differently on each: 54.3% at 16K with 2304 slots vs 60.7% at 64K with 2196 slots is the *text*, not
+  the context.  Comparing residency policies across contexts needs one prompt truncated instead.
+- **Prefill: 466 (16K) -> ~440 (32K) -> ~355 (64K) -> 248 tok/s (128K)** - it degrades, and the split says why:
+  at 128K the chunk time is dense **387.0 s** (attention+router 384.9) vs experts **136.7 s**, i.e. **73% of prefill
+  is the dense half**.  At 6K it was the other way round (dense 4.8 s, experts 8.4 s, s20), because there each chunk
+  streams every expert of every layer over PCIe while the attention work was small.  So at long context the same
+  `cap`-dependent attention/mask/sort work dominates **both** phases - it is now the single biggest lever in the
+  engine, ahead of the expert tier.
+
+The 20+ arithmetic at 128K, from the measured 96 ms/token (48.13 + 43.81 + 4.3): at p600's attention cost with the
+same experts it would be 63 ms (15.9 tok/s); with the context-linear work removed (~17 ms, p600's level) *and* the
+hit rate recovered to ~83% (~25 ms) it is ~46 ms = **21.7 tok/s**.  Both levers are named: the `cap`-dependent
+attention/mask/sort work above, and residency - the cross-layer LRU (s29) plus the Q8_0 compressed caches giving
+back the VRAM the F32 caches take (s22 (b): ~5.4 GB at 256K).
