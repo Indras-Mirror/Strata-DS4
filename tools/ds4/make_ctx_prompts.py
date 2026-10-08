@@ -44,7 +44,9 @@ def main() -> int:
             continue
         p = a.out / f"ctx{n}.i32"
         p.write_bytes(struct.pack(f"<{n}i", *ids[:n]))
-        print(f"wrote {p} ({p.stat().st_size} bytes)")
+        t = a.out / f"ctx{n}.txt"          # the same document for llama.cpp (-f; it re-tokenizes, +-1%)
+        t.write_text(tok.decode(ids[:n]), encoding="utf-8")
+        print(f"wrote {p.name} ({p.stat().st_size} B) + {t.name} ({t.stat().st_size} B)")
     return rc
 
 
