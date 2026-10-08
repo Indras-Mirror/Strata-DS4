@@ -161,8 +161,17 @@ The ratio-128 HCA *visible* block is the one path left un-gated: it only becomes
 Multi-token gate (`--multi 2,3,1,4`: a second instance decodes the same tokens in passes cycling through those sizes,
 compared with the one-token decode at every position): **bit-identical at all 40 / 63 positions on swa16 / tame**,
 passes of 1, 2, 3 and 4 tokens.  The gate was mutation-tested: leaking a later token's block visibility, dropping the
-raw window's per-query upper bound, or removing the spare compressed row each fail it.  Not yet run: the `--cuda`
-variant (n > 1 flash-attn with d_head 512 on ggml-cuda, strided I32 copies).
+raw window's per-query upper bound, or removing the spare compressed row each fail it.
+
+The `--cuda` variant was run 2026-10-08 (FINDINGS s25).  It does **not** pass this gate and should not: the
+per-tensor 0.99999 threshold was calibrated on the CPU, and CUDA-vs-CPU arithmetic on these amplifying fixtures
+already costs swa16 layer 0 `attn_raw` cos 0.9389 / `attn_out` 0.9299 and tame worst logits cos 0.99912 (top-1 still
+identical to `ds4_ref`); the same numbers come out of `DS4_VIS_DEV=0 DS4_SPARSE=0`, i.e. the pre-sparse attention
+path, so the gap is arithmetic, not a regression.  The CUDA multi-token arm is not bit-exact either (0/63 positions,
+top-1 differs at 3 of them - n > 1 kernels, as above).  A CUDA arm needs its own measured threshold; until then the
+CUDA checks with power are the real model's ppl/tokens and `DS4_CHECK_GPU` (`DS4_CHECK_LRU` for the tier).  What the
+CUDA arm *is* good for is a bit-exactness A/B of two code paths: `DS4_VIS_DEV=1` and `=0` give byte-identical output
+on both fixtures (FINDINGS s25).
 
 ## Backend / CUDA tree
 
