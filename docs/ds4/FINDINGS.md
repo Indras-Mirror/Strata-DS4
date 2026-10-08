@@ -752,3 +752,42 @@ is CUDA-vs-CPU arithmetic on the amplifying fixtures against a threshold that wa
 The CUDA multi-token arm is likewise not bit-exact (0/63 positions, top-1 differs at 3), as ENGINE_DENSE already
 says for n > 1 kernels.  **A CUDA arm of this gate needs its own threshold before it can be a gate** - today the
 only CUDA checks with power are the real model's ppl / tokens and `DS4_CHECK_GPU`.
+
+## 26. Real model: the device mask vs the host mask, 2 interleaved pairs (2026-10-08, `bench/ds4-2026-10-08/b20-*`)
+
+`bench/ds4-2026-10-08/batch20.sh` (snapshot binary `bin/ds4_generate.visdev`,
+`--vram-lru --pf-b 0.7 --f16-q8 --arena-skip-resident --arena-gib 58`, p600 + 128 greedy, through `q.sh`/memguard;
+the GLM session's CUDA build was compiling during run 1 - the GLM tree, `~/AI/Strata-GLM`, not this one - and was
+done before runs 2-4):
+
+| run | mask | decode tok/s | prefill (decode loop) | ppl | tokens | VRAM free at end |
+| --- | --- | ---: | ---: | ---: | --- | ---: |
+| b20-visdev1-1 | device | 24.96 | 21.85 | 10.6065 | 128/128 | 0.10 GiB |
+| b20-visdev0-1 | host | 25.11 | 21.66 | 10.6065 | identical to the above | 0.18 GiB |
+| b20-visdev1-2 | device | 25.28 | 21.87 | 10.6065 | 128/128 | 0.10 GiB |
+| b20-visdev0-2 | host | 25.13 | 22.05 | 10.6065 | identical to the above | 0.18 GiB |
+
+Mean decode 25.12 tok/s in **both** arms (single runs swing ~1 tok/s, but this config is far tighter than s13's
+"+-0.2 ppl" - see below).  The generated tokens are byte-identical between the arms in both pairs (`cmp` on the
+stdout id streams), and the whole per-token profile matches: hit 83.4%, prefetched-useful 12.1/28.0 issued,
+cpu 7.6%, pcie 9.1%, 2442 slots, tier swaps 7.00/pass.  With s25 (the CUDA mini fixture is byte-identical too),
+the device mask is **the same computation** as the host mask on the real model, not merely within noise.
+
+Why the A/B could not show a speed win at p600, and why that is expected: the span's `vis_full` is sized
+`comp_max * kNtMax` with `comp_max = comp_cap_max = --ctx/4 + 2` (`ds4_generate.cpp:212`), so at the default
+793-token cap it is ~3.2 KB per compressed layer (~131 KB over 41 layers, one H2D per pass) - negligible.  The
+saving scales with `--ctx`: ~26 MiB/token at 256K, ~104 MiB/token at 1M (s23's numbers were right; the s22
+"~45 MB at 256K" was the same quantity counted loosely).  So p600 could only ever answer "no regression", and it
+did: 25.12 vs 25.12 tok/s.  The win has to be measured with `--ctx 262144`, which needs s24's query-blocked
+indexer to prefill a long prompt.
+
+**One number is unexplained and NOT attributed to this change:** "VRAM free at the end" is 0.10 GiB for the device
+mask and 0.18 GiB for the host mask, 2 runs to 2.  Nothing in the change is that big (the I32 `i_nvis` is 16 bytes;
+the extra `[cap, 1]` graph intermediates are ~1 KB at cap 200).  It is probably allocator jitter that happened to
+split by mode; `DS4_VRAM_TRACE=1` would attribute it.  Do not quote it as a saving.
+
+**Reproducibility, worth knowing for every future A/B:** with `--arena-skip-resident --arena-gib 58` (every
+non-VRAM expert host-resident, so the CPU/GPU split is deterministic), all four runs produced ppl 10.6065 to six
+significant figures and byte-identical generated tokens.  The "+-0.2 ppl / tokens diverge from token 3" caveat of
+s13 was measured on configs where the expert sourcing varies run to run; in this config a 2+2 interleaved A/B can
+resolve far smaller differences than the old noise floor suggested.
