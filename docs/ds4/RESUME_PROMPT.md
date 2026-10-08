@@ -1,3 +1,15 @@
+## RESUME HERE (2026-10-08 ~22:00, after s35) - read FINDINGS **s35** first, then s23-s34
+**Long-context decode is fixed on the attention side**: the fused lightning indexer (`DS4_FUSED_IDX`, default
+off-CPU) + O(ntk) sparse select took attention+router at 128K from 38.2 to 18.7 ms (`--pos-offset` probe: 13.7 ->
+19.0 tok/s, **22.4 with `--comp-type q8_0 --icomp-q8`**, 256K with q4_0 caches **21.75**).  KV ladder measured on
+the real model (p600 ppl, F32 10.4468): q8 +0.54%, **rotated iq4_nl +0.60%** (recommended), q4_0 +0.85%.
+`--comp-host` (pinned RAM) works but is not worth it below ~512K.  `DS4_RAW_BLOCK` (prefill raw-window blocking)
+is gated bit-exact on CPU, **not yet measured on GPU prefill**.  Commits bc21c1e..b22fe73, nothing pushed.
+Next: (1) a real long-document decode run to replace the probe's optimistic expert hit rate (Mal: keep runs
+short - 32K is enough); (2) prefill timing of DS4_RAW_BLOCK at 16-32K; (3) dense-half fusion (s35 op census: the
+overlap compressor's conts, the 7 matvecs on `xn`); (4) cross-layer expert LRU - Mal's call.
+GPU is shared with strata-glm over relay (this session = `strata-ds4-gpu`): short runs, take turns, announce.
+
 ## RESUME HERE (2026-10-08, end of the long-context session) - read FINDINGS **s23-s33** first, then s19-s22
 **Long context works now and the curve is measured** - decode 24.96 (p600) / 12.71 (16K) / 14.22 (32K) / 13.11 (64K)
 / **10.38-9.81 (128K)** tok/s; prefill 466 (16K) / 429 (32K) / ~355 (64K, 244.6 with `--ppl`) / 247.8 (128K) tok/s;
