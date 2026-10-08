@@ -730,3 +730,25 @@ Long prompts are ready for when it lands: `bench/ds4-2026-10-08/ctx/ctx{65536,13
 `strata_tokenizer`, so the prompt is real prose and code; 2.07M tokens of corpus, a 1M-token file is one
 `--sizes 1048576` away).  Feed with `ds4_generate --ids-file`.  The directory is git-ignored (regenerate, don't
 commit).
+
+## 25. The device mask on CUDA is the host mask, bit for bit (2026-10-08, GPU)
+
+`test_ds4_dense --cuda` on the mini fixtures (the `--cuda` arm ENGINE_DENSE says was never run), `DS4_VIS_DEV=1`
+against `=0`: **byte-identical output** - swa16 40 tokens, 422 lines; tame 63 tokens, identical except where one
+"CUDA graph warmup complete" stderr line lands.  Every per-layer tap, every per-position logit cosine and the
+multi-token table are the same numbers, so `arange/repeat/step/log` on the GPU produce exactly the host mask's
+`0.0f` / `-INFINITY` (the `-use_fast_math` `__logf` question is settled: `__logf(1.0f)` is exactly 0 and
+`__logf(0.0f)` is -inf).  This is the strong form of s23's CPU result, and it means the CUDA decode is not just
+"within noise" of the host mask but the same bits.
+
+**The `--cuda` arm fails the CPU-calibrated per-tensor threshold, and that predates this work.**  swa16 layer 0
+`attn_raw` cos 0.9389 / `attn_out` 0.9299 (the amplifying fixture - unit-scale random weights give the net a
+1e3-1e4 gain, ENGINE_DENSE "Verification status"); tame worst logits cos 0.99912 with 63/63 positions below the
+0.99999 gate, top-1 identical to `ds4_ref` at the last position.  Isolated with `DS4_VIS_DEV=0 DS4_SPARSE=0`, which
+reproduces the pre-session attention path: **the same numbers to the last printed digit** (swa16 0.9388602 /
+0.9298549 / 0.9970405 / 0.9968992; tame 0.9999985 / 0.9999776, worst 0.99912037, 63/63 below the gate).  So the gap
+is CUDA-vs-CPU arithmetic on the amplifying fixtures against a threshold that was only ever calibrated on the CPU
+(the README's "--cuda agrees to ~1e-4" is the same fact), not a regression from s22's sparse gather or s23's mask.
+The CUDA multi-token arm is likewise not bit-exact (0/63 positions, top-1 differs at 3), as ENGINE_DENSE already
+says for n > 1 kernels.  **A CUDA arm of this gate needs its own threshold before it can be a gate** - today the
+only CUDA checks with power are the real model's ppl / tokens and `DS4_CHECK_GPU`.
