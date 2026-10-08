@@ -673,3 +673,24 @@ at handoff - read it first: it shows what loads today and how many expert slots 
 256K loads and runs today; it costs ~620 slots (F32 compressed caches + the larger arena), hit 83 -> 70%. 1M would
 not fit in VRAM as F32 (~13.5 GB). Real long-context decode/prefill speed is still unmeasured (needs a long prompt
 and the s22 fixes: masked full-cap attention and the per-token vis upload grow with position, not capacity).
+
+## 23. Long-context step (c): the visibility mask built on the device (2026-10-08, CPU)
+
+s22 item 2: the compressed-attention visibility mask was built on the host and rode the per-token input span as one
+F32 `vis_full` per compressed layer, sized `comp_max * kNtMax` - the whole capacity, though only `cap` rows are ever
+used (21 ratio-4 layers x 1 MiB + 20 ratio-128 x 32 KiB = ~22 MiB per token at 256K; ~87 MiB at 1M, of a single H2D
+per pass). `DS4_VIS_DEV` (default on) replaces it with a per-layer I32 count `i_nvis` (16 bytes): the graph derives
+the mask itself - row `i` is visible to query `t` iff `i < i_nvis[t]` (block `i` completed at or before `pos_t`) -
+from `arange(cap)`, `repeat`, `step` and `log`. `log(step(...))` is exactly `0.0f` / `-INFINITY`, the host's two
+values; scaling by `NEG_INF` instead is `0 * inf = NaN` (the naive port's first failure - it makes every indexer
+score non-finite and the whole decode NaN). Prefill keeps its own per-chunk `vis_full` (s22 item (d) will block
+that one); `DS4_VIS_DEV=0` restores the host path for an A/B.
+
+Gates (CPU fixtures, `bench/ds4-2026-10-06/dense`), device mask vs `DS4_VIS_DEV=0`: swa16 40 tokens and tame 63
+tokens with `--multi 2,3,1,4` - per-layer taps cos 1.0000000, worst logits cos 0.9999999649, multi-token
+bit-identical 40/40 and 63/63, identical numbers in both modes (the device mask is the host mask, bit for bit).
+MTP block gate: worst cos 0.99999996, top-1 62/62, MTP in multi bit-identical. `verify-cpu/run.sh`: FAILURES: 0
+(29 runs; the n <= 4 path this change also touches). Mutation: inverting the comparison (`ivN - nvN`) fails the gate
+on 69 checks (taps 0.92-0.99, 60 of 63 positions below the gate).
+NOT measured: any GPU run, and a real 256K/1M prompt - the gain is the span bytes per token
+(~22 MiB at 256K, ~87 MiB at 1M) off the one H2D per pass, which only a long-context GPU run shows.

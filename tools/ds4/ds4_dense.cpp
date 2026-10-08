@@ -420,6 +420,7 @@ struct Ds4Dense::Impl {
         int  tap_n = 0;                   // the n of the pass the taps / host_fn hold
         bool have_attn = false, have_finish = false;
         ggml_tensor * vis_full = nullptr; // F32 [comp_max * kNtMax]  compressed-row visibility (graphs view [cap, n])
+        ggml_tensor * i_nvis = nullptr;   // I32[kNtMax]  complete compressed blocks per query (DS4_VIS_DEV, s22)
         ggml_tensor * rbias = nullptr;    // F32 [NEXP]       cache-aware routing: added to the SELECTION score only
         // router outputs: per token a block of o_blk bytes [fn | ids | wts], kNtMax blocks, one readback per layer
         ggml_tensor * o_ids = nullptr;    // I32 [NUSED]      token 0's router ids
@@ -646,6 +647,7 @@ struct B {
 // per-query visibility mask (a block completed by token t is visible to tokens > t, never the reverse).  The
 // compressor rings take every token's state before any gather; each token gathers its own `ring` slots.
 static bool sparse_on();   // DS4_SPARSE, defined with the other switches below
+static bool vis_dev_on();  // DS4_VIS_DEV, ditto
 
 static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_t n, Ds4Dense::Impl::Layer & L,
                                bool emit = true) {
@@ -723,7 +725,23 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
         ggml_tensor * comp_pos  = first(L.i_comp_pos, n);
         ggml_tensor * slot_st   = im.pf ? nullptr : first(L.i_slot_state, n);   // chunk: tail_into uses its own
         ggml_tensor * idx_st    = first(L.i_idx_state, L.ring * n);   // [ring] per token, flat (get_rows takes 1-D)
-        var.vis = ggml_view_2d(gc, L.vis_full, cap, n, (size_t) cap * sizeof(float), 0);
+        if (vis_dev_on() && !im.pf) {
+            // DS4_VIS_DEV (default on): build the compressed-row visibility on the device from the per-layer count
+            // `i_nvis` (the blocks each query may see) instead of a host mask.  That host mask carried comp_max *
+            // kNtMax floats per compressed layer inside the per-token input span, of which only `cap` rows were ever
+            // used: ~22 MiB/token at 256K and ~90 MiB at 1M of pure upload (FINDINGS s22).  Row i is visible to
+            // query t iff block i completed at or before pos_t, i.e. (i+1)*ratio <= pos_t+1 <=> i < i_nvis[t].
+            // step() gives exactly 1 (visible) / 0 (hidden) and log() exactly 0.0f / -INFINITY - the host's values;
+            // scaling by NEG_INF instead would be 0 * inf = NaN.
+            ggml_tensor * nvs = ggml_cast(gc, first(L.i_nvis, n), GGML_TYPE_F32);             // [n]
+            ggml_tensor * iv  = ggml_arange(gc, 0.0f, (float) cap, 1.0f);                     // [cap] = i
+            ggml_tensor * shp = ggml_new_tensor_2d(gc, GGML_TYPE_F32, cap, n);
+            ggml_tensor * ivN = ggml_repeat(gc, ggml_reshape_2d(gc, iv, cap, 1), shp);         // [cap, n] = i
+            ggml_tensor * nvN = ggml_repeat(gc, ggml_reshape_2d(gc, nvs, 1, n), shp);          // [cap, n] = i_nvis[t]
+            var.vis = ggml_log(gc, ggml_step(gc, ggml_sub(gc, nvN, ivN)));                      // i < i_nvis -> 0
+        } else {
+            var.vis = ggml_view_2d(gc, L.vis_full, cap, n, (size_t) cap * sizeof(float), 0);
+        }
 
         if (csa) {
             // overlap compressor (ds4_ref attention():514-556): each token state is [ prev-half | cur-half ]
@@ -1232,7 +1250,11 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
             L.i_comp_pos  = in1(GGML_TYPE_I32, NT);
             L.i_state_pos = in1(GGML_TYPE_I32, NT);
             L.i_idx_state = in1(GGML_TYPE_I32, std::max<int64_t>(1, L.ring) * NT);
-            if (L.ratio != 0) L.vis_full = in1(GGML_TYPE_F32, L.comp_max * NT);
+            if (L.ratio != 0) {
+                // DS4_VIS_DEV: a 16-byte per-layer count replaces the whole-capacity host mask in the span
+                if (vis_dev_on()) L.i_nvis   = in1(GGML_TYPE_I32, NT);
+                else              L.vis_full = in1(GGML_TYPE_F32, L.comp_max * NT);
+            }
             L.rbias = in1(GGML_TYPE_F32, im.NEXP);
 
             if (L.ratio != 0) {
@@ -1405,6 +1427,14 @@ static bool comp_skip_on() {
     return on;
 }
 
+// DS4_VIS_DEV (default on): the compressed-row visibility mask is built in the graph from the per-layer count
+// `i_nvis` instead of a host mask that rides the per-token input span (FINDINGS s22).  DS4_VIS_DEV=0 restores the
+// host path (and its span cost) for an A/B - both must produce the same bits on the CPU gate.
+static bool vis_dev_on() {
+    static const bool on = [] { const char * e = std::getenv("DS4_VIS_DEV"); return !e || std::atoi(e) != 0; }();
+    return on;
+}
+
 // compressed-row capacity a pass whose last token sits at `pos_last` needs (0 for a ratio-0 layer)
 static int64_t attn_cap(const Ds4Dense::Impl::Layer & L, int64_t pos_last) {
     if (L.ratio == 0) return 0;
@@ -1533,7 +1563,8 @@ bool Ds4Dense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
                 msk[(size_t) (t * n_raw + i)] = tok >= 0 && tok <= pt && tok > pt - im.SWA ? h0 : hinf;
             }
         }
-        std::vector<int32_t> sp(n), cpp(n), sc(n), ss(n), sidx;
+        const bool vdev = vis_dev_on();
+        std::vector<int32_t> sp(n), cpp(n), sc(n), ss(n), sidx, nvis;
         std::vector<float> vis;
         for (Impl::Layer & Ly : im.ly) {
             put(Ly.i_slot_raw, s32.data(), s32.size() * 4);
@@ -1543,7 +1574,8 @@ bool Ds4Dense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
             if (pos_last / Ly.ratio >= Ly.comp_max) continue;   // attn_router refuses this layer above
             const int64_t cp_ = attn_cap(Ly, pos_last);
             sidx.resize((size_t) (Ly.ring * n));
-            vis.assign((size_t) (cp_ * n), NEG_INF);
+            if (vdev) nvis.resize((size_t) n);
+            else      vis.assign((size_t) (cp_ * n), NEG_INF);
             for (int t = 0; t < n; ++t) {
                 const int64_t pt = (int64_t) pos0 + t, bl = pt / Ly.ratio;
                 sp[(size_t) t]  = (int32_t) (pt % Ly.ratio);      // compressor `ape` row
@@ -1558,14 +1590,16 @@ bool Ds4Dense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
                     sidx[(size_t) (t * Ly.ring + i)] = (int32_t) (((tok % Ly.ring_sz) + Ly.ring_sz) % Ly.ring_sz);
                 }
                 const int64_t nv = (pt + 1) / Ly.ratio;           // complete blocks query t may see
-                for (int64_t i = 0; i < nv && i < cp_; ++i) vis[(size_t) (t * cp_ + i)] = 0.0f;
+                if (vdev) nvis[(size_t) t] = (int32_t) nv;
+                else for (int64_t i = 0; i < nv && i < cp_; ++i) vis[(size_t) (t * cp_ + i)] = 0.0f;
             }
             put(Ly.i_state_pos, sp.data(), (size_t) n * 4);
             put(Ly.i_comp_pos, cpp.data(), (size_t) n * 4);
             put(Ly.i_slot_comp, sc.data(), (size_t) n * 4);
             put(Ly.i_slot_state, ss.data(), (size_t) n * 4);
             put(Ly.i_idx_state, sidx.data(), sidx.size() * 4);
-            put(Ly.vis_full, vis.data(), vis.size() * 4);
+            if (vdev) put(Ly.i_nvis, nvis.data(), (size_t) n * 4);
+            else      put(Ly.vis_full, vis.data(), vis.size() * 4);
         }
         ggml_backend_tensor_set(im.i_span, im.in_host.data(), 0, im.in_host.size());
         im.in_pos = pos0;
